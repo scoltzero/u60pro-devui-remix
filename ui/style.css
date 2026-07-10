@@ -287,7 +287,9 @@ body.light .sms + .sms { border-top: 1px solid #e6e9ef; }
 
 /* sms detail dialog (second level) */
 .smsmdate { color: #8a929d; font-size: 12px; text-align: center; padding-bottom: 10px; }
-.smsmbody { font-size: 15px; line-height: 1.5; }
+.smsmview { position: absolute; left: 14px; right: 14px; top: 72px; bottom: 67px; overflow: hidden; }
+.smsmbody { position: relative; margin-right: 4px; font-size: 15px; line-height: 1.5;
+            overflow-wrap: break-word; word-wrap: break-word; }
 .mfull { width: 100%; margin-right: 0; }
 
 /* ---- toggle switch (settings) ---- */

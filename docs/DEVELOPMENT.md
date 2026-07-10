@@ -160,7 +160,7 @@ ubus 服务 ──▶ zwrt-datad ──▶ HTTP /state + SSE /events ──▶ u
 
 `touch_input_read` 会把一次轮询里抽干的事件**坍缩成最后状态**——一次完整的「按下→抬起」若整段落在某次慢渲染期间，按下沿没被看到，整个 tap 就丢了（锁屏键盘连点尤其明显）。修法：触摸层维护**点击边沿锁存 + 8 格队列**，抬起且位移很小即入队；`touch_input_take_tap` 逐个取出。锁屏键盘**一次性把队列全部消费**再渲染一次，所以再快连点也不丢。进入键盘时 `touch_input_clear_taps` 清掉之前残留的 tap（避免开关那一下串进来误触）。
 
-覆盖层必须明确消费属于自己的触摸尾巴。短信详情关闭时，抬起会同时生成普通 release 和锁存 tap；若只关闭覆盖层，下一帧 tap 会命中下方同坐标的短信卡片。`g_sms_open` 分支因此在直接 release 时用 `touch_input_drop_replayed_release(&touch, 1)` 丢掉对应 tap/stroke；若慢帧期间未观察到按下沿，则取走最新锁存 tap 并关闭详情，防止点击穿透或详情无法关闭。
+覆盖层必须明确消费属于自己的触摸尾巴。弹层内抬起会同时生成普通 release 和锁存 tap；若只关闭覆盖层，下一帧 tap 会命中下方同坐标的入口。短信详情与高级设置因此都会消费自己处理过的 tap/stroke。短信详情只在 `html_view_click()` 命中 `act:smsclose` 时退出，正文或空白区点击保持打开；慢帧期间未观察到按下沿时，弹层会折叠并处理最新完整手势，而不是让它落到下层页面。
 
 为了给 `DEVUI-IPC` 提供系统级返回手势，触摸层现在还会额外维护一条**短笔画队列**：每次完整按下到抬起，都会把起点和终点缓存下来，宿主可通过 `touch_input_take_stroke` 取出最近一笔。外部画面前台时，`htmlmain.c` 只在内容区里消费这些笔画，并用它识别“左边缘起手、明显向右、纵向偏移不大”的返回手势。
 
@@ -375,9 +375,9 @@ esac
 第二页只读短信，不做发送。后端解码见上「数据模型 · `sms`」。UI 端：
 
 - 列表是**折叠卡片**（`act:sms:ID`），只显示号码/时间 + 一行预览（`utf8_trunc` 按字符边界截断、不切坏多字节）；未读条目红点 + 蓝色号码。
-- 点卡片：`data_refresh` 取该条全文存进 `g_sms_*`，开二级详情弹窗（复用 modal overlay）；若该条未读则 `ubus call zwrt_wms zwrt_wms_modify_tag '{"id":"<id>;","tag":0}'` 标记已读（`tag:0`=已读，分号分隔多 id）。未读数变化后端立即重读列表，红点/状态栏图标随之消失。
-- 关闭详情（关闭按钮或弹窗外）会消费同一次锁存 tap，不能让该触摸穿透并打开列表中下方的另一条短信。
-- 正文含任意字符，渲染前 `html_esc` 转义 `&<>`。
+- 点卡片：`data_refresh` 取该条全文存进 `g_sms_*`，开二级详情弹窗（复用 modal overlay）；正文位于固定高度的 `#smsview` 裁剪区，只有 `#smsbody` 的实测高度超过视口且本次手势能改变滚动偏移时才启用拖动，短短信不进入滚动状态。只有底部 `act:smsclose` 才关闭。弹层必须消费自己处理过的 tap/stroke，不能让关闭动作穿透到下方短信卡片。若该条未读则 `ubus call zwrt_wms zwrt_wms_modify_tag '{"id":"<id>;","tag":0}'` 标记已读（`tag:0`=已读，分号分隔多 id）。未读数变化后端立即重读列表，红点/状态栏图标随之消失。
+- 关闭详情只能点击底部关闭按钮；正文和弹窗空白区域的 tap 由弹层消费但不关闭，也不能穿透并打开列表中下方的另一条短信。
+- 正文含任意字符，渲染前 `html_esc_breaks` 转义 `&<>` 并把原始换行转换成 `<br>`。
 - **状态栏未读信封图标**：有未读时在时钟右侧原生画一个信封（`draw_sms_icon`，蓝身+白翻盖），位置按固定状态栏坐标和当前时间文字宽度计算，不依赖页面里的占位元素，所以不会跟着长页面滚动；和电池闪电一样翻页时常驻、锁屏也显示。字体没有信封字形所以走原生。
 
 ### 电源菜单（原生圆形按键，v0.3.6）
@@ -423,8 +423,8 @@ esac
 ```jsonc
 // 本仓库 release 的 version.json
 { "schema": 1,
-  "devui": { "version": "1.2.5", "asset": "u60pro-devui-aarch64" },
-  "ui":    { "version": "0.4.5", "asset": "ui.tar.gz" } }
+  "devui": { "version": "1.2.11", "asset": "u60pro-devui-aarch64" },
+  "ui":    { "version": "0.4.10", "asset": "ui.tar.gz" } }
 // zwrt-datad release 的 version.json
 { "schema": 1, "datad": { "version": "0.6.2", "asset": "zwrt-datad-aarch64" } }
 ```

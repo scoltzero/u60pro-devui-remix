@@ -2006,6 +2006,8 @@ static void draw_lock_icon(void)
 static long g_sms_open = -1;   /* opened SMS message id for detail dialog (-1 = none) */
 static int  g_sms_unread_now;  /* unread SMS present -> draw the status-bar envelope */
 static char g_sms_num[40], g_sms_date[16], g_sms_text[DEVUI_SMS_TEXT_MAX];   /* opened message */
+static int  g_sms_scroll, g_sms_scroll_max;
+static int  g_sms_view_x, g_sms_view_y, g_sms_view_w, g_sms_view_h;
 
 /* Draw a small envelope in the fixed status bar, just right of the clock, when
  * there are unread messages. Native shape; the font has no envelope glyph. */
@@ -3438,6 +3440,23 @@ static void html_esc(char *dst, size_t cap, const char *src)
     dst[o] = 0;
 }
 
+/* SMS bodies are text nodes too, but preserve their original line breaks. */
+static void html_esc_breaks(char *dst, size_t cap, const char *src)
+{
+    size_t o = 0;
+    for (const char *s = src; *s && o + 7 < cap; s++) {
+        const char *r = NULL;
+        if      (*s == '&')  r = "&amp;";
+        else if (*s == '<')  r = "&lt;";
+        else if (*s == '>')  r = "&gt;";
+        else if (*s == '\n') r = "<br>";
+        else if (*s == '\r') continue;
+        if (r) { size_t L = strlen(r); memcpy(dst + o, r, L); o += L; }
+        else dst[o++] = *s;
+    }
+    dst[o] = 0;
+}
+
 /* Copy at most maxb bytes of UTF-8 without splitting a multibyte char; stop at
  * a newline. Sets *cut if the source was longer, so the caller can add ellipsis. */
 static void utf8_trunc(char *dst, size_t cap, const char *src, int maxb, int *cut)
@@ -3517,18 +3536,18 @@ static void signal_bler_compact(char *dst, size_t cap, const char *src)
 /* Second-level SMS detail dialog (number + date + full text), overlaid dimmed. */
 static const char *sms_modal_html(void)
 {
-    static char out[DEVUI_SMS_TEXT_MAX * 6 + 1024];
+    static char out[DEVUI_SMS_TEXT_MAX * 6 + 1536];
     static char esc[DEVUI_SMS_TEXT_MAX * 6];
-    html_esc(esc, sizeof esc, g_sms_text);
+    html_esc_breaks(esc, sizeof esc, g_sms_text);
     snprintf(out, sizeof out,
         "<!DOCTYPE html><html><head><meta charset='UTF-8'><link rel='stylesheet' href='style.css'></head>"
         "<body class='mo'><div class='modal %s'>"
         "<div class='mtitle'>%s</div>"
         "<div class='smsmdate'>%s</div>"
-        "<div class='smsmbody'>%s</div>"
+        "<div id='smsview' class='smsmview'><div id='smsbody' class='smsmbody' style='top:-%dpx'>%s</div></div>"
         "<div class='mbtns'><a href='act:smsclose' class='mbtn2 prim mfull'>关闭</a></div>"
         "</div></body></html>",
-        g_theme ? "light" : "dark", g_sms_num, g_sms_date, esc);
+        g_theme ? "light" : "dark", g_sms_num, g_sms_date, g_sms_scroll, esc);
     return out;
 }
 
@@ -5002,6 +5021,7 @@ static void draw_speedtest_widgets(void)
 }
 
 static void capture_fb(drm_disp_t *d);   /* fwd: fb snapshot for modal overlay */
+static void render_sms_overlay(drm_disp_t *d, int restore_background);
 
 static void maybe_dump_fb(drm_disp_t *d)
 {
@@ -5070,7 +5090,7 @@ static void render(drm_disp_t *disp, const char *path)
     } else if (g_sms_open >= 0) {                     /* dim page + SMS detail dialog */
         html_view_fill_rect(0, 28, disp->width, H - 28, 0, 0, 0, 150);
         capture_fb(disp);
-        html_view_render_overlay(sms_modal_html());
+        render_sms_overlay(disp, 0);
     }
     drm_disp_dirty(disp, 0, 0, disp->width - 1, disp->height - 1);
     maybe_dump_fb(disp);
@@ -5223,12 +5243,146 @@ static uint16_t g_overbg[320 * 480];
 static void capture_fb(drm_disp_t *d) { memcpy(g_overbg, d->fb, (size_t)d->pitch_px * d->height * sizeof(uint16_t)); }
 static void restore_fb(drm_disp_t *d) { memcpy(d->fb, g_overbg, (size_t)d->pitch_px * d->height * sizeof(uint16_t)); }
 
+static int sms_scroll_metrics(void)
+{
+    int bx, by, bw, bh;
+    int vx, vy, vw, vh;
+    int old_scroll = g_sms_scroll;
+
+    if (html_view_rect("#smsview", &vx, &vy, &vw, &vh) &&
+        html_view_rect("#smsbody", &bx, &by, &bw, &bh)) {
+        g_sms_view_x = vx;
+        g_sms_view_y = vy;
+        g_sms_view_w = vw;
+        g_sms_view_h = vh;
+        g_sms_scroll_max = bh > vh ? bh - vh : 0;
+    } else {
+        g_sms_view_x = g_sms_view_y = g_sms_view_w = g_sms_view_h = 0;
+        g_sms_scroll_max = 0;
+    }
+    g_sms_scroll = clampi(g_sms_scroll, 0, g_sms_scroll_max);
+    return g_sms_scroll != old_scroll;
+}
+
+static int sms_point_in_view(int x, int y)
+{
+    return g_sms_view_w > 0 && g_sms_view_h > 0 &&
+           x >= g_sms_view_x && x < g_sms_view_x + g_sms_view_w &&
+           y >= g_sms_view_y && y < g_sms_view_y + g_sms_view_h;
+}
+
+/* Redraw only the SMS dialog while dragging; the dimmed page remains cached. */
+static void render_sms_overlay(drm_disp_t *d, int restore_background)
+{
+    if (restore_background) restore_fb(d);
+    html_view_render_overlay(sms_modal_html());
+    if (sms_scroll_metrics()) {
+        restore_fb(d);
+        html_view_render_overlay(sms_modal_html());
+        (void)sms_scroll_metrics();
+    }
+    if (g_sms_scroll_max > 0 && g_sms_view_h > 0) {
+        int content_h = g_sms_view_h + g_sms_scroll_max;
+        int thumb_h = g_sms_view_h * g_sms_view_h / content_h;
+        int travel, thumb_y;
+        if (thumb_h < 18) thumb_h = 18;
+        if (thumb_h > g_sms_view_h) thumb_h = g_sms_view_h;
+        travel = g_sms_view_h - thumb_h;
+        thumb_y = g_sms_view_y + g_sms_scroll * travel / g_sms_scroll_max;
+        html_view_fill_round_rect(g_sms_view_x + g_sms_view_w - 3, thumb_y,
+                                  3, thumb_h, 2, 0x8a, 0x92, 0x9d, 190);
+    }
+    drm_disp_dirty(d, 0, 0, d->width - 1, d->height - 1);
+}
+
 /* Redraw the modal over the cached dimmed page (fast: no page relayout). */
 static void render_modal_overlay(drm_disp_t *d)
 {
     restore_fb(d);
     html_view_render_overlay(modal_html());
     drm_disp_dirty(d, 0, 0, d->width - 1, d->height - 1);
+}
+
+static void handle_modal_tap(drm_disp_t *disp, int x, int y, uint32_t now,
+                             int *need_render, int *animating)
+{
+    const char *act = html_view_click((float)x, (float)y);
+
+    if (g_modal == 4) {
+        if (strncmp(act, "act:", 4)) return;
+        const char *a = act + 4;
+        if (!strcmp(a, "sigread")) {
+            g_sig_read = !g_sig_read;
+            (void)datad_set_signal_read(g_sig_read);
+            signal_async_publish(NULL, 0);
+            save_conf();
+            snprintf(g_toast, sizeof g_toast, "信令读取已%s", g_sig_read ? "开启" : "关闭");
+            g_toast_until = now + 1600;
+            invalidate_render_html_cache();
+            *need_render = 1;
+        } else if (!strcmp(a, "sigparse")) {
+            g_sig_parse = !g_sig_parse;
+            (void)datad_set_signal_parse(g_sig_parse);
+            signal_async_publish(NULL, 0);
+            save_conf();
+            rescan_pages_keep_current();
+            invalidate_render_html_cache();
+            snprintf(g_toast, sizeof g_toast, "信令解析已%s", g_sig_parse ? "开启" : "关闭");
+            g_toast_until = now + 1600;
+            *need_render = 1;
+        } else if (!strcmp(a, "closemodal")) {
+            g_modal = 0;
+            *need_render = 1;
+        }
+        return;
+    }
+
+    char *sel = g_modal == 1 ? g_sel_sa : g_modal == 2 ? g_sel_nsa : g_sel_lte;
+    const char *uni = g_modal == 1 ? g_uni_sa : g_modal == 2 ? g_uni_nsa : g_uni_lte;
+    if (!strncmp(act, "act:", 4)) {
+        const char *a = act + 4;
+        if (!strncmp(a, "bsa:", 4) || !strncmp(a, "bnsa:", 5) || !strncmp(a, "blte:", 5)) {
+            band_toggle(sel, 256, strchr(a, ':') + 1);
+            render_modal_overlay(disp);
+            *animating = 1;
+        } else if (!strcmp(a, "mall")) {
+            if (!strcmp(sel, uni)) sel[0] = 0;
+            else snprintf(sel, 256, "%s", uni);
+            render_modal_overlay(disp);
+            *animating = 1;
+        } else if (!strcmp(a, "minv")) {
+            char u[256], out[256];
+            int o = 0;
+            snprintf(u, sizeof u, "%s", uni);
+            for (char *tk = strtok(u, ","); tk; tk = strtok(NULL, ","))
+                if (!band_in(sel, tk))
+                    o += snprintf(out + o, sizeof out - o, "%s%s", o ? "," : "", tk);
+            out[o] = 0;
+            snprintf(sel, 256, "%s", out);
+            render_modal_overlay(disp);
+            *animating = 1;
+        } else if (!strcmp(a, "mapply")) {
+            if (sel[0]) {
+                char cmd[360];
+                if (g_modal == 3)
+                    snprintf(cmd, sizeof cmd,
+                             "ubus call zte_nwinfo_api nwinfo_set_lte_ext_band '{\"lte_band\":\"%s\"}' >/dev/null 2>&1 &",
+                             sel);
+                else
+                    snprintf(cmd, sizeof cmd,
+                             "ubus call zte_nwinfo_api nwinfo_set_nrbandlock '{\"nr5g_type\":\"%s\",\"nr5g_band\":\"%s\"}' >/dev/null 2>&1 &",
+                             g_modal == 1 ? "0" : "1", sel);
+                system(cmd);
+            }
+            snprintf(g_toast, sizeof g_toast, "锁频成功");
+            g_toast_until = now + 1600;
+            g_modal = 0;
+            *need_render = 1;
+        }
+    } else {
+        g_modal = 0;   /* band-lock dialogs keep their existing tap-outside behavior */
+        *need_render = 1;
+    }
 }
 
 /* Draw the sliding segmented-control highlight box at the finger, over cached fb.
@@ -5314,6 +5468,7 @@ int main(void)
     int menu = 0, prev_press = 0, prev_lock = 0, was_on = 1, down_x = 0, down_y = 0;
     int dragging = 0, drag_dir = 0, drag_target = 0;
     int scroll_dir = 0, scroll_start = 0;
+    int sms_dragging = 0, sms_scroll_start = 0;
     int scroll_inertia = 0, scroll_track_valid = 0;
     int scroll_track_pos = 0;
     uint32_t drag_down_ms = 0;
@@ -5532,80 +5687,102 @@ int main(void)
             dragging = 0; drag_dir = 0; scroll_dir = 0; sliding = 0; segging = 0;
             scroll_inertia = 0; scroll_track_valid = 0; scroll_v = 0.0f;
         } else if (g_sms_open >= 0) {
-            /* The release that closes this overlay is also latched as a tap. Consume
-             * it here so it cannot replay against the SMS card underneath. */
-            if (!pressed && prev_press) {
-                g_sms_open = -1;
-                touch_input_drop_replayed_release(&touch, 1);
-                need_render = 1;
+            if (pressed && !prev_press) {
+                down_x = x;
+                down_y = y;
+                sms_scroll_start = g_sms_scroll;
+                sms_dragging = 0;
+            } else if (pressed && prev_press) {
+                int dy = y - down_y;
+                int ady = dy < 0 ? -dy : dy;
+                int next = clampi(sms_scroll_start - dy, 0, g_sms_scroll_max);
+                if (!sms_dragging && ady > 6 && next != g_sms_scroll &&
+                    sms_point_in_view(down_x, down_y))
+                    sms_dragging = 1;
+                if (sms_dragging) {
+                    if (next != g_sms_scroll && motion_frame_due(now, &last_motion_frame)) {
+                        g_sms_scroll = next;
+                        render_sms_overlay(&disp, 1);
+                        animating = 1;
+                    }
+                }
+            } else if (!pressed && prev_press) {
+                int dx = x - down_x, dy = y - down_y;
+                int release_was_tap = dx * dx + dy * dy <= 14 * 14;
+                if (sms_dragging) {
+                    int next = clampi(sms_scroll_start - dy, 0, g_sms_scroll_max);
+                    if (next != g_sms_scroll) {
+                        g_sms_scroll = next;
+                        render_sms_overlay(&disp, 1);
+                        animating = 1;
+                    }
+                } else if (release_was_tap) {
+                    const char *act = html_view_click((float)down_x, (float)down_y);
+                    if (!strcmp(act, "act:smsclose")) {
+                        g_sms_open = -1;
+                        g_sms_scroll = g_sms_scroll_max = 0;
+                        need_render = 1;
+                    }
+                }
+                touch_input_drop_replayed_release(&touch, release_was_tap);
+                sms_dragging = 0;
             } else if (!pressed) {
-                /* A full tap can arrive while a render was in progress, with no
-                 * observable pressed edge in this loop. It belongs to the modal too. */
-                int tx, ty;
-                if (touch_input_take_latest_tap(&touch, &tx, &ty)) {
-                    g_sms_open = -1;
-                    need_render = 1;
+                /* A complete gesture can land while layout is busy. Collapse queued
+                 * input to its newest stroke so it cannot replay below the dialog. */
+                int sx, sy, ex, ey;
+                if (touch_input_take_latest_stroke(&touch, &sx, &sy, &ex, &ey)) {
+                    int tx = sx, ty = sy;
+                    int dx = ex - sx, dy = ey - sy;
+                    int was_tap = dx * dx + dy * dy <= 14 * 14;
+                    int have_tap = touch_input_take_latest_tap(&touch, &tx, &ty);
+                    if (was_tap) {
+                        const char *act = html_view_click((float)(have_tap ? tx : sx),
+                                                          (float)(have_tap ? ty : sy));
+                        if (!strcmp(act, "act:smsclose")) {
+                            g_sms_open = -1;
+                            g_sms_scroll = g_sms_scroll_max = 0;
+                            need_render = 1;
+                        }
+                    } else if (sms_point_in_view(sx, sy) && g_sms_scroll_max > 0) {
+                        int next = clampi(g_sms_scroll - dy, 0, g_sms_scroll_max);
+                        if (next != g_sms_scroll) {
+                            g_sms_scroll = next;
+                            render_sms_overlay(&disp, 1);
+                            animating = 1;
+                        }
+                    }
+                } else {
+                    int tx, ty;
+                    if (touch_input_take_latest_tap(&touch, &tx, &ty)) {
+                        const char *act = html_view_click((float)tx, (float)ty);
+                        if (!strcmp(act, "act:smsclose")) {
+                            g_sms_open = -1;
+                            g_sms_scroll = g_sms_scroll_max = 0;
+                            need_render = 1;
+                        }
+                    }
                 }
             }
         } else if (g_modal) {
             /* second-level band-lock dialog: tap only (level-1 is disabled) */
-            if (!pressed && prev_press) {
-                const char *act = html_view_click((float)x, (float)y);
-                if (g_modal == 4) {
-                    if (!strncmp(act, "act:", 4)) {
-                        const char *a = act + 4;
-                        if (!strcmp(a, "sigread")) {
-                            g_sig_read = !g_sig_read;
-                            (void)datad_set_signal_read(g_sig_read);
-                            signal_async_publish(NULL, 0);
-                            save_conf();
-                            snprintf(g_toast, sizeof g_toast, "信令读取已%s", g_sig_read ? "开启" : "关闭");
-                            g_toast_until = now + 1600;
-                            invalidate_render_html_cache();
-                            need_render = 1;
-                        } else if (!strcmp(a, "sigparse")) {
-                            g_sig_parse = !g_sig_parse;
-                            (void)datad_set_signal_parse(g_sig_parse);
-                            signal_async_publish(NULL, 0);
-                            save_conf();
-                            rescan_pages_keep_current();
-                            invalidate_render_html_cache();
-                            snprintf(g_toast, sizeof g_toast, "信令解析已%s", g_sig_parse ? "开启" : "关闭");
-                            g_toast_until = now + 1600;
-                            need_render = 1;
-                        } else if (!strcmp(a, "closemodal")) {
-                            g_modal = 0;
-                            need_render = 1;
-                        }
-                    }
-                } else {
-                char *sel = g_modal == 1 ? g_sel_sa : g_modal == 2 ? g_sel_nsa : g_sel_lte;
-                const char *uni = g_modal == 1 ? g_uni_sa : g_modal == 2 ? g_uni_nsa : g_uni_lte;
-                if (!strncmp(act, "act:", 4)) {
-                    const char *a = act + 4;
-                    if (!strncmp(a, "bsa:", 4) || !strncmp(a, "bnsa:", 5) || !strncmp(a, "blte:", 5)) {
-                        band_toggle(sel, 256, strchr(a, ':') + 1); render_modal_overlay(&disp); animating = 1;
-                    } else if (!strcmp(a, "mall")) {
-                        if (!strcmp(sel, uni)) sel[0] = 0; else snprintf(sel, 256, "%s", uni);
-                        render_modal_overlay(&disp); animating = 1;
-                    } else if (!strcmp(a, "minv")) {
-                        char u[256]; snprintf(u, sizeof u, "%s", uni); char out[256]; int o = 0;
-                        for (char *tk = strtok(u, ","); tk; tk = strtok(NULL, ","))
-                            if (!band_in(sel, tk)) o += snprintf(out + o, sizeof out - o, "%s%s", o ? "," : "", tk);
-                        out[o] = 0; snprintf(sel, 256, "%s", out); render_modal_overlay(&disp); animating = 1;
-                    } else if (!strcmp(a, "mapply")) {
-                        if (sel[0]) { char cmd[360];
-                            if (g_modal == 3)
-                                snprintf(cmd, sizeof cmd, "ubus call zte_nwinfo_api nwinfo_set_lte_ext_band '{\"lte_band\":\"%s\"}' >/dev/null 2>&1 &", sel);
-                            else
-                                snprintf(cmd, sizeof cmd, "ubus call zte_nwinfo_api nwinfo_set_nrbandlock '{\"nr5g_type\":\"%s\",\"nr5g_band\":\"%s\"}' >/dev/null 2>&1 &", g_modal == 1 ? "0" : "1", sel);
-                            system(cmd);
-                        }
-                        snprintf(g_toast, sizeof g_toast, "锁频成功"); g_toast_until = now + 1600;
-                        g_modal = 0; need_render = 1;
-                    }
-                } else { g_modal = 0; need_render = 1; }   /* tap outside closes */
-                }
+            if (pressed && !prev_press) {
+                down_x = x;
+                down_y = y;
+            } else if (!pressed && prev_press) {
+                int mdx = x - down_x, mdy = y - down_y;
+                int modal_was_tap = mdx * mdx + mdy * mdy <= 14 * 14;
+                if (modal_was_tap)
+                    handle_modal_tap(&disp, x, y, now, &need_render, &animating);
+                /* The renderer has already handled this release. Remove its matching
+                 * queue entries before a closed modal exposes the button underneath. */
+                touch_input_drop_replayed_release(&touch, modal_was_tap);
+            } else if (!pressed) {
+                int sx, sy, ex, ey, tx, ty;
+                int have_stroke = touch_input_take_latest_stroke(&touch, &sx, &sy, &ex, &ey);
+                int have_tap = touch_input_take_latest_tap(&touch, &tx, &ty);
+                if (have_tap && (!have_stroke ||
+                    (ex - sx) * (ex - sx) + (ey - sy) * (ey - sy) <= 14 * 14))
+                    handle_modal_tap(&disp, tx, ty, now, &need_render, &animating);
             }
         } else {
             int maxs = g_page_h > H ? g_page_h - H : 0;
@@ -6184,6 +6361,8 @@ int main(void)
                             long sid = strtol(id_txt, &endp, 10);
                             static devui_data_t sd;
                             g_sms_open = -1;
+                            g_sms_scroll = g_sms_scroll_max = 0;
+                            g_sms_view_x = g_sms_view_y = g_sms_view_w = g_sms_view_h = 0;
                             g_sms_num[0] = g_sms_date[0] = g_sms_text[0] = 0;
                             need_render = 1;
                             if (id_txt != endp && endp && *endp == '\0' && data_refresh(&sd)) {
