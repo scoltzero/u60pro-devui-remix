@@ -65,11 +65,12 @@
 
 struct backend_state {
     int inited;
+    int suspended;
     int sse_fd;
     uint32_t next_retry_ms;
-    char sse_buf[DEVUI_SSE_BUF_MAX];
+    char *sse_buf;
     size_t sse_len;
-    char live_json[DEVUI_STATE_BUF_MAX];
+    char *live_json;
     size_t live_json_len;
     devui_data_t live_data;
     int live_valid;
@@ -80,6 +81,32 @@ struct backend_state {
 };
 
 static struct backend_state g_backend;
+static char *g_parse_sec;
+static char *g_clean_json;
+static char *g_http_resp;
+
+static int ensure_work_buffers(void)
+{
+    if (!g_backend.sse_buf) g_backend.sse_buf = malloc(DEVUI_SSE_BUF_MAX);
+    if (!g_backend.live_json) g_backend.live_json = malloc(DEVUI_STATE_BUF_MAX);
+    if (!g_parse_sec) g_parse_sec = malloc(DEVUI_STATE_BUF_MAX);
+    if (!g_clean_json) g_clean_json = malloc(DEVUI_STATE_BUF_MAX);
+    if (!g_http_resp) g_http_resp = malloc(DEVUI_HTTP_BUF_MAX);
+    return g_backend.sse_buf && g_backend.live_json && g_parse_sec &&
+           g_clean_json && g_http_resp;
+}
+
+static void free_work_buffers(void)
+{
+    free(g_backend.sse_buf); g_backend.sse_buf = NULL;
+    free(g_backend.live_json); g_backend.live_json = NULL;
+    free(g_parse_sec); g_parse_sec = NULL;
+    free(g_clean_json); g_clean_json = NULL;
+    free(g_http_resp); g_http_resp = NULL;
+    g_backend.sse_len = 0;
+    g_backend.live_json_len = 0;
+    g_backend.live_valid = 0;
+}
 
 static uint32_t mono_ms(void)
 {
@@ -170,14 +197,15 @@ static char *find_next_object(const char *p)
 
 static int parse_snapshot(devui_data_t *d, const char *buf)
 {
-    static char sec[DEVUI_STATE_BUF_MAX];
+    char *sec = g_parse_sec;
 
     memset(d, 0, sizeof *d);
     d->cpu_usage = -1;
     d->valid = 0;
     if (!buf || !buf[0]) return 0;
 
-    if (json_get(buf, "net", sec, sizeof sec)) {
+    if (!sec) return 0;
+    if (json_get(buf, "net", sec, DEVUI_STATE_BUF_MAX)) {
         getstr(sec, "type", d->net_type, sizeof d->net_type);
         getstr(sec, "operator", d->operator_name, sizeof d->operator_name);
         getstr(sec, "band", d->band, sizeof d->band);
@@ -216,7 +244,7 @@ static int parse_snapshot(devui_data_t *d, const char *buf)
         }
     }
 
-    if (json_get(buf, "battery", sec, sizeof sec)) {
+    if (json_get(buf, "battery", sec, DEVUI_STATE_BUF_MAX)) {
         d->bat_percent     = (int)json_get_int(sec, "percent", 0);
         d->bat_temp        = (int)json_get_int(sec, "temp", 0);
         d->charging        = (int)json_get_int(sec, "charging", 0);
@@ -227,7 +255,7 @@ static int parse_snapshot(devui_data_t *d, const char *buf)
         d->bat_ua = json_get_int(sec, "bat_ua", 0);
     }
 
-    if (json_get(buf, "clients", sec, sizeof sec)) {
+    if (json_get(buf, "clients", sec, DEVUI_STATE_BUF_MAX)) {
         d->clients_total = (int)json_get_int(sec, "total", 0);
         d->clients_wifi  = (int)json_get_int(sec, "wifi", 0);
         d->clients_lan   = (int)json_get_int(sec, "lan", 0);
@@ -297,31 +325,31 @@ static int parse_snapshot(devui_data_t *d, const char *buf)
         }
     }
 
-    if (json_get(buf, "wlan", sec, sizeof sec)) {
+    if (json_get(buf, "wlan", sec, DEVUI_STATE_BUF_MAX)) {
         getstr(sec, "ssid", d->wifi_ssid, sizeof d->wifi_ssid);
         getstr(sec, "key",  d->wifi_key,  sizeof d->wifi_key);
         getstr(sec, "enc",  d->wifi_enc,  sizeof d->wifi_enc);
         d->wifi_enabled = (int)json_get_int(sec, "enabled", 1);
     }
 
-    if (json_get(buf, "nfc", sec, sizeof sec))
+    if (json_get(buf, "nfc", sec, DEVUI_STATE_BUF_MAX))
         d->nfc_switch = (int)json_get_int(sec, "switch", 0);
 
-    if (json_get(buf, "dhcp", sec, sizeof sec)) {
+    if (json_get(buf, "dhcp", sec, DEVUI_STATE_BUF_MAX)) {
         getstr(sec, "ip",        d->dhcp_ip,        sizeof d->dhcp_ip);
         getstr(sec, "start",     d->dhcp_start,     sizeof d->dhcp_start);
         getstr(sec, "limit",     d->dhcp_limit,     sizeof d->dhcp_limit);
         getstr(sec, "leasetime", d->dhcp_leasetime, sizeof d->dhcp_leasetime);
     }
 
-    if (json_get(buf, "traffic", sec, sizeof sec)) {
+    if (json_get(buf, "traffic", sec, DEVUI_STATE_BUF_MAX)) {
         d->rx_speed = json_get_int(sec, "rx_speed", 0);
         d->tx_speed = json_get_int(sec, "tx_speed", 0);
         d->rx_bytes = json_get_int(sec, "rx_bytes", 0);
         d->tx_bytes = json_get_int(sec, "tx_bytes", 0);
     }
 
-    if (json_get(buf, "qos", sec, sizeof sec)) {
+    if (json_get(buf, "qos", sec, DEVUI_STATE_BUF_MAX)) {
         char tmp[32];
         d->qci = (int)json_get_int(sec, "qci", 0);
         d->ambr_dl = json_get(sec, "ambr_dl", tmp, sizeof tmp) ? atof(tmp) : 0.0;
@@ -329,7 +357,7 @@ static int parse_snapshot(devui_data_t *d, const char *buf)
         getstr(sec, "usb_mode", d->usb_mode, sizeof d->usb_mode);
     }
 
-    if (json_get(buf, "system", sec, sizeof sec)) {
+    if (json_get(buf, "system", sec, DEVUI_STATE_BUF_MAX)) {
         d->uptime       = json_get_int(sec, "uptime", 0);
         d->cpu_temp     = json_get_int(sec, "cpu_temp", 0);
         d->cpu_usage    = json_get_int(sec, "cpu_usage", -1);
@@ -460,11 +488,12 @@ static int trim_json_copy(const char *src, size_t len, char *dst, size_t cap, si
 
 static int apply_snapshot_json(const char *json, size_t len)
 {
-    static char clean[DEVUI_STATE_BUF_MAX];
+    char *clean = g_clean_json;
     devui_data_t parsed;
     size_t clean_len = 0;
 
-    if (!trim_json_copy(json, len, clean, sizeof clean, &clean_len)) return 0;
+    if (!clean || !g_backend.live_json) return 0;
+    if (!trim_json_copy(json, len, clean, DEVUI_STATE_BUF_MAX, &clean_len)) return 0;
     if (clean_len == g_backend.live_json_len &&
         memcmp(g_backend.live_json, clean, clean_len) == 0)
         return 0;
@@ -479,10 +508,11 @@ static int apply_snapshot_json(const char *json, size_t len)
 
 static int fetch_state_http(void)
 {
-    static char resp[DEVUI_HTTP_BUF_MAX];
+    char *resp = g_http_resp;
     char req[256];
     char *body;
     size_t n = 0;
+    if (!resp) return -1;
     int fd = connect_tcp(DEVUI_BACKEND_HOST, DEVUI_BACKEND_PORT, DEVUI_BACKEND_IO_TIMEOUT_MS);
 
     if (fd < 0) return -1;
@@ -498,7 +528,7 @@ static int fetch_state_http(void)
     }
     for (;;) {
         ssize_t rd;
-        if (n + 1 >= sizeof resp) {
+        if (n + 1 >= DEVUI_HTTP_BUF_MAX) {
             close(fd);
             return -1;
         }
@@ -506,7 +536,7 @@ static int fetch_state_http(void)
             close(fd);
             return -1;
         }
-        rd = read(fd, resp + n, sizeof resp - 1 - n);
+        rd = read(fd, resp + n, DEVUI_HTTP_BUF_MAX - 1 - n);
         if (rd == 0) break;
         if (rd < 0) {
             if (errno == EINTR) continue;
@@ -547,11 +577,12 @@ static size_t next_sse_event_bytes(const char *buf, size_t len)
 
 static int process_sse_event(const char *buf, size_t len)
 {
-    static char payload[DEVUI_STATE_BUF_MAX];
+    char *payload = g_http_resp;
     char event_name[32];
     size_t line_start = 0;
     size_t payload_len = 0;
 
+    if (!payload) return 0;
     event_name[0] = 0;
     for (size_t i = 0; i < len; i++) {
         if (buf[i] != '\n') continue;
@@ -573,9 +604,9 @@ static int process_sse_event(const char *buf, size_t len)
                 size_t vn;
                 while ((size_t)(v - line) < line_len && *v == ' ') v++;
                 vn = line_len - (size_t)(v - line);
-                if (payload_len && payload_len + 1 < sizeof payload)
+                if (payload_len && payload_len + 1 < DEVUI_STATE_BUF_MAX)
                     payload[payload_len++] = '\n';
-                if (payload_len + vn >= sizeof payload) return 0;
+                if (payload_len + vn >= DEVUI_STATE_BUF_MAX) return 0;
                 memcpy(payload + payload_len, v, vn);
                 payload_len += vn;
             }
@@ -663,7 +694,7 @@ static int open_sse_stream(void)
             }
             g_backend.sse_fd = fd;
             g_backend.sse_len = n - (size_t)(body - hdr);
-            if (g_backend.sse_len >= sizeof g_backend.sse_buf) {
+            if (g_backend.sse_len >= DEVUI_SSE_BUF_MAX) {
                 close_sse_stream();
                 return -1;
             }
@@ -680,12 +711,12 @@ static int drain_sse_stream(void)
 
     while (g_backend.sse_fd >= 0) {
         ssize_t rd;
-        if (g_backend.sse_len + 1 >= sizeof g_backend.sse_buf) {
+        if (g_backend.sse_len + 1 >= DEVUI_SSE_BUF_MAX) {
             close_sse_stream();
             break;
         }
         rd = read(g_backend.sse_fd, g_backend.sse_buf + g_backend.sse_len,
-                  sizeof g_backend.sse_buf - 1 - g_backend.sse_len);
+                  DEVUI_SSE_BUF_MAX - 1 - g_backend.sse_len);
         if (rd > 0) {
             g_backend.sse_len += (size_t)rd;
             g_backend.sse_buf[g_backend.sse_len] = 0;
@@ -707,6 +738,8 @@ static int drain_sse_stream(void)
 int data_backend_init(void)
 {
     backend_init_once();
+    if (!ensure_work_buffers()) return 0;
+    g_backend.suspended = 0;
     (void)fetch_state_http();
     if (g_backend.live_valid) (void)data_backend_commit_latest();
     if (g_backend.sse_fd < 0 && open_sse_stream() < 0)
@@ -719,6 +752,8 @@ int data_backend_poll(uint32_t now_ms)
     int changed = 0;
 
     backend_init_once();
+    if (g_backend.suspended) return 0;
+    if (!ensure_work_buffers()) return 0;
     if (!g_backend.current_valid && !g_backend.live_valid)
         (void)data_backend_init();
     if (g_backend.sse_fd >= 0) changed |= drain_sse_stream();
@@ -747,12 +782,36 @@ int data_backend_commit_latest(void)
     return 1;
 }
 
+void data_backend_suspend(void)
+{
+    backend_init_once();
+    if (g_backend.suspended) return;
+    if (g_backend.sse_fd >= 0) close(g_backend.sse_fd);
+    g_backend.sse_fd = -1;
+    g_backend.suspended = 1;
+    g_backend.next_retry_ms = 0;
+    free_work_buffers();
+}
+
+int data_backend_resume(void)
+{
+    backend_init_once();
+    if (!ensure_work_buffers()) return 0;
+    g_backend.suspended = 0;
+    g_backend.next_retry_ms = 0;
+    (void)fetch_state_http();
+    if (g_backend.sse_fd < 0 && open_sse_stream() < 0)
+        g_backend.next_retry_ms = mono_ms() + DEVUI_BACKEND_RETRY_MS;
+    return g_backend.live_valid;
+}
+
 void data_backend_close(void)
 {
     backend_init_once();
     if (g_backend.sse_fd >= 0) close(g_backend.sse_fd);
     g_backend.sse_fd = -1;
     g_backend.sse_len = 0;
+    free_work_buffers();
 }
 
 int data_refresh(devui_data_t *d)

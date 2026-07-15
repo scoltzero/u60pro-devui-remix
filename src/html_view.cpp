@@ -13,6 +13,7 @@
 #include FT_FREETYPE_H
 
 #include <cstdint>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -40,8 +41,34 @@ static inline void put_px(int x, int y, int r, int g, int b, int a)
         r = (r * a + orr * (255 - a)) / 255;
         g = (g * a + og * (255 - a)) / 255;
         b = (b * a + ob * (255 - a)) / 255;
+        static const int8_t dither[2][2] = {{-2, 1}, {2, -1}};
+        int q = dither[y & 1][x & 1];
+        r = std::max(0, std::min(255, r + q));
+        g = std::max(0, std::min(255, g + q));
+        b = std::max(0, std::min(255, b + q));
     }
     *p = (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
+
+static int round_coverage(int x, int y, int fx, int fy, int fw, int fh,
+                          int rtl, int rtr, int rbr, int rbl)
+{
+    int r = 0;
+    float cx = 0, cy = 0;
+    if (x < fx || y < fy || x >= fx + fw || y >= fy + fh) return 0;
+    if      (x < fx + rtl       && y < fy + rtl)       { r = rtl; cx = fx + rtl;      cy = fy + rtl; }
+    else if (x >= fx + fw - rtr && y < fy + rtr)       { r = rtr; cx = fx + fw - rtr; cy = fy + rtr; }
+    else if (x >= fx + fw - rbr && y >= fy + fh - rbr) { r = rbr; cx = fx + fw - rbr; cy = fy + fh - rbr; }
+    else if (x < fx + rbl       && y >= fy + fh - rbl) { r = rbl; cx = fx + rbl;      cy = fy + fh - rbl; }
+    if (r <= 0) return 255;
+    static const float sample[4][2] = {{.25f,.25f},{.75f,.25f},{.25f,.75f},{.75f,.75f}};
+    int inside = 0;
+    float rr = (float)r * r;
+    for (int i = 0; i < 4; i++) {
+        float dx = x + sample[i][0] - cx, dy = y + sample[i][1] - cy;
+        if (dx * dx + dy * dy <= rr) inside++;
+    }
+    return inside * 255 / 4;
 }
 
 static inline uint16_t get_px565(int x, int y)
@@ -208,8 +235,8 @@ class fb_container : public document_container {
                 else if (x >= fx + fw - rtr && y < fy + rtr)       { r = rtr; cx = fx + fw - 1 - rtr; cy = fy + rtr; }
                 else if (x >= fx + fw - rbr && y >= fy + fh - rbr) { r = rbr; cx = fx + fw - 1 - rbr; cy = fy + fh - 1 - rbr; }
                 else if (x < fx + rbl       && y >= fy + fh - rbl) { r = rbl; cx = fx + rbl;          cy = fy + fh - 1 - rbl; }
-                if (r > 0) { int dx = x - cx, dy = y - cy; if (dx * dx + dy * dy > r * r) continue; }
-                put_px(x, y, c.red, c.green, c.blue, c.alpha);
+                int cov = r > 0 ? round_coverage(x, y, fx, fy, fw, fh, rtl, rtr, rbr, rbl) : 255;
+                if (cov) put_px(x, y, c.red, c.green, c.blue, c.alpha * cov / 255);
             }
         }
     }
@@ -229,9 +256,13 @@ class fb_container : public document_container {
         int x2 = std::min(fx + fw, (int)cl.right()), y2 = std::min(fy + fh, (int)cl.bottom());
         for (int y = y1; y < y2; y++)
             for (int x = x1; x < x2; x++)
-                if (pt_in_round(x, y, fx, fy, fw, fh, rtl, rtr, rbr, rbl) &&
-                    !pt_in_round(x, y, fx + t, fy + t, fw - 2 * t, fh - 2 * t, itl, itr, ibr, ibl))
-                    put_px(x, y, c.red, c.green, c.blue, c.alpha);
+                {
+                    int outer = round_coverage(x, y, fx, fy, fw, fh, rtl, rtr, rbr, rbl);
+                    int inner = round_coverage(x, y, fx + t, fy + t, fw - 2 * t, fh - 2 * t,
+                                               itl, itr, ibr, ibl);
+                    int cov = outer > inner ? outer - inner : 0;
+                    if (cov) put_px(x, y, c.red, c.green, c.blue, c.alpha * cov / 255);
+                }
     }
 
     void fill_background_box(const background_layer &layer, web_color c) {
@@ -267,27 +298,27 @@ public:
     pixel_t text_width(const char *text, uint_ptr h) override {
         auto *f = (ft_font *)h;
         FT_Set_Pixel_Sizes(g_face, 0, f->size);
-        pixel_t w = 0;
+        FT_Pos pen = 0;
         for (const char *s = text; *s; ) {
             unsigned cp = utf8_next(s);
             if (FT_Load_Char(g_face, cp, FT_LOAD_DEFAULT)) continue;
-            w += g_face->glyph->advance.x >> 6;
+            pen += g_face->glyph->advance.x;
         }
-        return w;
+        return (pixel_t)((pen + 32) >> 6);
     }
 
     void draw_text(uint_ptr, const char *text, uint_ptr h, web_color color, const position &pos) override {
         auto *f = (ft_font *)h;
         FT_Set_Pixel_Sizes(g_face, 0, f->size);
-        int pen = (int)pos.x;
+        FT_Pos pen = (FT_Pos)pos.x << 6;
         int base = (int)pos.y + f->ascent;
         position cl = eff_clip();
         for (const char *s = text; *s; ) {
             unsigned cp = utf8_next(s);
-            if (FT_Load_Char(g_face, cp, FT_LOAD_RENDER)) continue;
+            if (FT_Load_Char(g_face, cp, FT_LOAD_RENDER | FT_LOAD_TARGET_LIGHT)) continue;
             FT_GlyphSlot gl = g_face->glyph;
             FT_Bitmap &bm = gl->bitmap;
-            int ox = pen + gl->bitmap_left, oy = base - gl->bitmap_top;
+            int ox = (int)(pen >> 6) + gl->bitmap_left, oy = base - gl->bitmap_top;
             for (int r = 0; r < (int)bm.rows; r++) {
                 int yy = oy + r;
                 if (yy < (int)cl.top() || yy >= (int)cl.bottom()) continue;
@@ -298,7 +329,7 @@ public:
                     if (a) put_px(xx, yy, color.red, color.green, color.blue, a * color.alpha / 255);
                 }
             }
-            pen += gl->advance.x >> 6;
+            pen += gl->advance.x;
         }
     }
 
@@ -492,6 +523,38 @@ extern "C" int html_view_render_tall(uint16_t *buf, const char *html, int bufh)
     return hh;
 }
 
+/* Paint the already parsed and laid-out document into a tall logical buffer.
+ * This is the vertical-drag fast path: no HTML parsing and no second layout. */
+extern "C" int html_view_draw_current_tall(uint16_t *buf, int bufh)
+{
+    if (!buf || !g_doc || !g_container || bufh <= 0) return -1;
+    uint16_t *sfb = g_fb;
+    int sh = g_h, sp = g_pitch_px, sr = g_rotate, ssc = g_scroll_y;
+    g_fb = buf; g_h = bufh; g_pitch_px = g_w; g_rotate = 0; g_scroll_y = 0;
+    std::fill(buf, buf + (size_t)g_w * bufh, 0);
+    g_container->reset_state();
+    position clip(0, 0, (pixel_t)g_w, (pixel_t)bufh);
+    g_doc->draw((uint_ptr)0, 0, 0, &clip);
+    element::ptr root = g_doc->root();
+    int hh = root ? (int)root->get_placement().height : sh;
+    g_fb = sfb; g_h = sh; g_pitch_px = sp; g_rotate = sr; g_scroll_y = ssc;
+    return hh;
+}
+
+extern "C" void html_view_suspend(void)
+{
+    g_doc.reset();
+    g_clicked.clear();
+    if (g_container) g_container->reset_state();
+    for (auto &e : g_css_cache) {
+        e.path.clear();
+        e.text.clear();
+        e.text.shrink_to_fit();
+        e.mtime = -1;
+        e.used = false;
+    }
+}
+
 /* Fill a rect directly (used for the scrollbar overlay). */
 extern "C" void html_view_fill_rect(int x, int y, int w, int h, int r, int g, int b, int a)
 {
@@ -531,8 +594,10 @@ extern "C" void html_view_fill_round_rect(int x, int y, int w, int h, int rad, i
     if (w <= 0 || h <= 0) return;
     for (int yy = y; yy < y + h; yy++)
         for (int xx = x; xx < x + w; xx++)
-            if (pt_in_round(xx, yy, x, y, w, h, rad, rad, rad, rad))
-                put_px(xx, yy, r, g, b, a);
+            {
+                int cov = round_coverage(xx, yy, x, y, w, h, rad, rad, rad, rad);
+                if (cov) put_px(xx, yy, r, g, b, a * cov / 255);
+            }
 }
 
 extern "C" int html_view_text_width_px(const char *text, int size)
@@ -558,12 +623,13 @@ extern "C" void html_view_text_bounds_px(const char *text, int size,
     if (!g_face || !text) return;
     FT_Set_Pixel_Sizes(g_face, 0, size);
     int ascent = g_face->size->metrics.ascender >> 6;
-    int pen = 0, minx = 0, miny = 0, maxx = 0, maxy = 0, seen = 0;
+    FT_Pos pen = 0;
+    int minx = 0, miny = 0, maxx = 0, maxy = 0, seen = 0;
     for (const char *s = text; *s; ) {
         unsigned cp = utf8_next(s);
-        if (FT_Load_Char(g_face, cp, FT_LOAD_RENDER)) continue;
+        if (FT_Load_Char(g_face, cp, FT_LOAD_RENDER | FT_LOAD_TARGET_LIGHT)) continue;
         FT_GlyphSlot gl = g_face->glyph;
-        int gx0 = pen + gl->bitmap_left;
+        int gx0 = (int)(pen >> 6) + gl->bitmap_left;
         int gy0 = ascent - gl->bitmap_top;
         int gx1 = gx0 + (int)gl->bitmap.width;
         int gy1 = gy0 + (int)gl->bitmap.rows;
@@ -575,7 +641,7 @@ extern "C" void html_view_text_bounds_px(const char *text, int size,
             if (gx1 > maxx) maxx = gx1;
             if (gy1 > maxy) maxy = gy1;
         }
-        pen += gl->advance.x >> 6;
+        pen += gl->advance.x;
     }
     if (!seen) return;
     if (x0) *x0 = minx;
@@ -590,21 +656,22 @@ extern "C" void html_view_draw_text_px(int x, int y, const char *text, int size,
     if (!g_face || !text) return;
     FT_Set_Pixel_Sizes(g_face, 0, size);
     int ascent = g_face->size->metrics.ascender >> 6;
-    int pen = x, base = y + ascent;
+    FT_Pos pen = (FT_Pos)x << 6;
+    int base = y + ascent;
     for (const char *s = text; *s; ) {
         unsigned cp = utf8_next(s);
-        if (FT_Load_Char(g_face, cp, FT_LOAD_RENDER)) continue;
+        if (FT_Load_Char(g_face, cp, FT_LOAD_RENDER | FT_LOAD_TARGET_LIGHT)) continue;
         FT_GlyphSlot gl = g_face->glyph;
         FT_Bitmap &bm = gl->bitmap;
         for (int pass = 0; pass < (bold ? 2 : 1); pass++) {
-            int ox = pen + gl->bitmap_left + pass, oy = base - gl->bitmap_top;
+            int ox = (int)(pen >> 6) + gl->bitmap_left + pass, oy = base - gl->bitmap_top;
             for (int row = 0; row < (int)bm.rows; row++)
                 for (int col = 0; col < (int)bm.width; col++) {
                     int aa = bm.buffer[row * bm.pitch + col];
                     if (aa) put_px(ox + col, oy + row, r, g, b, aa * a / 255);
                 }
         }
-        pen += gl->advance.x >> 6;
+        pen += gl->advance.x;
     }
 }
 
@@ -614,14 +681,15 @@ extern "C" void html_view_draw_text_contrast_px(int x, int y, const char *text, 
     if (!g_face || !text) return;
     FT_Set_Pixel_Sizes(g_face, 0, size);
     int ascent = g_face->size->metrics.ascender >> 6;
-    int pen = x, base = y + ascent;
+    FT_Pos pen = (FT_Pos)x << 6;
+    int base = y + ascent;
     for (const char *s = text; *s; ) {
         unsigned cp = utf8_next(s);
-        if (FT_Load_Char(g_face, cp, FT_LOAD_RENDER)) continue;
+        if (FT_Load_Char(g_face, cp, FT_LOAD_RENDER | FT_LOAD_TARGET_LIGHT)) continue;
         FT_GlyphSlot gl = g_face->glyph;
         FT_Bitmap &bm = gl->bitmap;
         for (int pass = 0; pass < (bold ? 2 : 1); pass++) {
-            int ox = pen + gl->bitmap_left + pass, oy = base - gl->bitmap_top;
+            int ox = (int)(pen >> 6) + gl->bitmap_left + pass, oy = base - gl->bitmap_top;
             for (int row = 0; row < (int)bm.rows; row++)
                 for (int col = 0; col < (int)bm.width; col++) {
                     int aa = bm.buffer[row * bm.pitch + col];
@@ -637,7 +705,7 @@ extern "C" void html_view_draw_text_contrast_px(int x, int y, const char *text, 
                     put_px(ox + col, oy + row, r, g, b, aa * a / 255);
                 }
         }
-        pen += gl->advance.x >> 6;
+        pen += gl->advance.x;
     }
 }
 
@@ -663,6 +731,25 @@ extern "C" const char *html_view_click(float x, float y)
 static void chart_line(int x0, int y0, int x1, int y1,
                        int rx, int ry, int rw, int rh, int r, int g, int b, int thick)
 {
+    if (thick == 1 && x0 != x1 && y0 != y1) {
+        bool steep = std::abs(y1 - y0) > std::abs(x1 - x0);
+        if (steep) { std::swap(x0, y0); std::swap(x1, y1); }
+        if (x0 > x1) { std::swap(x0, x1); std::swap(y0, y1); }
+        float grad = (float)(y1 - y0) / (float)(x1 - x0);
+        float yy = (float)y0;
+        for (int xx = x0; xx <= x1; xx++, yy += grad) {
+            int iy = (int)std::floor(yy);
+            int a0 = (int)((1.0f - (yy - iy)) * 255.0f);
+            int a1 = 255 - a0;
+            int px0 = steep ? iy : xx, py0 = steep ? xx : iy;
+            int px1 = steep ? iy + 1 : xx, py1 = steep ? xx : iy + 1;
+            if (px0 >= rx && px0 < rx + rw && py0 >= ry && py0 < ry + rh)
+                put_px(px0, py0, r, g, b, a0);
+            if (px1 >= rx && px1 < rx + rw && py1 >= ry && py1 < ry + rh)
+                put_px(px1, py1, r, g, b, a1);
+        }
+        return;
+    }
     int dx = std::abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
     int dy = -std::abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
     int err = dx + dy;

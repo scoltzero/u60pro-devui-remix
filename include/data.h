@@ -83,6 +83,11 @@ int  data_backend_poll(uint32_t now_ms);
 /* Promote the latest live snapshot to the UI-visible snapshot. */
 int  data_backend_commit_latest(void);
 
+/* Drop transport/parser working memory while the panel is dark, then rebuild it
+ * and fetch a fresh snapshot on wake. The last committed UI snapshot is kept. */
+void data_backend_suspend(void);
+int  data_backend_resume(void);
+
 /* Close the transport socket. Safe to call during shutdown. */
 void data_backend_close(void);
 

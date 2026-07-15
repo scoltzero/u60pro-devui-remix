@@ -23,8 +23,11 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,7 +59,9 @@ extern void        html_view_draw_text_px(int x, int y, const char *text, int si
 extern void        html_view_draw_text_contrast_px(int x, int y, const char *text, int size, int bold,
                                                    int dr, int dg, int db, int lr, int lg, int lb, int a);
 extern int         html_view_render_tall(uint16_t *buf, const char *html, int bufh);
+extern int         html_view_draw_current_tall(uint16_t *buf, int bufh);
 extern int         html_view_render_overlay(const char *html);
+extern void        html_view_suspend(void);
 static void        maybe_dump_fb(drm_disp_t *d);
 
 #ifndef UI_DIR
@@ -69,6 +74,7 @@ static void        maybe_dump_fb(drm_disp_t *d);
 #define DATAD_HTTP_TIMEOUT_MS 300
 
 static volatile sig_atomic_t g_run = 1;
+static volatile int g_ui_awake = 1;
 static void on_sig(int s) { (void)s; g_run = 0; }
 
 static uint32_t millis(void)
@@ -156,7 +162,8 @@ static double g_st_dl_avg, g_st_dl_peak, g_st_ul_avg, g_st_ul_peak, g_st_ping, g
 #define ST_HIST 48
 static int g_st_dl_hist[ST_HIST], g_st_ul_hist[ST_HIST], g_st_dl_n, g_st_ul_n;
 static int g_last_clock_min = -1;       /* HH:MM changes only once per minute */
-static char g_render_html_cache[PAGE_HTML_CACHE_CAP];
+static char *g_render_html_cache;
+static size_t g_render_html_cache_cap;
 static size_t g_render_html_cache_len;
 static char g_render_html_cache_path[320];
 static int g_render_html_cache_scroll;
@@ -167,6 +174,8 @@ static long long g_render_html_cache_css_mtime = -1;
 static long long g_pages_dir_mtime = -1;
 static uint32_t g_pages_scan_at;
 static int normalize_refresh_ms(int ms);
+
+static void invalidate_render_html_cache(void);
 
 /* ---- page-2 aux state, cached (-1 = unknown). Like the reference plugin,
  * bands are controlled purely with `ifconfig wlanN up/down` and read back from
@@ -484,9 +493,7 @@ static int rescan_pages_if_changed(void)
     if (mtime < 0 || mtime == g_pages_dir_mtime) return 0;
     g_pages_dir_mtime = mtime;
     rescan_pages_keep_current();
-    g_render_html_cache_len = 0;
-    g_render_html_cache_path[0] = 0;
-    g_render_html_cache_css_mtime = -1;
+    invalidate_render_html_cache();
     return 1;
 }
 
@@ -3372,6 +3379,13 @@ static void *signal_async_worker(void *arg)
     (void)arg;
     signal_async_publish(NULL, 0);
     while (g_run) {
+        if (!g_ui_awake) {
+            if (was_enabled) signal_async_publish(NULL, 0);
+            was_enabled = 0;
+            next_at = 0;
+            usleep(200000);
+            continue;
+        }
         int enabled = signal_live_enabled();
         int wait_ms = g_refresh_ms > 0 ? g_refresh_ms : 1000;
         uint32_t now = millis();
@@ -5053,6 +5067,9 @@ static const char *page_html(const char *path)
 
 static void invalidate_render_html_cache(void)
 {
+    free(g_render_html_cache);
+    g_render_html_cache = NULL;
+    g_render_html_cache_cap = 0;
     g_render_html_cache_len = 0;
     g_render_html_cache_path[0] = 0;
     g_render_html_cache_css_mtime = -1;
@@ -5272,7 +5289,7 @@ static void render(drm_disp_t *disp, const char *path)
     int has_charts = strstr(path, "charts.html") != NULL || is_speedtest;
     long long css_mtime = file_mtime_ns(UI_DIR "/style.css");
     if (is_speedtest) css_mtime ^= file_mtime_ns(UI_DIR "/speedtest.css");
-    int cacheable = html_len > 0 && html_len < sizeof(g_render_html_cache);
+    int cacheable = html_len > 0 && html_len < PAGE_HTML_CACHE_CAP;
     int reuse = cacheable && !has_charts &&
                  g_render_html_cache_scroll == scroll &&
                  g_render_html_cache_modal == g_modal &&
@@ -5281,19 +5298,30 @@ static void render(drm_disp_t *disp, const char *path)
                  g_render_html_cache_css_mtime == css_mtime &&
                  g_render_html_cache_len == html_len &&
                  !strcmp(g_render_html_cache_path, path) &&
-                 !strncmp(g_render_html_cache, html, html_len);
+                 g_render_html_cache && !memcmp(g_render_html_cache, html, html_len);
     html_view_set_scroll(scroll);
     if (!reuse) {
         g_page_h = html_view_render_html(html);
         if (cacheable) {
-            memcpy(g_render_html_cache, html, html_len + 1);
-            g_render_html_cache_len = html_len;
-            snprintf(g_render_html_cache_path, sizeof g_render_html_cache_path, "%s", path);
-            g_render_html_cache_scroll = scroll;
-            g_render_html_cache_modal = g_modal;
-            g_render_html_cache_sms_open = g_sms_open;
-            g_render_html_cache_lock = g_lock_state;
-            g_render_html_cache_css_mtime = css_mtime;
+            if (g_render_html_cache_cap != html_len + 1) {
+                char *next = realloc(g_render_html_cache, html_len + 1);
+                if (next) {
+                    g_render_html_cache = next;
+                    g_render_html_cache_cap = html_len + 1;
+                }
+            }
+            if (g_render_html_cache && g_render_html_cache_cap >= html_len + 1) {
+                memcpy(g_render_html_cache, html, html_len + 1);
+                g_render_html_cache_len = html_len;
+                snprintf(g_render_html_cache_path, sizeof g_render_html_cache_path, "%s", path);
+                g_render_html_cache_scroll = scroll;
+                g_render_html_cache_modal = g_modal;
+                g_render_html_cache_sms_open = g_sms_open;
+                g_render_html_cache_lock = g_lock_state;
+                g_render_html_cache_css_mtime = css_mtime;
+            } else {
+                invalidate_render_html_cache();
+            }
         } else {
             invalidate_render_html_cache();
         }
@@ -5331,7 +5359,7 @@ static void render_ext_view(drm_disp_t *disp, devui_ext_t *ext)
 /* Offscreen page bitmaps (logical, no rotation) for slide transitions.
  * During a drag: g_bufA = left page, g_bufB = right page (windowed by offset o:
  * window column x shows [left|right][x+o], o in 0..W). */
-static uint16_t g_bufA[320 * 480], g_bufB[320 * 480];
+static uint16_t *g_bufA, *g_bufB;
 
 /* Status bar stays pinned during a swipe (only the content below slides), so
  * we keep the already-rendered native status bar rows untouched and only
@@ -5354,6 +5382,74 @@ static uint16_t g_bufA[320 * 480], g_bufB[320 * 480];
 #define QUEUED_SCROLL_PX 28
 #define IDLE_SLEEP_ON_US 8000
 #define IDLE_SLEEP_OFF_US 30000
+#define GESTURE_CACHE_TTL_MS 5000
+#define INTERACTION_BOOST_MS 1500
+
+static uint32_t g_gesture_used_at;
+static uint32_t g_boost_until;
+static int g_boosted;
+
+struct devui_sched_attr {
+    uint32_t size;
+    uint32_t sched_policy;
+    uint64_t sched_flags;
+    int32_t sched_nice;
+    uint32_t sched_priority;
+    uint64_t sched_runtime, sched_deadline, sched_period;
+    uint32_t sched_util_min, sched_util_max;
+};
+
+static void set_interaction_boost(int enabled)
+{
+    const unsigned long SCHED_FLAG_UTIL_CLAMP_MIN_LOCAL = 0x20;
+    struct devui_sched_attr a;
+    if (g_boosted == enabled) return;
+    (void)setpriority(PRIO_PROCESS, 0, enabled ? -5 : 0);
+#ifdef SYS_sched_setattr
+    memset(&a, 0, sizeof a);
+    a.size = sizeof a;
+    a.sched_flags = SCHED_FLAG_UTIL_CLAMP_MIN_LOCAL;
+    a.sched_nice = enabled ? -5 : 0;
+    a.sched_util_min = enabled ? 256 : 0;
+    (void)syscall(SYS_sched_setattr, 0, &a, 0);
+#endif
+    g_boosted = enabled;
+}
+
+static void interaction_pulse(uint32_t now)
+{
+    g_boost_until = now + INTERACTION_BOOST_MS;
+    set_interaction_boost(1);
+}
+
+static void *gesture_alloc(size_t bytes)
+{
+    void *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return p == MAP_FAILED ? NULL : p;
+}
+
+static void gesture_free(void **p, size_t bytes)
+{
+    if (*p) munmap(*p, bytes);
+    *p = NULL;
+}
+
+static int ensure_pair_buffers(void)
+{
+    const size_t bytes = 320u * 480u * sizeof(uint16_t);
+    if (!g_bufA) g_bufA = gesture_alloc(bytes);
+    if (!g_bufB) g_bufB = gesture_alloc(bytes);
+    return g_bufA && g_bufB;
+}
+
+static void capture_fb_logical(drm_disp_t *d, uint16_t *dst)
+{
+    for (int y = 0; y < d->height; y++)
+        for (int x = 0; x < d->width; x++)
+            dst[(size_t)y * d->width + x] =
+                d->fb[(size_t)(d->height - 1 - y) * d->pitch_px + (d->width - 1 - x)];
+}
 
 static int motion_frame_due(uint32_t now, uint32_t *last)
 {
@@ -5414,17 +5510,20 @@ static void render_page_to_pair_buf(uint16_t *buf, const char *path, const char 
     html_view_target_end();
 }
 
-static void prep_pair(int target, int dir)
+static int prep_pair(drm_disp_t *d, int target, int dir)
 {
     const char *h;
+    if (!ensure_pair_buffers()) return 0;
     if (dir > 0) {   /* next: left=current, right=target */
-        html_view_set_scroll(g_scroll); h = page_html(g_pages[g_cur]);  render_page_to_pair_buf(g_bufA, g_pages[g_cur], h, g_scroll);
+        capture_fb_logical(d, g_bufA);
         html_view_set_scroll(0);        h = page_html(g_pages[target]); render_page_to_pair_buf(g_bufB, g_pages[target], h, 0);
     } else {         /* prev: left=target, right=current */
         html_view_set_scroll(0);        h = page_html(g_pages[target]); render_page_to_pair_buf(g_bufA, g_pages[target], h, 0);
-        html_view_set_scroll(g_scroll); h = page_html(g_pages[g_cur]);  render_page_to_pair_buf(g_bufB, g_pages[g_cur], h, g_scroll);
+        capture_fb_logical(d, g_bufB);
     }
     html_view_set_scroll(g_scroll);
+    g_gesture_used_at = millis();
+    return 1;
 }
 
 /* Settle the offset from o0 to o1 over a few frames. */
@@ -5438,8 +5537,15 @@ static void anim_o(drm_disp_t *d, int o0, int o1)
  * (logical, unrotated); each drag frame just blits the visible window + scrollbar
  * without re-parsing/re-layout, so it keeps up like the horizontal swipe. */
 #define SCROLLMAX 2048
-static uint16_t g_scrollbuf[320 * SCROLLMAX];
+static uint16_t *g_scrollbuf;
 static int g_scroll_h;
+
+static int ensure_scroll_buffer(void)
+{
+    if (!g_scrollbuf)
+        g_scrollbuf = gesture_alloc(320u * SCROLLMAX * sizeof(uint16_t));
+    return g_scrollbuf != NULL;
+}
 
 static void scroll_blit(drm_disp_t *d, int scroll)
 {
@@ -5462,9 +5568,25 @@ static void scroll_blit(drm_disp_t *d, int scroll)
 
 /* fb snapshot for fast overlay refresh (modal toggles, segmented-control drag):
  * avoids re-laying-out the whole page on every interaction. */
-static uint16_t g_overbg[320 * 480];
-static void capture_fb(drm_disp_t *d) { memcpy(g_overbg, d->fb, (size_t)d->pitch_px * d->height * sizeof(uint16_t)); }
-static void restore_fb(drm_disp_t *d) { memcpy(d->fb, g_overbg, (size_t)d->pitch_px * d->height * sizeof(uint16_t)); }
+static uint16_t *g_overbg;
+static void capture_fb(drm_disp_t *d) {
+    size_t bytes = (size_t)d->pitch_px * d->height * sizeof(uint16_t);
+    if (!g_overbg) g_overbg = gesture_alloc(bytes);
+    if (g_overbg) memcpy(g_overbg, d->fb, bytes);
+}
+static void restore_fb(drm_disp_t *d) {
+    if (g_overbg) memcpy(d->fb, g_overbg, (size_t)d->pitch_px * d->height * sizeof(uint16_t));
+}
+
+static void release_gesture_caches(void)
+{
+    const size_t frame_bytes = 320u * 480u * sizeof(uint16_t);
+    gesture_free((void **)&g_bufA, frame_bytes);
+    gesture_free((void **)&g_bufB, frame_bytes);
+    gesture_free((void **)&g_scrollbuf, 320u * SCROLLMAX * sizeof(uint16_t));
+    gesture_free((void **)&g_overbg, frame_bytes);
+    g_scroll_h = 0;
+}
 
 static int sms_scroll_metrics(void)
 {
@@ -5632,7 +5754,12 @@ static void set_bright_x(int x, int bx, int bw)
 static void screen_off(drm_disp_t *d)
 {
     backlight_fade_off();
+    g_ui_awake = 0;
+    data_backend_suspend();
     invalidate_render_html_cache();
+    html_view_suspend();
+    release_gesture_caches();
+    set_interaction_boost(0);
     memset(d->fb, 0, (size_t)d->pitch_px * d->height * sizeof(uint16_t));
     drm_disp_dirty(d, 0, 0, d->width - 1, d->height - 1);
 }
@@ -5641,10 +5768,14 @@ static void screen_off(drm_disp_t *d)
  * transient invisibly, then fades the backlight up from 0. */
 static void screen_on(drm_disp_t *d, const char *path)
 {
+    g_ui_awake = 1;
+    (void)data_backend_resume();
+    (void)data_backend_commit_latest();
+    interaction_pulse(millis());
     if (g_charge_boot) render_charge_boot(d);
     else               render(d, path);       /* backlight still 0 from screen_off */
-    for (int k = 0; k < 5; k++) {            /* ~175ms of dark refresh */
-        usleep(35000);
+    for (int k = 0; k < 3; k++) {            /* ~75ms command-mode wake settling */
+        usleep(25000);
         drm_disp_dirty(d, 0, 0, d->width - 1, d->height - 1);
     }
     backlight_fade_on();   /* 0 -> user level */
@@ -5652,9 +5783,13 @@ static void screen_on(drm_disp_t *d, const char *path)
 
 static void screen_on_ext(drm_disp_t *d, devui_ext_t *ext)
 {
+    g_ui_awake = 1;
+    (void)data_backend_resume();
+    (void)data_backend_commit_latest();
+    interaction_pulse(millis());
     render_ext_view(d, ext);                  /* backlight still 0 from screen_off */
-    for (int k = 0; k < 5; k++) {
-        usleep(35000);
+    for (int k = 0; k < 3; k++) {
+        usleep(25000);
         drm_disp_dirty(d, 0, 0, d->width - 1, d->height - 1);
     }
     backlight_fade_on();
@@ -5689,6 +5824,7 @@ int main(void)
     }
 
     int menu = 0, prev_press = 0, prev_lock = 0, was_on = 1, down_x = 0, down_y = 0;
+    int press_feedback = 0;
     int dragging = 0, drag_dir = 0, drag_target = 0;
     int scroll_dir = 0, scroll_start = 0;
     int sms_dragging = 0, sms_scroll_start = 0;
@@ -5750,12 +5886,12 @@ int main(void)
         int live_changed = data_backend_poll(now);
         if (live_changed) state_pending = 1;
 
-        if (ext_ok && g_lock_state && devui_ext_active(&ext)) {
+        if (backlight_is_on() && ext_ok && g_lock_state && devui_ext_active(&ext)) {
             devui_ext_deactivate(&ext);
             touch_input_clear_taps(&touch);
             need_render = 1;
         }
-        if (ext_ok && !g_lock_state) {
+        if (backlight_is_on() && ext_ok && !g_lock_state) {
             int ext_changed = devui_ext_poll(&ext, now);
             if (ext_changed) {
                 dragging = 0; drag_dir = 0; scroll_dir = 0; sliding = 0; segging = 0;
@@ -5807,6 +5943,14 @@ int main(void)
             }
         }
 
+        if (!backlight_is_on()) {
+            touch_input_clear_taps(&touch);
+            prev_press = 0;
+            was_on = 0;
+            usleep(IDLE_SLEEP_OFF_US);
+            continue;
+        }
+
         if (g_charge_boot) {
             if (live_changed && data_backend_commit_latest()) {
                 state_pending = 0;
@@ -5832,6 +5976,21 @@ int main(void)
             pressed = 0;
         }
         if (pressed && on_now) last_act = now;
+        if (pressed && on_now) {
+            interaction_pulse(now);
+            g_gesture_used_at = now;
+        }
+        if (pressed && !prev_press && on_now && !g_lock_state && !g_modal && g_sms_open < 0 &&
+            !(ext_ok && devui_ext_active(&ext))) {
+            capture_fb(&disp);
+            html_view_fill_round_rect(x - 12, y - 8, 24, 16, 6, 255, 255, 255, 44);
+            drm_disp_dirty(&disp, 0, 0, W - 1, H - 1);
+            press_feedback = 1;
+        } else if (!pressed && prev_press && press_feedback) {
+            restore_fb(&disp);
+            drm_disp_dirty(&disp, 0, 0, W - 1, H - 1);
+            press_feedback = 0;
+        }
 
         if (!on_now) {
             /* screen off: ignore touch entirely and discard any taps the panel
@@ -6056,20 +6215,23 @@ int main(void)
                         scroll_inertia = 0;
                         scroll_track_valid = 0;
                         scroll_v = 0.0f;
-                        prep_pair(target, dir);
-                        anim_o(&disp, o_now, dir > 0 ? W : 0);
-                        g_cur = target;
-                        g_scroll = 0;
-                        invalidate_render_html_cache();
-                        need_render = 1;
-                        animating = 1;
-                        last_motion_frame = now;
-                        queued_motion = 1;
-                        touch_input_clear_taps(&touch);
+                        if (prep_pair(&disp, target, dir)) {
+                            anim_o(&disp, o_now, dir > 0 ? W : 0);
+                            g_cur = target;
+                            g_scroll = 0;
+                            invalidate_render_html_cache();
+                            need_render = 1;
+                            animating = 1;
+                            last_motion_frame = now;
+                            queued_motion = 1;
+                            touch_input_clear_taps(&touch);
+                        }
                     } else if (qady >= QUEUED_SCROLL_PX && qady >= qadx && maxs > 0) {
                         int bufh = g_page_h > SCROLLMAX ? SCROLLMAX : g_page_h;
-                        const char *hp = page_html(CUR_PATH);
-                        int rh = hp ? html_view_render_tall(g_scrollbuf, hp, bufh) : g_page_h;
+                        int rh;
+                        if (!ensure_scroll_buffer()) goto queued_done;
+                        rh = html_view_draw_current_tall(g_scrollbuf, bufh);
+                        if (rh <= 0) goto queued_done;
                         int ns;
                         g_scroll_h = rh > bufh ? bufh : rh;
                         maxs = g_scroll_h > H ? g_scroll_h - H : 0;
@@ -6090,6 +6252,7 @@ int main(void)
                         touch_input_clear_taps(&touch);
                     }
                 }
+queued_done:
                 if (!queued_motion) {
                     int tx, ty;
                     if (touch_input_take_latest_tap(&touch, &tx, &ty)) {
@@ -6158,20 +6321,29 @@ int main(void)
                 int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
                 if (drag_dir == 0 && scroll_dir == 0) {
                     if (!g_subpage[0] && g_npages > 1 && adx > DRAG_START_PX && adx > ady) {
+                        if (press_feedback) { restore_fb(&disp); press_feedback = 0; }
                         drag_dir = dx < 0 ? 1 : -1;
                         drag_target = (g_cur + (drag_dir > 0 ? 1 : g_npages - 1)) % g_npages;
-                        prep_pair(drag_target, drag_dir);
+                        if (!prep_pair(&disp, drag_target, drag_dir)) {
+                            drag_dir = 0;
+                            dragging = 0;
+                        }
                     } else if (ady > DRAG_START_PX && ady >= adx && maxs > 0) {
+                        if (press_feedback) { restore_fb(&disp); press_feedback = 0; }
                         scroll_dir = 1; scroll_start = g_scroll;
                         int bufh = g_page_h > SCROLLMAX ? SCROLLMAX : g_page_h;  /* prerender once */
-                        const char *hp = page_html(CUR_PATH);
-                        int rh = hp ? html_view_render_tall(g_scrollbuf, hp, bufh) : g_page_h;
-                        g_scroll_h = rh > bufh ? bufh : rh;
-                        maxs = g_scroll_h > H ? g_scroll_h - H : 0;
-                        scroll_track_pos = g_scroll;
-                        scroll_track_ms = now;
-                        scroll_track_valid = 0;
-                        scroll_v = 0.0f;
+                        int rh = ensure_scroll_buffer() ? html_view_draw_current_tall(g_scrollbuf, bufh) : -1;
+                        if (rh <= 0) {
+                            scroll_dir = 0;
+                            dragging = 0;
+                        } else {
+                            g_scroll_h = rh > bufh ? bufh : rh;
+                            maxs = g_scroll_h > H ? g_scroll_h - H : 0;
+                            scroll_track_pos = g_scroll;
+                            scroll_track_ms = now;
+                            scroll_track_valid = 0;
+                            scroll_v = 0.0f;
+                        }
                     } else if (ady > DRAG_CANCEL_PX) dragging = 0;
                 }
                 if (drag_dir != 0) {
@@ -6716,6 +6888,10 @@ action_done:
          * live backend updates, but the minute clock still ticks once per second. */
         {
             uint32_t poll_ms = g_refresh_ms > 0 ? (uint32_t)g_refresh_ms : 1000;
+            int keep_fast = (g_npages > 0 && !strcmp(CUR_PATH, g_pages[0])) ||
+                            path_is_speedtest(CUR_PATH) || g_st_home_open;
+            if (!keep_fast && g_refresh_ms > 0 && g_refresh_ms < 2000 && now - last_act >= 10000)
+                poll_ms = 2000;
             if (!dragging && !scroll_inertia && now - last_data >= poll_ms) {
                 time_t now_t = time(NULL);
                 int state_changed = 0;
@@ -6764,6 +6940,17 @@ action_done:
                 render_ext_view(&disp, &ext);
             else
                 render(&disp, CUR_PATH);
+        }
+        if (animating) {
+            interaction_pulse(now);
+            g_gesture_used_at = now;
+        }
+        if (g_boosted && (int32_t)(now - g_boost_until) >= 0)
+            set_interaction_boost(0);
+        if (!dragging && !scroll_inertia && !g_modal && g_sms_open < 0 && !segging &&
+            g_gesture_used_at && now - g_gesture_used_at >= GESTURE_CACHE_TTL_MS) {
+            release_gesture_caches();
+            g_gesture_used_at = 0;
         }
         was_on = backlight_is_on();   /* track for next frame's wake-touch discard */
         if (!animating) usleep(backlight_is_on() ? IDLE_SLEEP_ON_US : IDLE_SLEEP_OFF_US);
