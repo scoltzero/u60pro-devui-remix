@@ -151,6 +151,7 @@ litehtml 不是浏览器，**限制比较多**，踩坑前先看这里：
 | `{{PAGE}}` `{{NPAGES}}` | 当前页 / 总页数 | `3` / `5` |
 | `{{TSSTATE}}` `{{TSIP}}` `{{TSVERSION}}` `{{TSHOST}}` `{{TSROUTES}}` `{{TSBOOT}}` | Tailscale 自定义页状态 | |
 | `{{MHSTATE}}` `{{MHVERSION}}` `{{MHMODE}}` `{{MHPORT}}` `{{MHTUN}}` `{{MHRULES}}` `{{MHIPSET}}` | Clash / Mihomo 自定义页状态 | |
+| `{{CPUSTATE}}` `{{CPUGOV}}` `{{CPUCUR}}` `{{CPUMIN}}` `{{CPUMAX}}` | CPU 性能模式页状态 | |
 
 > 安全提示：`{{KEY}}`(WiFi 密码)、`{{CELLID}}`、`{{IMEI}}` **默认打码**(显示 `*`)，点对应"显示"动作才明文。请保留此行为。
 
@@ -189,6 +190,7 @@ litehtml 不是浏览器，**限制比较多**，踩坑前先看这里：
 | `act:backfunc` | 从二级页面返回顶层页 |
 | `act:tsstart` `act:tsstop` `act:tsrestart` `act:tsrefresh` | 控制或刷新本机 Tailscale 服务 |
 | `act:mhstart` `act:mhstop` `act:mhrestart` `act:mhrefresh` | 控制或刷新本机 Clash / Mihomo 服务 |
+| `act:cpupowersave` `act:cpubalance` `act:cpuperformance` `act:cpuextreme` `act:cpurefresh` | 设置或刷新 CPU 性能模式 |
 | `act:neighbors` | 首页展开 / 收起邻小区列表 |
 | `act:stpage` | 打开测速二级页（只有测速后端存在时更多功能页才显示入口） |
 

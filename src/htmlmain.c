@@ -79,21 +79,26 @@ static uint32_t millis(void)
 
 /* Optional service pages under ui/functions/.  These fixed paths intentionally
  * avoid a generic "run shell from HTML" action: custom pages remain data-only,
- * while the two known local services get a small, auditable control surface. */
+ * while known local services get a small, auditable control surface. */
 #define TAILSCALE_CTL "/data/plugins/tailscale/tsctl.sh"
 #define TAILSCALE_DIR "/data/plugins/tailscale"
 #define TAILSCALE_ACTION_LOG "/tmp/devui-tailscale-action.log"
 #define MIHOMO_CTL    "/data/ufi-tools/mihomo/mm.sh"
 #define MIHOMO_DIR    "/data/ufi-tools/mihomo"
 #define MIHOMO_ACTION_LOG "/tmp/devui-mihomo-action.log"
+#define CPU_CTL UI_DIR "/../cpuctl.sh"
+#define CPU_ACTION_LOG "/tmp/devui-cpu-action.log"
 
 static uint32_t g_plugin_status_at;
 static int g_ts_installed, g_ts_running, g_ts_connected, g_ts_boot;
 static int g_mh_installed, g_mh_running, g_mh_tun, g_mh_rules;
+static int g_cpu_installed;
 static char g_ts_pid[16] = "-", g_ts_ip[48] = "-", g_ts_version[32] = "-";
 static char g_ts_host[64] = "-", g_ts_routes[160] = "-";
 static char g_mh_pid[16] = "-", g_mh_version[64] = "-", g_mh_mode[24] = "-";
 static char g_mh_port[16] = "-", g_mh_ipset[24] = "-";
+static char g_cpu_mode[24] = "unknown", g_cpu_gov[24] = "-";
+static char g_cpu_cur[24] = "-", g_cpu_min[24] = "-", g_cpu_max[24] = "-";
 
 #define TEMPLATE_CACHE_CAP 8
 #define PAGE_HTML_CACHE_CAP 1048576
@@ -856,7 +861,8 @@ static int plugin_status_page(const char *path)
 {
     return path && (strstr(path, "/functions/tailscale.html") ||
                     strstr(path, "/functions/clash.html") ||
-                    strstr(path, "/functions/mihomo.html"));
+                    strstr(path, "/functions/mihomo.html") ||
+                    strstr(path, "/functions/cpu-performance.html"));
 }
 
 static void plugin_status_refresh(const char *path, int force)
@@ -871,6 +877,7 @@ static void plugin_status_refresh(const char *path, int force)
 
     g_ts_installed = g_ts_running = g_ts_connected = g_ts_boot = 0;
     g_mh_installed = g_mh_running = g_mh_tun = g_mh_rules = 0;
+    g_cpu_installed = 0;
     snprintf(g_ts_pid, sizeof g_ts_pid, "-");
     snprintf(g_ts_ip, sizeof g_ts_ip, "-");
     snprintf(g_ts_version, sizeof g_ts_version, "-");
@@ -881,6 +888,11 @@ static void plugin_status_refresh(const char *path, int force)
     snprintf(g_mh_mode, sizeof g_mh_mode, "-");
     snprintf(g_mh_port, sizeof g_mh_port, "-");
     snprintf(g_mh_ipset, sizeof g_mh_ipset, "-");
+    snprintf(g_cpu_mode, sizeof g_cpu_mode, "unknown");
+    snprintf(g_cpu_gov, sizeof g_cpu_gov, "-");
+    snprintf(g_cpu_cur, sizeof g_cpu_cur, "-");
+    snprintf(g_cpu_min, sizeof g_cpu_min, "-");
+    snprintf(g_cpu_max, sizeof g_cpu_max, "-");
 
     fp = popen(
         "echo TS_INST=$([ -x " TAILSCALE_CTL " ] && [ -x " TAILSCALE_DIR "/bin/tailscale ] && echo 1 || echo 0);"
@@ -897,7 +909,8 @@ static void plugin_status_refresh(const char *path, int force)
         "echo MH_VER=$(" MIHOMO_DIR "/mihomo -v 2>/dev/null | awk 'NR==1{print $3;exit}');"
         "echo MH_MODE=$(sed -n 's/^mode:[[:space:]]*//p' " MIHOMO_DIR "/config.yaml 2>/dev/null | head -1);"
         "echo MH_PORT=$(sed -n 's/^mixed-port:[[:space:]]*//p' " MIHOMO_DIR "/config.yaml 2>/dev/null | head -1);"
-        "echo MH_IPSET=$(ipset list chnroute 2>/dev/null | awk -F': ' '/Number of entries/{print $2;exit}')",
+        "echo MH_IPSET=$(ipset list chnroute 2>/dev/null | awk -F': ' '/Number of entries/{print $2;exit}');"
+        "if [ -x " CPU_CTL " ]; then " CPU_CTL " status 2>/dev/null; else echo CPU_INST=0; fi",
         "r");
     if (!fp) return;
     while (fgets(line, sizeof line, fp)) {
@@ -916,6 +929,12 @@ static void plugin_status_refresh(const char *path, int force)
         else if (!strncmp(line, "MH_MODE=", 8))   line_value(g_mh_mode, sizeof g_mh_mode, line, 8);
         else if (!strncmp(line, "MH_PORT=", 8))   line_value(g_mh_port, sizeof g_mh_port, line, 8);
         else if (!strncmp(line, "MH_IPSET=", 9))  line_value(g_mh_ipset, sizeof g_mh_ipset, line, 9);
+        else if (!strncmp(line, "CPU_INST=", 9))  g_cpu_installed = atoi(line + 9);
+        else if (!strncmp(line, "CPU_MODE=", 9))  line_value(g_cpu_mode, sizeof g_cpu_mode, line, 9);
+        else if (!strncmp(line, "CPU_GOV=", 8))   line_value(g_cpu_gov, sizeof g_cpu_gov, line, 8);
+        else if (!strncmp(line, "CPU_CUR=", 8))   line_value(g_cpu_cur, sizeof g_cpu_cur, line, 8);
+        else if (!strncmp(line, "CPU_MIN=", 8))   line_value(g_cpu_min, sizeof g_cpu_min, line, 8);
+        else if (!strncmp(line, "CPU_MAX=", 8))   line_value(g_cpu_max, sizeof g_cpu_max, line, 8);
     }
     pclose(fp);
     g_ts_running = strcmp(g_ts_pid, "-") != 0;
@@ -4621,7 +4640,7 @@ static int build_kv(struct kv *t, const char *path)
     /* ---- band lock: universe grows to the largest set seen; selection mirrors
      * the live lock unless the user is editing in the modal ---- */
     static char s_netseg[640], s_cursa[300], s_curnsa[300], s_curlte[300], s_toast[120];
-    static char s_ts_action_log[2200], s_mh_action_log[2200];
+    static char s_ts_action_log[2200], s_mh_action_log[2200], s_cpu_action_log[2200];
     if (band_count(d.sa_bands)  >= band_count(g_uni_sa))  snprintf(g_uni_sa,  sizeof g_uni_sa,  "%s", d.sa_bands);
     if (band_count(d.nsa_bands) >= band_count(g_uni_nsa)) snprintf(g_uni_nsa, sizeof g_uni_nsa, "%s", d.nsa_bands);
     if (band_count(d.lte_bands) >= band_count(g_uni_lte)) snprintf(g_uni_lte, sizeof g_uni_lte, "%s", d.lte_bands);
@@ -4925,6 +4944,18 @@ static int build_kv(struct kv *t, const char *path)
     t[i++] = (struct kv){ "MHIPSET", g_mh_ipset };
     plugin_action_log_html(s_mh_action_log, sizeof s_mh_action_log, MIHOMO_ACTION_LOG);
     t[i++] = (struct kv){ "MHACTIONLOG", s_mh_action_log };
+    t[i++] = (struct kv){ "CPUSTATE", !g_cpu_installed ? "控制器未安装" : !strcmp(g_cpu_mode, "powersave") ? "省电模式" : !strcmp(g_cpu_mode, "balance") ? "均衡模式" : !strcmp(g_cpu_mode, "performance") ? "性能模式" : !strcmp(g_cpu_mode, "extreme") ? "极致模式" : "自定义状态" };
+    t[i++] = (struct kv){ "CPUSTATECLASS", g_cpu_installed ? "ok" : "muted" };
+    t[i++] = (struct kv){ "CPUPOWERSAVECLASS", !strcmp(g_cpu_mode, "powersave") ? "seg-on" : "" };
+    t[i++] = (struct kv){ "CPUBALANCECLASS", !strcmp(g_cpu_mode, "balance") ? "seg-on" : "" };
+    t[i++] = (struct kv){ "CPUPERFORMANCECLASS", !strcmp(g_cpu_mode, "performance") ? "seg-on" : "" };
+    t[i++] = (struct kv){ "CPUEXTREMECLASS", !strcmp(g_cpu_mode, "extreme") ? "seg-on" : "" };
+    t[i++] = (struct kv){ "CPUGOV", g_cpu_gov };
+    t[i++] = (struct kv){ "CPUCUR", g_cpu_cur };
+    t[i++] = (struct kv){ "CPUMIN", g_cpu_min };
+    t[i++] = (struct kv){ "CPUMAX", g_cpu_max };
+    plugin_action_log_html(s_cpu_action_log, sizeof s_cpu_action_log, CPU_ACTION_LOG);
+    t[i++] = (struct kv){ "CPUACTIONLOG", s_cpu_action_log };
     return i;
 }
 
@@ -6546,6 +6577,30 @@ int main(void)
                                                     !strcmp(verb, "stop") ? "停止" : "重启";
                                 plugin_action_submit(MIHOMO_ACTION_LOG, "sh ", MIHOMO_CTL, verb, label);
                                 snprintf(g_toast, sizeof g_toast, "Mihomo %s已提交", label);
+                                g_plugin_status_at = 0;
+                            }
+                            g_toast_until = now + 1800;
+                            last_act = now;
+                            need_render = 1;
+                        }
+                        else if (!strcmp(a, "cpupowersave") || !strcmp(a, "cpubalance") ||
+                                 !strcmp(a, "cpuperformance") || !strcmp(a, "cpuextreme") ||
+                                 !strcmp(a, "cpurefresh")) {
+                            if (!strcmp(a, "cpurefresh")) {
+                                plugin_status_refresh(CUR_PATH, 1);
+                                plugin_action_note(CPU_ACTION_LOG, "手动刷新状态");
+                                snprintf(g_toast, sizeof g_toast, "CPU 状态已刷新");
+                            } else if (!g_cpu_installed) {
+                                snprintf(g_toast, sizeof g_toast, "CPU 控制器未安装");
+                            } else {
+                                const char *mode = !strcmp(a, "cpupowersave") ? "powersave" :
+                                                   !strcmp(a, "cpubalance") ? "balance" :
+                                                   !strcmp(a, "cpuperformance") ? "performance" : "extreme";
+                                const char *label = !strcmp(mode, "powersave") ? "省电模式" :
+                                                    !strcmp(mode, "balance") ? "均衡模式" :
+                                                    !strcmp(mode, "performance") ? "性能模式" : "极致模式";
+                                plugin_action_submit(CPU_ACTION_LOG, "", CPU_CTL, mode, label);
+                                snprintf(g_toast, sizeof g_toast, "CPU %s已提交", label);
                                 g_plugin_status_at = 0;
                             }
                             g_toast_until = now + 1800;

@@ -8,6 +8,7 @@
 - 显示服务状态、版本、进程、Tailscale 地址、子网路由和 Mihomo 透明代理状态。
 - 提供启动、停止、重启和手动刷新操作，启动/停止按真实状态高亮。
 - 页面内显示最近三条带时间戳的操作记录，并保留即时 toast 反馈。
+- 提供基于 Linux cpufreq 的 CPU 省电、均衡、性能和极致模式控制页面。
 - 只允许调用固定控制脚本，不向自定义 HTML 暴露任意 Shell 执行能力。
 
 对应设备路径为：
@@ -71,9 +72,12 @@ bash scripts/build.sh
 ## 在设备上运行
 
 ```sh
-# 推送界面文件
-adb shell 'mkdir -p /data/plugins/u60pro-devui/ui'
+# 推送界面文件和 Remix 控制脚本
+adb shell 'mkdir -p /data/plugins/u60pro-devui/ui/functions'
 adb push ui/*.html ui/*.css /data/plugins/u60pro-devui/ui/
+adb push ui/functions/*.html /data/plugins/u60pro-devui/ui/functions/
+adb push scripts/cpuctl.sh /data/plugins/u60pro-devui/cpuctl.sh
+adb shell 'chmod 755 /data/plugins/u60pro-devui/cpuctl.sh'
 
 # 推送并运行（先停原厂 UI 释放面板）
 adb shell 'mkdir -p /data/plugins/u60pro-devui'
