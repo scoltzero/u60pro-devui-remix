@@ -1517,16 +1517,20 @@ static const char *custom_function_tiles_html(void)
 
     for (int i = 0; i < n; i++) {
         char path[300], raw[96], title[160], href[160];
+        const char *desc = "自定义工具";
         snprintf(path, sizeof path, "%s/%s", FUNCTIONS_DIR, names[i]);
         function_title_for_file(raw, sizeof raw, path, names[i]);
         html_esc(title, sizeof title, raw);
         html_esc(href, sizeof href, names[i]);
+        if (!strcmp(names[i], "tailscale.html")) desc = "组网状态与子网路由";
+        else if (!strcmp(names[i], "clash.html") || !strcmp(names[i], "mihomo.html")) desc = "代理状态与服务控制";
+        else if (!strcmp(names[i], "cpu-performance.html")) desc = "频率策略与温控状态";
         o += snprintf(buf + o, sizeof buf - o,
                       "<a href=\"act:func:%s\" class=\"func-tile func-custom\">"
                       "<span class=\"func-name\">%s</span>"
-                      "<span class=\"func-desc\">自定义页面</span>"
+                      "<span class=\"func-desc\">%s</span>"
                       "</a>",
-                      href, title);
+                      href, title, desc);
         if (o >= (int)sizeof(buf) - 256) break;
     }
     return buf;
@@ -2163,26 +2167,26 @@ static void draw_charts(void)
 {
     int x, y, w, h;
     if (html_view_rect("#chart-cpu", &x, &y, &w, &h)) {
-        html_view_polyline(x, y, w, h, h_cpu, h_n, 0, 100, 0x4f, 0x8b, 0xff, 2, 26); /* CPU usage, blue */
-        html_view_polyline(x, y, w, h, h_ct,  h_n, 20, 70, 0xff, 0x8c, 0x42, 2, 0);  /* temperature, orange */
+        html_view_polyline(x, y, w, h, h_cpu, h_n, 0, 100, 0x4f, 0x8f, 0xe8, 2, 26); /* CPU usage, blue */
+        html_view_polyline(x, y, w, h, h_ct,  h_n, 20, 70, 0xd5, 0xa6, 0x3d, 2, 0);  /* temperature, amber */
     }
     if (html_view_rect("#chart-mem", &x, &y, &w, &h))
-        html_view_polyline(x, y, w, h, h_mem, h_n, 0, 100, 0x46, 0xc4, 0x6f, 2, 34); /* memory, green */
+        html_view_polyline(x, y, w, h, h_mem, h_n, 0, 100, 0x55, 0xbc, 0x7b, 2, 34); /* memory, green */
     if (html_view_rect("#chart-net", &x, &y, &w, &h)) {
         static int rxi[HIST], txi[HIST];
         long mx = 1;
         for (int i = 0; i < h_n; i++) { if (h_rx[i] > mx) mx = h_rx[i]; if (h_tx[i] > mx) mx = h_tx[i]; }
         for (int i = 0; i < h_n; i++) { rxi[i] = (int)h_rx[i]; txi[i] = (int)h_tx[i]; }
-        html_view_polyline(x, y, w, h, rxi, h_n, 0, (int)mx, 0x4f, 0x8b, 0xff, 2, 22); /* downlink, blue */
-        html_view_polyline(x, y, w, h, txi, h_n, 0, (int)mx, 0xff, 0x8c, 0x42, 2, 0);  /* uplink, orange */
+        html_view_polyline(x, y, w, h, rxi, h_n, 0, (int)mx, 0x4f, 0x8f, 0xe8, 2, 22); /* downlink, blue */
+        html_view_polyline(x, y, w, h, txi, h_n, 0, (int)mx, 0xd5, 0xa6, 0x3d, 2, 0);  /* uplink, amber */
     }
     if (html_view_rect("#chart-batt", &x, &y, &w, &h)) {
         static int tn[HIST], pn[HIST];
         int mx = 1;
         for (int i = 0; i < h_n; i++) if (h_pwr[i] > mx) mx = h_pwr[i];
         for (int i = 0; i < h_n; i++) { tn[i] = (h_bt[i] - 20) * 2; pn[i] = (int)((long)h_pwr[i] * 100 / mx); }
-        html_view_polyline(x, y, w, h, pn, h_n, 0, 100, 0x4f, 0x8b, 0xff, 2, 22); /* power, blue */
-        html_view_polyline(x, y, w, h, tn, h_n, 0, 100, 0xff, 0x8c, 0x42, 2, 0);  /* temperature, orange */
+        html_view_polyline(x, y, w, h, pn, h_n, 0, 100, 0x4f, 0x8f, 0xe8, 2, 22); /* power, blue */
+        html_view_polyline(x, y, w, h, tn, h_n, 0, 100, 0xd5, 0xa6, 0x3d, 2, 0);  /* temperature, amber */
     }
 }
 
@@ -2208,7 +2212,7 @@ static void draw_lock_icon(void)
     /* body + keyhole (keyhole in page bg tone to look punched through) */
     html_view_fill_round_rect(cx - 10, cy + 1, 20, 15, 4, lv, lv, lv, 255);
     html_view_fill_round_rect(cx - 2, cy + 6, 4, 4, 2,
-                              dark ? 0x15 : 0xec, dark ? 0x16 : 0xee, dark ? 0x1a : 0xf1, 255);
+                              dark ? 0x0d : 0xee, dark ? 0x12 : 0xf3, dark ? 0x19 : 0xf8, 255);
 }
 
 /* SMS detail dialog + status-bar envelope state. */
@@ -2227,7 +2231,7 @@ static void draw_sms_icon(void)
     int ex = 8 + html_view_text_width_px(g_stat_time, 16) + 7;
     int ey = (26 - eh) / 2;
     /* body: blue rounded rectangle */
-    html_view_fill_round_rect(ex, ey, ew, eh, 2, 0x2f, 0x6f, 0xe0, 255);
+    html_view_fill_round_rect(ex, ey, ew, eh, 2, 0x4f, 0x8f, 0xe8, 255);
     /* flap: white inverted-V from the two top corners down to center */
     int xs[3] = { ex + 1, ex + ew - 1, ex + ew / 2 };
     int ys[3] = { ey + 1, ey + 1,      ey + eh / 2 + 1 };
@@ -2238,12 +2242,12 @@ static void draw_sms_icon(void)
 static void draw_native_statusbar(void)
 {
     const int dark = !g_theme;
-    const int bg_r = dark ? 0x1d : 0xd8, bg_g = dark ? 0x27 : 0xe2, bg_b = dark ? 0x33 : 0xf0;
-    const int fg_r = dark ? 0xe9 : 0x1b, fg_g = dark ? 0xeb : 0x1d, fg_b = dark ? 0xee : 0x22;
-    const int dim_r = dark ? 0x5b : 0xa6, dim_g = dark ? 0x66 : 0xae, dim_b = dark ? 0x74 : 0xb8;
+    const int bg_r = dark ? 0x11 : 0xdc, bg_g = dark ? 0x1b : 0xe7, bg_b = dark ? 0x27 : 0xf2;
+    const int fg_r = dark ? 0xee : 0x17, fg_g = dark ? 0xf4 : 0x22, fg_b = dark ? 0xfb : 0x32;
+    const int dim_r = dark ? 0x6f : 0x7a, dim_g = dark ? 0x80 : 0x89, dim_b = dark ? 0x94 : 0x99;
 
     html_view_fill_rect(0, 0, 320, 26, bg_r, bg_g, bg_b, 255);
-    html_view_draw_text_px(8, 4, g_stat_time, 16, 0, fg_r, fg_g, fg_b, 255);
+    html_view_draw_text_px(8, 5, g_stat_time, 15, 0, fg_r, fg_g, fg_b, 255);
 
     const int bat_x = 279, bat_y = 5, bat_w = 35, bat_h = 16;
     const int tip_x = bat_x + bat_w, tip_y = bat_y + 5;
@@ -2255,9 +2259,9 @@ static void draw_native_statusbar(void)
     const int bar_left = sig_left + bx[0];
     const int bar_right = sig_left + bx[4] + bw[4];
     const int group_gap = bat_x - bar_right;
-    int sw = html_view_text_width_px(g_stat_speed, 13);
+    int sw = html_view_text_width_px(g_stat_speed, 12);
     int sx = bar_left - group_gap - sw; if (sx < 84) sx = 84;
-    html_view_draw_text_px(sx, 5, g_stat_speed, 13, 0, fg_r, fg_g, fg_b, 255);
+    html_view_draw_text_px(sx, 6, g_stat_speed, 12, 0, fg_r, fg_g, fg_b, 255);
 
     const int base = sig_y + sig_h + 1;
     for (int i = 0; i < 5; i++) {
@@ -2277,14 +2281,14 @@ static void draw_native_statusbar(void)
     if (dark)
         html_view_fill_round_rect(bat_x + 1, bat_y + 1, bat_w - 2, bat_h - 2, 3, bg_r, bg_g, bg_b, 255);
     else
-        html_view_fill_round_rect(bat_x + 1, bat_y + 1, bat_w - 2, bat_h - 2, 3, 0xd6, 0xdc, 0xe4, 255);
+        html_view_fill_round_rect(bat_x + 1, bat_y + 1, bat_w - 2, bat_h - 2, 3, 0xcb, 0xd7, 0xe4, 255);
     html_view_fill_round_rect(tip_x, tip_y, 2, 7, 1, fg_r, fg_g, fg_b, 255);
 
     int bat_pct = clampi(g_stat_bat, 0, 100);
     int draw_charging = g_charging;
     int fr = fg_r, fgc = fg_g, fb = fg_b;
-    if (draw_charging) { fr = 0x5e; fgc = 0xc8; fb = 0x5e; }
-    else if (g_stat_lowbat) { fr = 0xe8; fgc = 0x53; fb = 0x3a; }
+    if (draw_charging) { fr = 0x55; fgc = 0xbc; fb = 0x7b; }
+    else if (g_stat_lowbat) { fr = 0xd4; fgc = 0x5c; fb = 0x55; }
     int fill_w = (bat_w - 4) * bat_pct / 100;
     if (fill_w > 0)
         html_view_fill_round_rect(bat_x + 2, bat_y + 2, fill_w, bat_h - 4, 2, fr, fgc, fb, 255);
@@ -5164,9 +5168,9 @@ static void pm_glyph(const char *sel, int kind, int cr, int cg, int cb)
 
 static void draw_power_menu(void)
 {
-    pm_glyph("#pmc-off",    0, 0xd2, 0x48, 0x3c);   /* red */
-    pm_glyph("#pmc-reboot", 1, 0xe0, 0x89, 0x2a);   /* orange */
-    pm_glyph("#pmc-cancel", 2, 0x4a, 0x51, 0x5c);   /* gray */
+    pm_glyph("#pmc-off",    0, 0xd4, 0x5c, 0x55);   /* red */
+    pm_glyph("#pmc-reboot", 1, 0xd5, 0xa6, 0x3d);   /* amber */
+    pm_glyph("#pmc-cancel", 2, 0x3a, 0x48, 0x59);   /* cool gray */
 }
 
 static int st_hist_max(const int *hist, int n)
@@ -5179,9 +5183,9 @@ static int st_hist_max(const int *hist, int n)
 static void st_chart_grid(int x, int y, int w, int h)
 {
     const int dark = !g_theme;
-    const int r = dark ? 0x2d : 0xb8;
-    const int g = dark ? 0x3c : 0xcc;
-    const int b = dark ? 0x4a : 0xd8;
+    const int r = dark ? 0x26 : 0xc8;
+    const int g = dark ? 0x34 : 0xd4;
+    const int b = dark ? 0x45 : 0xe2;
     const int a = dark ? 150 : 180;
 
     html_view_fill_rect(x + 1, y + h / 3, w - 2, 1, r, g, b, a);
@@ -5229,36 +5233,36 @@ static void draw_speedtest_widgets(void)
             (int)(basey - py * half + 0.5)
         };
         char num[32];
-        const int outer_r = dark ? 0x0b : 0xd9;
-        const int outer_g = dark ? 0x12 : 0xf0;
-        const int outer_b = dark ? 0x1b : 0xf6;
-        const int inner_r = dark ? 0x12 : 0xf7;
-        const int inner_g = dark ? 0x20 : 0xfc;
-        const int inner_b = dark ? 0x2e : 0xfe;
-        const int track_r = dark ? 0x34 : 0xc0;
-        const int track_g = dark ? 0x43 : 0xd8;
-        const int track_b = dark ? 0x51 : 0xe2;
-        const int tick_r = dark ? 0xd8 : 0x3d;
-        const int tick_g = dark ? 0xe5 : 0x58;
-        const int tick_b = dark ? 0xee : 0x65;
-        const int num_r = dark ? 0xff : 0x18;
-        const int num_g = dark ? 0xff : 0x33;
-        const int num_b = dark ? 0xff : 0x42;
-        const int unit_r = dark ? 0x9f : 0x68;
-        const int unit_g = dark ? 0xb4 : 0x7f;
-        const int unit_b = dark ? 0xc5 : 0x8b;
-        const int hub_outer_r = dark ? 0xf4 : 0x18;
-        const int hub_outer_g = dark ? 0xf7 : 0x33;
-        const int hub_outer_b = dark ? 0xfb : 0x42;
-        const int hub_inner_r = dark ? 0x12 : 0xf7;
-        const int hub_inner_g = dark ? 0x20 : 0xfc;
-        const int hub_inner_b = dark ? 0x2e : 0xfe;
+        const int outer_r = dark ? 0x0f : 0xe3;
+        const int outer_g = dark ? 0x17 : 0xeb;
+        const int outer_b = dark ? 0x20 : 0xf4;
+        const int inner_r = dark ? 0x15 : 0xfb;
+        const int inner_g = dark ? 0x1d : 0xfd;
+        const int inner_b = dark ? 0x28 : 0xff;
+        const int track_r = dark ? 0x2d : 0xbd;
+        const int track_g = dark ? 0x3a : 0xc9;
+        const int track_b = dark ? 0x4a : 0xd6;
+        const int tick_r = dark ? 0xb8 : 0x52;
+        const int tick_g = dark ? 0xc7 : 0x62;
+        const int tick_b = dark ? 0xd7 : 0x77;
+        const int num_r = dark ? 0xee : 0x17;
+        const int num_g = dark ? 0xf4 : 0x22;
+        const int num_b = dark ? 0xfb : 0x32;
+        const int unit_r = dark ? 0x71 : 0x65;
+        const int unit_g = dark ? 0x81 : 0x75;
+        const int unit_b = dark ? 0x96 : 0x8a;
+        const int hub_outer_r = dark ? 0xee : 0x17;
+        const int hub_outer_g = dark ? 0xf4 : 0x22;
+        const int hub_outer_b = dark ? 0xfb : 0x32;
+        const int hub_inner_r = dark ? 0x15 : 0xfb;
+        const int hub_inner_g = dark ? 0x1d : 0xfd;
+        const int hub_inner_b = dark ? 0x28 : 0xff;
 
         pm_disc(cx, cy, rad, outer_r, outer_g, outer_b, 255);
         pm_disc(cx, cy, rad - 5, inner_r, inner_g, inner_b, 255);
         pm_arc(cx, cy, rad - 12, rad - 20, -30, 210, track_r, track_g, track_b);
         if (pct > 0)
-            pm_arc(cx, cy, rad - 12, rad - 20, (int)(210.0 - 240.0 * pct / 100.0), 210, 0x2f, 0xb8, 0xc9);
+            pm_arc(cx, cy, rad - 12, rad - 20, (int)(210.0 - 240.0 * pct / 100.0), 210, 0x4f, 0x8f, 0xe8);
         for (int i = 0; i <= 10; i++) {
             double a = (210.0 - 240.0 * i / 10.0) * PM_PI / 180.0;
             double tx = cos(a), ty = -sin(a);
@@ -5266,15 +5270,15 @@ static void draw_speedtest_widgets(void)
                     cx + tx * (rad - 22), cy + ty * (rad - 22),
                     i % 5 == 0 ? 3.0 : 2.0, tick_r, tick_g, tick_b);
         }
-        html_view_fill_poly(nx, ny, 3, 0xf0, 0xb2, 0x47, 255);
+        html_view_fill_poly(nx, ny, 3, 0xd5, 0xa6, 0x3d, 255);
         pm_disc(cx, cy, 8, hub_outer_r, hub_outer_g, hub_outer_b, 255);
         pm_disc(cx, cy, 4, hub_inner_r, hub_inner_g, hub_inner_b, 255);
         snprintf(num, sizeof num, "%.1f", cur);
         draw_center_text_px(cx, cy + 38, num, 28, 1, num_r, num_g, num_b, 255);
         draw_center_text_px(cx, cy + 62, "Mbps", 12, 0, unit_r, unit_g, unit_b, 255);
     }
-    st_draw_one_chart("#st-chart-dl", g_st_dl_hist, g_st_dl_n, 0x2f, 0xb8, 0xc9);
-    st_draw_one_chart("#st-chart-ul", g_st_ul_hist, g_st_ul_n, 0xe7, 0xa3, 0x3b);
+    st_draw_one_chart("#st-chart-dl", g_st_dl_hist, g_st_dl_n, 0x4f, 0x8f, 0xe8);
+    st_draw_one_chart("#st-chart-ul", g_st_ul_hist, g_st_ul_n, 0xd5, 0xa6, 0x3d);
     html_view_set_clip_top(0);
 }
 
@@ -5681,7 +5685,7 @@ static void render_sms_overlay(drm_disp_t *d, int restore_background)
         travel = g_sms_view_h - thumb_h;
         thumb_y = g_sms_view_y + g_sms_scroll * travel / g_sms_scroll_max;
         html_view_fill_round_rect(g_sms_view_x + g_sms_view_w - 3, thumb_y,
-                                  3, thumb_h, 2, 0x8a, 0x92, 0x9d, 190);
+                                  3, thumb_h, 2, 0x71, 0x81, 0x96, 190);
     }
     drm_disp_dirty(d, 0, 0, d->width - 1, d->height - 1);
 }
@@ -5783,7 +5787,7 @@ static void seg_box(drm_disp_t *d, int sx, int sy, int sw, int sh, int n, int fx
     restore_fb(d);
     int cw = sw / n, bx = fx - cw / 2;
     if (bx < sx) bx = sx; if (bx > sx + sw - cw) bx = sx + sw - cw;
-    html_view_fill_rect(bx, sy, cw, sh, 0x2f, 0x6f, 0xe0, 150);
+    html_view_fill_rect(bx, sy, cw, sh, 0x4f, 0x8f, 0xe8, 150);
     drm_disp_dirty(d, 0, 0, d->width - 1, d->height - 1);
 }
 
