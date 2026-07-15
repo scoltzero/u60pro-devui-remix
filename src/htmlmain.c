@@ -5372,7 +5372,7 @@ static uint16_t *g_bufA, *g_bufB;
 #define DRAG_CANCEL_PX 8
 #define SCROLL_INERTIA_MIN_V 180.0f
 #define SCROLL_INERTIA_MAX_V 2200.0f
-#define SCROLL_INERTIA_DECEL 3600.0f
+#define SCROLL_INERTIA_DECEL 2800.0f
 #define STATE_RENDER_THROTTLE_MS 1500
 #define STATE_RENDER_IDLE_THROTTLE_MS 2500
 #define EXT_BACK_EDGE_PX 24
@@ -5848,6 +5848,7 @@ int main(void)
     int scroll_track_pos = 0;
     uint32_t drag_down_ms = 0;
     uint32_t scroll_track_ms = 0;
+    uint32_t inertia_frame_at = 0;
     uint32_t last_motion_frame = 0;
     float scroll_v = 0.0f, scroll_pos = 0.0f;
     int sliding = 0, bar_x = 0, bar_w = 0;   /* brightness slider drag */
@@ -6190,10 +6191,12 @@ int main(void)
                 scroll_v = 0.0f;
             }
             if (scroll_inertia && !pressed && !dragging && !menu && maxs > 0) {
-                uint32_t dtm = now > scroll_track_ms ? now - scroll_track_ms : 0;
-                if (dtm > 0) {
+                if ((int32_t)(now - inertia_frame_at) >= 0) {
+                    uint32_t dtm = now > scroll_track_ms ? now - scroll_track_ms : TOUCH_FRAME_MIN_MS;
+                    if (dtm > 50) dtm = 50;
                     float dt = dtm / 1000.0f;
                     float dv = SCROLL_INERTIA_DECEL * dt;
+                    float old_v = scroll_v;
                     if (scroll_v > 0.0f) {
                         scroll_v -= dv;
                         if (scroll_v < 0.0f) scroll_v = 0.0f;
@@ -6201,19 +6204,20 @@ int main(void)
                         scroll_v += dv;
                         if (scroll_v > 0.0f) scroll_v = 0.0f;
                     }
-                    scroll_pos += scroll_v * dt;
+                    scroll_pos += (old_v + scroll_v) * 0.5f * dt;
                     int ns = (int)(scroll_pos + (scroll_pos >= 0.0f ? 0.5f : -0.5f));
                     if (ns < 0) { ns = 0; scroll_pos = 0.0f; scroll_v = 0.0f; }
                     if (ns > maxs) { ns = maxs; scroll_pos = (float)maxs; scroll_v = 0.0f; }
                     if (ns != g_scroll) {
                         g_scroll = ns;
-                        if (motion_frame_due(now, &last_motion_frame)) {
-                            scroll_blit(&disp, g_scroll);
-                            animating = 1;
-                        }
+                        scroll_blit(&disp, g_scroll);
+                        animating = 1;
                     }
                     if (scroll_v == 0.0f || ns == 0 || ns == maxs) scroll_inertia = 0;
                     scroll_track_ms = now;
+                    inertia_frame_at += TOUCH_FRAME_MIN_MS;
+                    if ((int32_t)(now - inertia_frame_at) >= TOUCH_FRAME_MIN_MS)
+                        inertia_frame_at = now + TOUCH_FRAME_MIN_MS;
                 }
             }
             if (!pressed && !prev_press && !dragging && !menu) {
@@ -6436,18 +6440,19 @@ queued_done:
                     uint32_t gdt = (drag_down_ms && now > drag_down_ms) ? (now - drag_down_ms) : 0;
                     if (gdt > 0) {
                         float rel_v = (-(float)(y - down_y)) * 1000.0f / (float)gdt;
-                        if (scroll_track_valid) scroll_v = clamp_scroll_v(scroll_v * 0.55f + rel_v * 0.45f);
+                        if (scroll_track_valid) scroll_v = clamp_scroll_v(scroll_v * 0.85f + rel_v * 0.15f);
                         else                    scroll_v = clamp_scroll_v(rel_v);
                     }
                     if (fabsf(scroll_v) >= SCROLL_INERTIA_MIN_V && maxs > 0) {
                         scroll_inertia = 1;
                         scroll_pos = (float)g_scroll;
                         scroll_track_ms = now;
+                        inertia_frame_at = now;
+                        last_motion_frame = 0;
                     } else {
                         scroll_inertia = 0;
                         scroll_v = 0.0f;
                     }
-                    need_render = 1;
                 } else if (dragging) {                      /* tap -> action */
                     const char *act = html_view_click((float)x, (float)y);
                     if (!strncmp(act, "act:", 4)) {
@@ -6969,7 +6974,17 @@ action_done:
             g_gesture_used_at = 0;
         }
         was_on = backlight_is_on();   /* track for next frame's wake-touch discard */
-        if (!animating) usleep(backlight_is_on() ? IDLE_SLEEP_ON_US : IDLE_SLEEP_OFF_US);
+        if (!animating) {
+            if (scroll_inertia && backlight_is_on()) {
+                uint32_t sleep_now = millis();
+                uint32_t wait_ms = (int32_t)(inertia_frame_at - sleep_now) > 0 ?
+                                   inertia_frame_at - sleep_now : 1;
+                if (wait_ms > IDLE_SLEEP_ON_US / 1000) wait_ms = IDLE_SLEEP_ON_US / 1000;
+                usleep(wait_ms * 1000);
+            } else {
+                usleep(backlight_is_on() ? IDLE_SLEEP_ON_US : IDLE_SLEEP_OFF_US);
+            }
+        }
     }
 
     if (ext_ok) devui_ext_close(&ext);
