@@ -5377,7 +5377,7 @@ static uint16_t *g_bufA, *g_bufB;
 #define EXT_BACK_EDGE_PX 24
 #define EXT_BACK_COMMIT_PX 56
 #define EXT_BACK_MAX_DY 44
-#define TOUCH_FRAME_MIN_MS 16
+#define TOUCH_FRAME_MIN_MS 22  /* interaction cap: about 45 FPS */
 #define QUEUED_SWIPE_PX 52
 #define QUEUED_SCROLL_PX 28
 #define IDLE_SLEEP_ON_US 8000
