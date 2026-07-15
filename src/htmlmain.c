@@ -42,6 +42,7 @@ extern int         html_view_render_html(const char *html);
 extern int         html_view_render_to(uint16_t *buf, const char *html);
 extern int         html_view_render_to_scroll(uint16_t *buf, const char *html, int scroll);
 extern void        html_view_target_begin(uint16_t *buf, int scroll);
+extern void        html_view_target_begin_size(uint16_t *buf, int h, int scroll);
 extern void        html_view_target_end(void);
 extern const char *html_view_click(float x, float y);
 extern int         html_view_rect(const char *sel, int *x, int *y, int *w, int *h);
@@ -5547,6 +5548,23 @@ static int ensure_scroll_buffer(void)
     return g_scrollbuf != NULL;
 }
 
+static int prepare_scroll_buffer(int bufh)
+{
+    int rh;
+    if (!ensure_scroll_buffer()) return -1;
+    rh = html_view_draw_current_tall(g_scrollbuf, bufh);
+    if (rh <= 0) return -1;
+
+    /* Native charts and speed-test widgets are not part of the litehtml DOM.
+     * Bake them into the tall cache once so each drag frame is a pure blit. */
+    html_view_target_begin_size(g_scrollbuf, bufh, 0);
+    draw_charts();
+    if (!g_lock_state && (path_is_speedtest(active_page_path()) || g_st_home_open))
+        draw_speedtest_widgets();
+    html_view_target_end();
+    return rh;
+}
+
 static void scroll_blit(drm_disp_t *d, int scroll)
 {
     const int W = d->width, Hh = d->height, pp = d->pitch_px;
@@ -5558,8 +5576,6 @@ static void scroll_blit(drm_disp_t *d, int scroll)
         else     fill_rev_span(dp, 0, W);
     }
     html_view_set_scroll(scroll);
-    draw_charts();
-    if (!g_lock_state && (path_is_speedtest(active_page_path()) || g_st_home_open)) draw_speedtest_widgets();
     /* The native status bar is pinned; dragging only changes the content below it.
      * With the framebuffer rotated 180 degrees, that content maps to the top
      * framebuffer rows, so the dirty rectangle intentionally excludes the tail. */
@@ -6230,7 +6246,7 @@ int main(void)
                         int bufh = g_page_h > SCROLLMAX ? SCROLLMAX : g_page_h;
                         int rh;
                         if (!ensure_scroll_buffer()) goto queued_done;
-                        rh = html_view_draw_current_tall(g_scrollbuf, bufh);
+                        rh = prepare_scroll_buffer(bufh);
                         if (rh <= 0) goto queued_done;
                         int ns;
                         g_scroll_h = rh > bufh ? bufh : rh;
@@ -6332,7 +6348,7 @@ queued_done:
                         if (press_feedback) { restore_fb(&disp); press_feedback = 0; }
                         scroll_dir = 1; scroll_start = g_scroll;
                         int bufh = g_page_h > SCROLLMAX ? SCROLLMAX : g_page_h;  /* prerender once */
-                        int rh = ensure_scroll_buffer() ? html_view_draw_current_tall(g_scrollbuf, bufh) : -1;
+                        int rh = prepare_scroll_buffer(bufh);
                         if (rh <= 0) {
                             scroll_dir = 0;
                             dragging = 0;

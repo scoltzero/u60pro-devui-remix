@@ -491,6 +491,15 @@ extern "C" void html_view_target_begin(uint16_t *buf, int scroll)
     g_fb = buf; g_pitch_px = g_w; g_rotate = 0; g_scroll_y = scroll < 0 ? 0 : scroll;
 }
 
+extern "C" void html_view_target_begin_size(uint16_t *buf, int h, int scroll)
+{
+    if (g_saved_fb || !buf || h <= 0) return;
+    g_saved_fb = g_fb; g_saved_w = g_w; g_saved_h = g_h;
+    g_saved_pitch = g_pitch_px; g_saved_rotate = g_rotate; g_saved_scroll = g_scroll_y;
+    g_fb = buf; g_h = h; g_pitch_px = g_w; g_rotate = 0;
+    g_scroll_y = scroll < 0 ? 0 : scroll;
+}
+
 extern "C" void html_view_target_end(void)
 {
     if (!g_saved_fb) return;
