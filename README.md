@@ -76,8 +76,8 @@ bash scripts/build.sh
 adb shell 'mkdir -p /data/plugins/u60pro-devui/ui/functions'
 adb push ui/*.html ui/*.css /data/plugins/u60pro-devui/ui/
 adb push ui/functions/*.html /data/plugins/u60pro-devui/ui/functions/
-adb push scripts/cpuctl.sh /data/plugins/u60pro-devui/cpuctl.sh
-adb shell 'chmod 755 /data/plugins/u60pro-devui/cpuctl.sh'
+adb push scripts/cpuctl.sh /data/plugins/u60pro-devui/ui/functions/cpuctl.sh
+adb shell 'chmod 755 /data/plugins/u60pro-devui/ui/functions/cpuctl.sh'
 
 # 推送并运行（先停原厂 UI 释放面板）
 adb shell 'mkdir -p /data/plugins/u60pro-devui'
@@ -95,25 +95,31 @@ adb shell '/etc/init.d/zte_topsw_devui stop; sleep 1;
 
 每个 release 附一个 `version.json`，声明各组件版本，供配套的「U60 DevUI 管理插件」检测更新。组件分三块、可各自独立升级：**后端 datad**、**渲染器 devui**（二进制）、**ui**（界面）。
 
-- 本仓库 release 的 `version.json` 含 `devui` 与 `ui` 两项；后端 [zwrt-datad](https://github.com/33333s/zwrt-datad) 的 release 里有它自己的 `version.json`（只含 `datad`）。
+- Remix release 的 `version.json` 合并 `datad`、`devui` 与 `ui` 三项，供原版管理器从同一个自定义源完成全新安装。
 
 ```jsonc
-// 本仓库 version.json
+// Remix 聚合 version.json
 { "schema": 1,
-  "devui": { "version": "1.2.11", "asset": "u60pro-devui-aarch64" },
-  "ui":    { "version": "0.4.10", "asset": "ui.tar.gz" } }
+  "datad": { "version": "0.6.7-remix.1", "asset": "zwrt-datad-aarch64" },
+  "devui": { "version": "1.2.12-remix.1", "asset": "u60pro-devui-aarch64" },
+  "ui":    { "version": "0.4.10-remix.1", "asset": "ui.tar.gz" } }
 ```
 
-插件读各项目 **latest release** 的 `version.json`，与本地记录比对，支持**单独更新** datad / devui / ui 或一键更新全部。默认更新源就是 GitHub release；如果你自己在外部做镜像，只要保持 `u60pro-devui-aarch64` / `ui.tar.gz` / `version.json` 这些文件名不变即可，本仓库不再维护单独的网盘同步流程。
+在原版管理器中选择“自定义源链接”并填写以下地址，即可安装或更新 Remix 三组件：
 
-**发版**：改 `version.json` 里对应组件的版本号（ui 改动只升 `ui`，二进制改动只升 `devui`，两边都改就两项都升）→ 用 `bash scripts/build.sh` 产出 `u60pro-devui.stripped`，发布时重命名成 `u60pro-devui-aarch64` → 重新打包**顶层平铺**的 `ui.tar.gz`（不要带 `ui/` 目录、`./` 前缀或 macOS `._*`）→ 把 `version.json`、`u60pro-devui-aarch64`、`ui.tar.gz` 一起传到 GitHub release。
+```text
+https://github.com/scoltzero/u60pro-devui-remix/releases/latest/download
+```
+
+**发版**：分别构建 DevUI 和 datad，再使用 `scripts/package-release.sh` 生成顶层平铺的 UI 包、合并版清单和 SHA-256 文件。
 
 可直接照抄这一组命令准备 release 资产：
 
 ```sh
 bash scripts/build.sh
-cp u60pro-devui.stripped u60pro-devui-aarch64
-(cd ui && COPYFILE_DISABLE=1 tar -czf ../ui.tar.gz -- *.html *.css)
+bash scripts/package-release.sh \
+  --datad ../zwrt-datad/zwrt-datad.stripped \
+  --out dist/v1.2.12-remix.1
 ```
 
 ## 文档

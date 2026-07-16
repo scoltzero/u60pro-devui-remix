@@ -2,6 +2,23 @@
 
 > 当前正式命名与安装路径已经统一为：`zwrt-datad`、`/data/plugins/zwrt-datad/zwrt-datad`、`/data/plugins/u60pro-devui/`、`/data/plugins/u60pro-devui/ui`。历史条目里如果出现 `u60-datad`、`/data/u60pro` 或 `/data/ui`，表示当时版本记录。
 
+## v1.2.12-remix.1 - 2026-07-16
+
+### 变更
+
+- 全界面调整为冷灰与电光蓝的 Taste 精密仪表盘风格，同时保留深浅主题和 RGB565 低资源渲染。
+- 增加 Tailscale、Clash/Mihomo 和 CPU 性能页面，并按本地控制接口是否存在决定是否显示。
+- CPU 控制器可随 `ui.tar.gz` 安装到 `ui/functions/cpuctl.sh`，同时兼容旧路径。
+- 发布清单合并 datad、devui 和 UI 三个组件，可直接供原版屏幕管理插件作为自定义源。
+
+### 修复
+
+- 合入上游 `v1.2.12` 的短信关闭触控清理，避免关闭弹窗后遗留事件命中下方短信。
+
+### 性能
+
+- 保留 45 FPS 交互突发、按需手势缓存、黑屏资源释放和纵向惯性滚动优化。
+
 ## v1.2.11 - 2026-07-10
 
 ### 修复

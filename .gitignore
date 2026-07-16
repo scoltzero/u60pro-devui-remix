@@ -17,6 +17,7 @@
 
 # Release packaging
 /ui.tar.gz
+/dist/
 
 # Debug / capture artifacts
 /fb.dump

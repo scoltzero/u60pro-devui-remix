@@ -93,7 +93,8 @@ static uint32_t millis(void)
 #define MIHOMO_CTL    "/data/ufi-tools/mihomo/mm.sh"
 #define MIHOMO_DIR    "/data/ufi-tools/mihomo"
 #define MIHOMO_ACTION_LOG "/tmp/devui-mihomo-action.log"
-#define CPU_CTL UI_DIR "/../cpuctl.sh"
+#define CPU_CTL_BUNDLED UI_DIR "/functions/cpuctl.sh"
+#define CPU_CTL_LEGACY  UI_DIR "/../cpuctl.sh"
 #define CPU_ACTION_LOG "/tmp/devui-cpu-action.log"
 
 static uint32_t g_plugin_status_at;
@@ -106,6 +107,12 @@ static char g_mh_pid[16] = "-", g_mh_version[64] = "-", g_mh_mode[24] = "-";
 static char g_mh_port[16] = "-", g_mh_ipset[24] = "-";
 static char g_cpu_mode[24] = "unknown", g_cpu_gov[24] = "-";
 static char g_cpu_cur[24] = "-", g_cpu_min[24] = "-", g_cpu_max[24] = "-";
+
+static const char *cpu_ctl_path(void)
+{
+    if (access(CPU_CTL_BUNDLED, X_OK) == 0) return CPU_CTL_BUNDLED;
+    return CPU_CTL_LEGACY;
+}
 
 #define TEMPLATE_CACHE_CAP 8
 #define PAGE_HTML_CACHE_CAP 1048576
@@ -918,7 +925,8 @@ static void plugin_status_refresh(const char *path, int force)
         "echo MH_MODE=$(sed -n 's/^mode:[[:space:]]*//p' " MIHOMO_DIR "/config.yaml 2>/dev/null | head -1);"
         "echo MH_PORT=$(sed -n 's/^mixed-port:[[:space:]]*//p' " MIHOMO_DIR "/config.yaml 2>/dev/null | head -1);"
         "echo MH_IPSET=$(ipset list chnroute 2>/dev/null | awk -F': ' '/Number of entries/{print $2;exit}');"
-        "if [ -x " CPU_CTL " ]; then " CPU_CTL " status 2>/dev/null; else echo CPU_INST=0; fi",
+        "CPU_CTL=" CPU_CTL_BUNDLED "; [ -x \"$CPU_CTL\" ] || CPU_CTL=" CPU_CTL_LEGACY ";"
+        "if [ -x \"$CPU_CTL\" ]; then \"$CPU_CTL\" status 2>/dev/null; else echo CPU_INST=0; fi",
         "r");
     if (!fp) return;
     while (fgets(line, sizeof line, fp)) {
@@ -1371,7 +1379,7 @@ static int function_control_api_available(const char *name)
     if (!strcmp(name, "clash.html") || !strcmp(name, "mihomo.html"))
         return access(MIHOMO_CTL, X_OK) == 0;
     if (!strcmp(name, "cpu-performance.html"))
-        return access(CPU_CTL, X_OK) == 0;
+        return access(CPU_CTL_BUNDLED, X_OK) == 0 || access(CPU_CTL_LEGACY, X_OK) == 0;
     return 1;
 }
 
@@ -2221,6 +2229,16 @@ static int  g_sms_unread_now;  /* unread SMS present -> draw the status-bar enve
 static char g_sms_num[40], g_sms_date[16], g_sms_text[DEVUI_SMS_TEXT_MAX];   /* opened message */
 static int  g_sms_scroll, g_sms_scroll_max;
 static int  g_sms_view_x, g_sms_view_y, g_sms_view_w, g_sms_view_h;
+
+/* Discard all latched input when the dialog closes so an old release cannot
+ * be replayed against the message card exposed underneath. */
+static void sms_close(touch_input_t *touch, int *need_render)
+{
+    g_sms_open = -1;
+    g_sms_scroll = g_sms_scroll_max = 0;
+    touch_input_clear_taps(touch);
+    *need_render = 1;
+}
 
 /* Draw a small envelope in the fixed status bar, just right of the clock, when
  * there are unread messages. Native shape; the font has no envelope glyph. */
@@ -6152,12 +6170,11 @@ int main(void)
                 } else if (release_was_tap) {
                     const char *act = html_view_click((float)down_x, (float)down_y);
                     if (!strcmp(act, "act:smsclose")) {
-                        g_sms_open = -1;
-                        g_sms_scroll = g_sms_scroll_max = 0;
-                        need_render = 1;
+                        sms_close(&touch, &need_render);
                     }
                 }
-                touch_input_drop_replayed_release(&touch, release_was_tap);
+                if (g_sms_open >= 0)
+                    touch_input_drop_replayed_release(&touch, release_was_tap);
                 sms_dragging = 0;
             } else if (!pressed) {
                 /* A complete gesture can land while layout is busy. Collapse queued
@@ -6172,9 +6189,7 @@ int main(void)
                         const char *act = html_view_click((float)(have_tap ? tx : sx),
                                                           (float)(have_tap ? ty : sy));
                         if (!strcmp(act, "act:smsclose")) {
-                            g_sms_open = -1;
-                            g_sms_scroll = g_sms_scroll_max = 0;
-                            need_render = 1;
+                            sms_close(&touch, &need_render);
                         }
                     } else if (sms_point_in_view(sx, sy) && g_sms_scroll_max > 0) {
                         int next = clampi(g_sms_scroll - dy, 0, g_sms_scroll_max);
@@ -6189,9 +6204,7 @@ int main(void)
                     if (touch_input_take_latest_tap(&touch, &tx, &ty)) {
                         const char *act = html_view_click((float)tx, (float)ty);
                         if (!strcmp(act, "act:smsclose")) {
-                            g_sms_open = -1;
-                            g_sms_scroll = g_sms_scroll_max = 0;
-                            need_render = 1;
+                            sms_close(&touch, &need_render);
                         }
                     }
                 }
@@ -6856,7 +6869,7 @@ queued_done:
                                 const char *label = !strcmp(mode, "powersave") ? "省电模式" :
                                                     !strcmp(mode, "balance") ? "均衡模式" :
                                                     !strcmp(mode, "performance") ? "性能模式" : "极致模式";
-                                plugin_action_submit(CPU_ACTION_LOG, "", CPU_CTL, mode, label);
+                                plugin_action_submit(CPU_ACTION_LOG, "", cpu_ctl_path(), mode, label);
                                 snprintf(g_toast, sizeof g_toast, "CPU %s已提交", label);
                                 g_plugin_status_at = 0;
                             }
