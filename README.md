@@ -101,15 +101,17 @@ adb shell '/etc/init.d/zte_topsw_devui stop; sleep 1;
 // Remix 聚合 version.json
 { "schema": 1,
   "datad": { "version": "0.6.7-remix.1", "asset": "zwrt-datad-aarch64" },
-  "devui": { "version": "1.2.12-remix.1", "asset": "u60pro-devui-aarch64" },
+  "devui": { "version": "1.2.12-remix.2", "asset": "u60pro-devui-aarch64" },
   "ui":    { "version": "0.4.10-remix.1", "asset": "ui.tar.gz" } }
 ```
 
-在原版管理器中选择“自定义源链接”并填写以下地址，即可安装或更新 Remix 三组件：
+在原版管理器中选择“自定义源链接”，推荐填写 CDN 资产模板：
 
 ```text
-https://github.com/scoltzero/u60pro-devui-remix/releases/latest/download
+https://cdn.jsdelivr.net/gh/scoltzero/u60pro-devui-remix@release-assets/{file}
 ```
+
+正式归档仍位于 `https://github.com/scoltzero/u60pro-devui-remix/releases/latest/download`。部分设备网络访问 GitHub Release 重定向超过管理器的命令请求时限时，应使用上面的 jsDelivr 模板。
 
 **发版**：分别构建 DevUI 和 datad，再使用 `scripts/package-release.sh` 生成顶层平铺的 UI 包、合并版清单和 SHA-256 文件。
 
@@ -119,7 +121,7 @@ https://github.com/scoltzero/u60pro-devui-remix/releases/latest/download
 bash scripts/build.sh
 bash scripts/package-release.sh \
   --datad ../zwrt-datad/zwrt-datad.stripped \
-  --out dist/v1.2.12-remix.1
+  --out dist/v1.2.12-remix.2
 ```
 
 ## 文档

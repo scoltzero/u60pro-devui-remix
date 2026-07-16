@@ -1362,6 +1362,7 @@ static int subpage_name_ok(const char *name)
 {
     size_t l;
     if (!name || !*name) return 0;
+    if (name[0] == '.') return 0;
     if (strstr(name, "..") || strchr(name, '/') || strchr(name, '\\')) return 0;
     if (strpbrk(name, "\"'<>&")) return 0;
     l = strlen(name);

@@ -2,6 +2,12 @@
 
 > 当前正式命名与安装路径已经统一为：`zwrt-datad`、`/data/plugins/zwrt-datad/zwrt-datad`、`/data/plugins/u60pro-devui/`、`/data/plugins/u60pro-devui/ui`。历史条目里如果出现 `u60-datad`、`/data/u60pro` 或 `/data/ui`，表示当时版本记录。
 
+## v1.2.12-remix.2 - 2026-07-16
+
+### 修复
+
+- 自定义功能页扫描忽略点文件，避免原版管理器升级时遗留的 macOS `._*.html` 被识别成重复入口。
+
 ## v1.2.12-remix.1 - 2026-07-16
 
 ### 变更
