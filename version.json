@@ -6,9 +6,9 @@
     "notes": "增加 U60Pro 邻区和信令兼容接口"
   },
   "devui": {
-    "version": "1.2.12-remix.1",
+    "version": "1.2.12-remix.2",
     "asset": "u60pro-devui-aarch64",
-    "notes": "Taste 精密网络仪表盘及插件控制页面"
+    "notes": "Taste 精密网络仪表盘，并忽略升级残留的隐藏页面文件"
   },
   "ui": {
     "version": "0.4.10-remix.1",
