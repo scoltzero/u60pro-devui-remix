@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "datad": {
+    "version": "0.6.7-remix.1",
+    "asset": "zwrt-datad-aarch64",
+    "notes": "增加 U60Pro 邻区和信令兼容接口"
+  },
+  "devui": {
+    "version": "1.2.12-remix.1",
+    "asset": "u60pro-devui-aarch64",
+    "notes": "Taste 精密网络仪表盘及插件控制页面"
+  },
+  "ui": {
+    "version": "0.4.10-remix.1",
+    "asset": "ui.tar.gz",
+    "notes": "Taste 深浅主题、二级页面及可选插件页面"
+  }
+}
