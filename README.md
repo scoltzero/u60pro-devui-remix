@@ -108,7 +108,7 @@ adb shell '/etc/init.d/zte_topsw_devui stop; sleep 1;
 在原版管理器中选择“自定义源链接”，推荐填写 CDN 资产模板：
 
 ```text
-https://cdn.jsdelivr.net/gh/scoltzero/u60pro-devui-remix@release-assets/{file}
+https://fastly.jsdelivr.net/gh/scoltzero/u60pro-devui-remix@release-assets/{file}
 ```
 
 正式归档仍位于 `https://github.com/scoltzero/u60pro-devui-remix/releases/latest/download`。部分设备网络访问 GitHub Release 重定向超过管理器的命令请求时限时，应使用上面的 jsDelivr 模板。
