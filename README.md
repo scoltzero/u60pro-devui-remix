@@ -1,11 +1,11 @@
 # u60pro-devui-remix
 
-这是基于 [33333s/u60pro-devui](https://github.com/33333s/u60pro-devui) v1.2.11 的 Remix 版本，保留原项目提交历史和目录结构。
+这是基于 [33333s/u60pro-devui](https://github.com/33333s/u60pro-devui) v1.2.12 的 Remix 版本，保留原项目提交历史和目录结构。
 
-本分支增加了 UFI-TOOLS 环境下的 Tailscale 与 Clash / Mihomo 屏幕控制页面：
+本分支增加了 UFI-TOOLS 环境下的 Tailscale、Clash / Mihomo、WireGuard 和漫游锁卡屏幕控制页面：
 
-- 从 `ui/functions/` 自动加载 Tailscale 和 Clash / Mihomo 功能页。
-- 显示服务状态、版本、进程、Tailscale 地址、子网路由和 Mihomo 透明代理状态。
+- 从 `ui/functions/` 自动加载已安装插件对应的功能页。
+- 显示 Tailscale、Clash / Mihomo、WireGuard 和漫游锁卡的紧凑状态与日常控制。
 - 提供启动、停止、重启和手动刷新操作，启动/停止按真实状态高亮。
 - 页面内显示最近三条带时间戳的操作记录，并保留即时 toast 反馈。
 - 提供基于 Linux cpufreq 的 CPU 省电、均衡、性能和极致模式控制页面。
@@ -15,7 +15,9 @@
 
 ```text
 /data/plugins/tailscale/tsctl.sh
-/data/ufi-tools/mihomo/mm.sh
+/data/plugins/mihomo/mm.sh
+/data/plugins/wireguard/wgctl.sh
+/data/plugins/operator-lock/operatorctl.sh
 ```
 
 这是 ZTE U60Pro 以及类似 SDX 系列 5G MiFi 设备前面板屏幕 UI 的一个 clean-room 开源替代实现。运行在标准 Linux 的 **DRM/KMS** 和 **evdev** 接口之上，目标是：
@@ -100,18 +102,18 @@ adb shell '/etc/init.d/zte_topsw_devui stop; sleep 1;
 ```jsonc
 // Remix 聚合 version.json
 { "schema": 1,
-  "datad": { "version": "0.6.7-remix.1", "asset": "zwrt-datad-aarch64" },
-  "devui": { "version": "1.2.12-remix.2", "asset": "u60pro-devui-aarch64" },
-  "ui":    { "version": "0.4.10-remix.1", "asset": "ui.tar.gz" } }
+  "datad": { "version": "0.6.7-remix.2", "asset": "zwrt-datad-aarch64" },
+  "devui": { "version": "1.2.12-remix.3", "asset": "u60pro-devui-aarch64" },
+  "ui":    { "version": "0.4.10-remix.2", "asset": "ui.tar.gz" } }
 ```
 
 在原版管理器中选择“自定义源链接”，本版本推荐填写经过完整哈希校验的不可变 CDN 资产模板：
 
 ```text
-https://fastly.jsdelivr.net/gh/scoltzero/u60pro-devui-remix@assets-v1.2.12-remix.2/{file}
+https://fastly.jsdelivr.net/gh/scoltzero/u60pro-devui-remix@assets-v1.2.12-remix.3/{file}
 ```
 
-该地址固定指向 `v1.2.12-remix.2` 的五个发布文件，不会因 CDN 分支缓存而出现清单与二进制版本不一致。正式归档仍位于 `https://github.com/scoltzero/u60pro-devui-remix/releases/latest/download`。部分设备网络访问 GitHub Release 重定向超过管理器的命令请求时限时，应使用上面的 jsDelivr 模板；后续版本需要改用对应的新资产标签。
+该地址固定指向 `v1.2.12-remix.3` 的五个发布文件，不会因 CDN 分支缓存而出现清单与二进制版本不一致。正式归档仍位于 `https://github.com/scoltzero/u60pro-devui-remix/releases/latest/download`。部分设备网络访问 GitHub Release 重定向超过管理器的命令请求时限时，应使用上面的 jsDelivr 模板；后续版本需要改用对应的新资产标签。
 
 **发版**：分别构建 DevUI 和 datad，再使用 `scripts/package-release.sh` 生成顶层平铺的 UI 包、合并版清单和 SHA-256 文件。
 
@@ -121,7 +123,7 @@ https://fastly.jsdelivr.net/gh/scoltzero/u60pro-devui-remix@assets-v1.2.12-remix
 bash scripts/build.sh
 bash scripts/package-release.sh \
   --datad ../zwrt-datad/zwrt-datad.stripped \
-  --out dist/v1.2.12-remix.2
+  --out dist/v1.2.12-remix.3
 ```
 
 ## 文档

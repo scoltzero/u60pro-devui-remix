@@ -2,6 +2,19 @@
 
 > 当前正式命名与安装路径已经统一为：`zwrt-datad`、`/data/plugins/zwrt-datad/zwrt-datad`、`/data/plugins/u60pro-devui/`、`/data/plugins/u60pro-devui/ui`。历史条目里如果出现 `u60-datad`、`/data/u60pro` 或 `/data/ui`，表示当时版本记录。
 
+## v1.2.12-remix.3 - 2026-07-17
+
+### 变更
+
+- 插件控制器优先从 `/data/plugins` 读取，并兼容 Tailscale、Mihomo、WireGuard 和漫游锁卡的历史目录。
+- 新增 WireGuard 客户端页面，支持启停、重启、刷新和紧凑 Peer 状态。
+- 新增漫游卡锁运营商页面，支持后台状态刷新、扫描、选择后二次确认锁定、恢复自动选网和取消任务。
+- 插件状态改为只刷新当前页面，漫游锁卡空闲时降为 10 秒轮询，避免耗时 AT 查询阻塞主界面。
+
+### 性能
+
+- Peer 和运营商列表使用固定高度紧凑行，复用现有长页缓存、45 FPS 滑动和惯性路径。
+
 ## v1.2.12-remix.2 - 2026-07-16
 
 ### 修复

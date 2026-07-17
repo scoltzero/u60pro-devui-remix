@@ -87,31 +87,101 @@ static uint32_t millis(void)
 /* Optional service pages under ui/functions/.  These fixed paths intentionally
  * avoid a generic "run shell from HTML" action: custom pages remain data-only,
  * while known local services get a small, auditable control surface. */
-#define TAILSCALE_CTL "/data/plugins/tailscale/tsctl.sh"
-#define TAILSCALE_DIR "/data/plugins/tailscale"
 #define TAILSCALE_ACTION_LOG "/tmp/devui-tailscale-action.log"
-#define MIHOMO_CTL    "/data/ufi-tools/mihomo/mm.sh"
-#define MIHOMO_DIR    "/data/ufi-tools/mihomo"
 #define MIHOMO_ACTION_LOG "/tmp/devui-mihomo-action.log"
+#define WIREGUARD_ACTION_LOG "/tmp/devui-wireguard-action.log"
+#define OPERATOR_ACTION_LOG "/tmp/devui-operator-action.log"
 #define CPU_CTL_BUNDLED UI_DIR "/functions/cpuctl.sh"
 #define CPU_CTL_LEGACY  UI_DIR "/../cpuctl.sh"
+#define CPU_CTL_OLD     "/data/ufi-tools/u60pro-devui/cpuctl.sh"
 #define CPU_ACTION_LOG "/tmp/devui-cpu-action.log"
+
+struct plugin_candidate {
+    const char *dir;
+    const char *ctl;
+    const char *bin;
+};
+
+static const struct plugin_candidate g_ts_candidates[] = {
+    { "/data/plugins/tailscale", "/data/plugins/tailscale/tsctl.sh", "/data/plugins/tailscale/bin/tailscale" },
+    { "/data/ufi-tools/tailscale", "/data/ufi-tools/tailscale/tsctl.sh", "/data/ufi-tools/tailscale/bin/tailscale" },
+    { "/data/kano_plugins/tailscale", "/data/kano_plugins/tailscale/tsctl.sh", "/data/kano_plugins/tailscale/bin/tailscale" },
+};
+static const struct plugin_candidate g_mh_candidates[] = {
+    { "/data/plugins/mihomo", "/data/plugins/mihomo/mm.sh", "/data/plugins/mihomo/mihomo" },
+    { "/data/ufi-tools/mihomo", "/data/ufi-tools/mihomo/mm.sh", "/data/ufi-tools/mihomo/mihomo" },
+    { "/data/kano_plugins/mihomo", "/data/kano_plugins/mihomo/mm.sh", "/data/kano_plugins/mihomo/mihomo" },
+};
+static const struct plugin_candidate g_wg_candidates[] = {
+    { "/data/plugins/wireguard", "/data/plugins/wireguard/wgctl.sh", "/data/plugins/wireguard/bin/wg" },
+    { "/data/ufi-tools/wireguard", "/data/ufi-tools/wireguard/wgctl.sh", "/data/ufi-tools/wireguard/bin/wg" },
+    { "/data/kano_plugins/wireguard", "/data/kano_plugins/wireguard/wgctl.sh", "/data/kano_plugins/wireguard/bin/wg" },
+};
+static const struct plugin_candidate g_operator_candidates[] = {
+    { "/data/plugins/operator-lock", "/data/plugins/operator-lock/operatorctl.sh", NULL },
+    { "/data/ufi-tools/operator-lock", "/data/ufi-tools/operator-lock/operatorctl.sh", NULL },
+    { "/data/kano_plugins/operator-lock", "/data/kano_plugins/operator-lock/operatorctl.sh", NULL },
+};
+
+static const struct plugin_candidate *plugin_candidate_select(
+    const struct plugin_candidate *items, size_t count, int require_bin)
+{
+    for (size_t i = 0; i < count; i++) {
+        if (access(items[i].ctl, X_OK) != 0) continue;
+        if (require_bin && items[i].bin && access(items[i].bin, X_OK) != 0) continue;
+        return &items[i];
+    }
+    return NULL;
+}
+
+#define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
+#define WG_MAX_PEERS 16
+#define OP_MAX_CANDIDATES 24
+
+struct wg_peer_state {
+    char public_key[48];
+    char endpoint[96];
+    char allowed_ips[192];
+    long long latest_handshake;
+    unsigned long long rx_bytes;
+    unsigned long long tx_bytes;
+};
+
+struct operator_candidate_state {
+    int status;
+    char plmn[8];
+    char name[80];
+};
 
 static uint32_t g_plugin_status_at;
 static int g_ts_installed, g_ts_running, g_ts_connected, g_ts_boot;
 static int g_mh_installed, g_mh_running, g_mh_tun, g_mh_rules;
 static int g_cpu_installed;
+static int g_wg_installed, g_wg_running, g_wg_deps, g_wg_boot;
+static int g_wg_peer_n, g_wg_peer_total, g_wg_peer_active;
+static int g_op_installed, g_op_registered, g_op_job_running, g_op_at_busy;
+static int g_op_candidate_n, g_op_candidate_total;
 static char g_ts_pid[16] = "-", g_ts_ip[48] = "-", g_ts_version[32] = "-";
 static char g_ts_host[64] = "-", g_ts_routes[160] = "-";
 static char g_mh_pid[16] = "-", g_mh_version[64] = "-", g_mh_mode[24] = "-";
 static char g_mh_port[16] = "-", g_mh_ipset[24] = "-";
 static char g_cpu_mode[24] = "unknown", g_cpu_gov[24] = "-";
 static char g_cpu_cur[24] = "-", g_cpu_min[24] = "-", g_cpu_max[24] = "-";
+static char g_wg_iface[32] = "wg-ufi0", g_wg_address[96] = "-", g_wg_port[16] = "-";
+static char g_wg_mode[24] = "stopped", g_wg_uptime[32] = "-";
+static struct wg_peer_state g_wg_peers[WG_MAX_PEERS];
+static char g_op_sim[32] = "-", g_op_operator[32] = "-", g_op_rat[32] = "-";
+static char g_op_mode[24] = "-", g_op_job_status[24] = "idle", g_op_job_message[160] = "-";
+static char g_op_rat_pref[16] = "auto", g_op_failure_policy[24] = "stay_offline";
+static char g_op_selected[8];
+static uint32_t g_op_confirm_until;
+static struct operator_candidate_state g_op_scan[OP_MAX_CANDIDATES];
 
 static const char *cpu_ctl_path(void)
 {
     if (access(CPU_CTL_BUNDLED, X_OK) == 0) return CPU_CTL_BUNDLED;
-    return CPU_CTL_LEGACY;
+    if (access(CPU_CTL_LEGACY, X_OK) == 0) return CPU_CTL_LEGACY;
+    return CPU_CTL_OLD;
 }
 
 #define TEMPLATE_CACHE_CAP 8
@@ -877,85 +947,374 @@ static int plugin_status_page(const char *path)
     return path && (strstr(path, "/functions/tailscale.html") ||
                     strstr(path, "/functions/clash.html") ||
                     strstr(path, "/functions/mihomo.html") ||
-                    strstr(path, "/functions/cpu-performance.html"));
+                    strstr(path, "/functions/cpu-performance.html") ||
+                    strstr(path, "/functions/wireguard.html") ||
+                    strstr(path, "/functions/operator-lock.html"));
 }
 
-static void plugin_status_refresh(const char *path, int force)
+static int plugin_page_named(const char *path, const char *name)
 {
-    uint32_t now = millis();
-    FILE *fp;
-    char line[256];
+    char needle[96];
+    snprintf(needle, sizeof needle, "/functions/%s", name);
+    return path && strstr(path, needle) != NULL;
+}
 
-    if (!plugin_status_page(path)) return;
-    if (!force && g_plugin_status_at && now - g_plugin_status_at < 2000) return;
-    g_plugin_status_at = now;
+static char *trim_text(char *s)
+{
+    char *end;
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
+    end = s + strlen(s);
+    while (end > s && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '\n')) end--;
+    *end = 0;
+    return s;
+}
+
+static void duration_short(char *dst, size_t cap, long long sec)
+{
+    if (sec <= 0) snprintf(dst, cap, "-");
+    else if (sec >= 3600) snprintf(dst, cap, "%lldh %lldm", sec / 3600, (sec % 3600) / 60);
+    else if (sec >= 60) snprintf(dst, cap, "%lldm %llds", sec / 60, sec % 60);
+    else snprintf(dst, cap, "%llds", sec);
+}
+
+static void refresh_tailscale_status(void)
+{
+    const struct plugin_candidate *p = plugin_candidate_select(g_ts_candidates, ARRAY_LEN(g_ts_candidates), 1);
+    FILE *fp;
+    char line[512], cmd[2048];
 
     g_ts_installed = g_ts_running = g_ts_connected = g_ts_boot = 0;
-    g_mh_installed = g_mh_running = g_mh_tun = g_mh_rules = 0;
-    g_cpu_installed = 0;
     snprintf(g_ts_pid, sizeof g_ts_pid, "-");
     snprintf(g_ts_ip, sizeof g_ts_ip, "-");
     snprintf(g_ts_version, sizeof g_ts_version, "-");
     snprintf(g_ts_host, sizeof g_ts_host, "-");
     snprintf(g_ts_routes, sizeof g_ts_routes, "-");
-    snprintf(g_mh_pid, sizeof g_mh_pid, "-");
-    snprintf(g_mh_version, sizeof g_mh_version, "-");
-    snprintf(g_mh_mode, sizeof g_mh_mode, "-");
-    snprintf(g_mh_port, sizeof g_mh_port, "-");
-    snprintf(g_mh_ipset, sizeof g_mh_ipset, "-");
-    snprintf(g_cpu_mode, sizeof g_cpu_mode, "unknown");
-    snprintf(g_cpu_gov, sizeof g_cpu_gov, "-");
-    snprintf(g_cpu_cur, sizeof g_cpu_cur, "-");
-    snprintf(g_cpu_min, sizeof g_cpu_min, "-");
-    snprintf(g_cpu_max, sizeof g_cpu_max, "-");
-
-    fp = popen(
-        "echo TS_INST=$([ -x " TAILSCALE_CTL " ] && [ -x " TAILSCALE_DIR "/bin/tailscale ] && echo 1 || echo 0);"
-        "tpid=$(pidof tailscaled 2>/dev/null | awk '{print $1}'); echo TS_PID=${tpid:--};"
-        "tip=$(ip -4 addr show dev tailscale0 2>/dev/null | awk '/inet /{sub(/\\/.*/,\"\",$2);print $2;exit}'); echo TS_IP=${tip:--};"
-        "echo TS_VER=$(sed -n '1{s/[[:space:]].*//;p;q}' " TAILSCALE_DIR "/version.txt 2>/dev/null);"
-        "echo TS_HOST=$(sed -n 's/.*\"hostname\":\"\\([^\"]*\\)\".*/\\1/p' " TAILSCALE_DIR "/config.json 2>/dev/null);"
-        "echo TS_ROUTES=$(sed -n 's/.*\"advertise_routes\":\"\\([^\"]*\\)\".*/\\1/p' " TAILSCALE_DIR "/config.json 2>/dev/null);"
-        "grep -q '\"auto_start\":true' " TAILSCALE_DIR "/config.json 2>/dev/null && echo TS_BOOT=1 || echo TS_BOOT=0;"
-        "echo MH_INST=$([ -x " MIHOMO_CTL " ] && [ -x " MIHOMO_DIR "/mihomo ] && echo 1 || echo 0);"
-        "mpid=$(pidof mihomo 2>/dev/null | awk '{print $1}'); echo MH_PID=${mpid:--};"
-        "[ -d /sys/class/net/utun ] && echo MH_TUN=1 || echo MH_TUN=0;"
-        "ip rule show 2>/dev/null | grep -q 'lookup 2022' && echo MH_RULES=1 || echo MH_RULES=0;"
-        "echo MH_VER=$(" MIHOMO_DIR "/mihomo -v 2>/dev/null | awk 'NR==1{print $3;exit}');"
-        "echo MH_MODE=$(sed -n 's/^mode:[[:space:]]*//p' " MIHOMO_DIR "/config.yaml 2>/dev/null | head -1);"
-        "echo MH_PORT=$(sed -n 's/^mixed-port:[[:space:]]*//p' " MIHOMO_DIR "/config.yaml 2>/dev/null | head -1);"
-        "echo MH_IPSET=$(ipset list chnroute 2>/dev/null | awk -F': ' '/Number of entries/{print $2;exit}');"
-        "CPU_CTL=" CPU_CTL_BUNDLED "; [ -x \"$CPU_CTL\" ] || CPU_CTL=" CPU_CTL_LEGACY ";"
-        "if [ -x \"$CPU_CTL\" ]; then \"$CPU_CTL\" status 2>/dev/null; else echo CPU_INST=0; fi",
-        "r");
+    if (!p) return;
+    g_ts_installed = 1;
+    snprintf(cmd, sizeof cmd,
+             "tpid=$(pidof tailscaled 2>/dev/null | awk '{print $1}'); echo TS_PID=${tpid:--};"
+             "tip=$(ip -4 addr show dev tailscale0 2>/dev/null | awk '/inet /{sub(/\\/.*/,\"\",$2);print $2;exit}'); echo TS_IP=${tip:--};"
+             "echo TS_VER=$(sed -n '1{s/[[:space:]].*//;p;q}' '%s/version.txt' 2>/dev/null);"
+             "echo TS_HOST=$(sed -n 's/.*\"hostname\":\"\\([^\"]*\\)\".*/\\1/p' '%s/config.json' 2>/dev/null);"
+             "echo TS_ROUTES=$(sed -n 's/.*\"advertise_routes\":\"\\([^\"]*\\)\".*/\\1/p' '%s/config.json' 2>/dev/null);"
+             "grep -q '\"auto_start\":true' '%s/config.json' 2>/dev/null && echo TS_BOOT=1 || echo TS_BOOT=0;",
+             p->dir, p->dir, p->dir, p->dir);
+    fp = popen(cmd, "r");
     if (!fp) return;
     while (fgets(line, sizeof line, fp)) {
-        if      (!strncmp(line, "TS_INST=", 8))   g_ts_installed = atoi(line + 8);
-        else if (!strncmp(line, "TS_PID=", 7))    line_value(g_ts_pid, sizeof g_ts_pid, line, 7);
+        if      (!strncmp(line, "TS_PID=", 7))    line_value(g_ts_pid, sizeof g_ts_pid, line, 7);
         else if (!strncmp(line, "TS_IP=", 6))     line_value(g_ts_ip, sizeof g_ts_ip, line, 6);
         else if (!strncmp(line, "TS_VER=", 7))    line_value(g_ts_version, sizeof g_ts_version, line, 7);
         else if (!strncmp(line, "TS_HOST=", 8))   line_value(g_ts_host, sizeof g_ts_host, line, 8);
         else if (!strncmp(line, "TS_ROUTES=", 10)) line_value(g_ts_routes, sizeof g_ts_routes, line, 10);
         else if (!strncmp(line, "TS_BOOT=", 8))   g_ts_boot = atoi(line + 8);
-        else if (!strncmp(line, "MH_INST=", 8))   g_mh_installed = atoi(line + 8);
-        else if (!strncmp(line, "MH_PID=", 7))    line_value(g_mh_pid, sizeof g_mh_pid, line, 7);
+    }
+    pclose(fp);
+    g_ts_running = strcmp(g_ts_pid, "-") != 0;
+    g_ts_connected = g_ts_running && strcmp(g_ts_ip, "-") != 0;
+}
+
+static void refresh_mihomo_status(void)
+{
+    const struct plugin_candidate *p = plugin_candidate_select(g_mh_candidates, ARRAY_LEN(g_mh_candidates), 1);
+    FILE *fp;
+    char line[512], cmd[2048];
+
+    g_mh_installed = g_mh_running = g_mh_tun = g_mh_rules = 0;
+    snprintf(g_mh_pid, sizeof g_mh_pid, "-");
+    snprintf(g_mh_version, sizeof g_mh_version, "-");
+    snprintf(g_mh_mode, sizeof g_mh_mode, "-");
+    snprintf(g_mh_port, sizeof g_mh_port, "-");
+    snprintf(g_mh_ipset, sizeof g_mh_ipset, "-");
+    if (!p) return;
+    g_mh_installed = 1;
+    snprintf(cmd, sizeof cmd,
+             "mpid=$(pidof mihomo 2>/dev/null | awk '{print $1}'); echo MH_PID=${mpid:--};"
+             "[ -d /sys/class/net/utun ] && echo MH_TUN=1 || echo MH_TUN=0;"
+             "ip rule show 2>/dev/null | grep -q 'lookup 2022' && echo MH_RULES=1 || echo MH_RULES=0;"
+             "echo MH_VER=$('%s' -v 2>/dev/null | awk 'NR==1{print $3;exit}');"
+             "echo MH_MODE=$(sed -n 's/^mode:[[:space:]]*//p' '%s/config.yaml' 2>/dev/null | head -1);"
+             "echo MH_PORT=$(sed -n 's/^mixed-port:[[:space:]]*//p' '%s/config.yaml' 2>/dev/null | head -1);"
+             "echo MH_IPSET=$(ipset list chnroute 2>/dev/null | awk -F': ' '/Number of entries/{print $2;exit}');",
+             p->bin, p->dir, p->dir);
+    fp = popen(cmd, "r");
+    if (!fp) return;
+    while (fgets(line, sizeof line, fp)) {
+        if      (!strncmp(line, "MH_PID=", 7))    line_value(g_mh_pid, sizeof g_mh_pid, line, 7);
         else if (!strncmp(line, "MH_TUN=", 7))    g_mh_tun = atoi(line + 7);
         else if (!strncmp(line, "MH_RULES=", 9))  g_mh_rules = atoi(line + 9);
         else if (!strncmp(line, "MH_VER=", 7))    line_value(g_mh_version, sizeof g_mh_version, line, 7);
         else if (!strncmp(line, "MH_MODE=", 8))   line_value(g_mh_mode, sizeof g_mh_mode, line, 8);
         else if (!strncmp(line, "MH_PORT=", 8))   line_value(g_mh_port, sizeof g_mh_port, line, 8);
         else if (!strncmp(line, "MH_IPSET=", 9))  line_value(g_mh_ipset, sizeof g_mh_ipset, line, 9);
-        else if (!strncmp(line, "CPU_INST=", 9))  g_cpu_installed = atoi(line + 9);
-        else if (!strncmp(line, "CPU_MODE=", 9))  line_value(g_cpu_mode, sizeof g_cpu_mode, line, 9);
-        else if (!strncmp(line, "CPU_GOV=", 8))   line_value(g_cpu_gov, sizeof g_cpu_gov, line, 8);
-        else if (!strncmp(line, "CPU_CUR=", 8))   line_value(g_cpu_cur, sizeof g_cpu_cur, line, 8);
-        else if (!strncmp(line, "CPU_MIN=", 8))   line_value(g_cpu_min, sizeof g_cpu_min, line, 8);
-        else if (!strncmp(line, "CPU_MAX=", 8))   line_value(g_cpu_max, sizeof g_cpu_max, line, 8);
     }
     pclose(fp);
-    g_ts_running = strcmp(g_ts_pid, "-") != 0;
-    g_ts_connected = g_ts_running && strcmp(g_ts_ip, "-") != 0;
     g_mh_running = strcmp(g_mh_pid, "-") != 0;
+}
+
+static void refresh_cpu_status(void)
+{
+    const char *ctl = cpu_ctl_path();
+    FILE *fp;
+    char line[256], cmd[512];
+
+    g_cpu_installed = 0;
+    snprintf(g_cpu_mode, sizeof g_cpu_mode, "unknown");
+    snprintf(g_cpu_gov, sizeof g_cpu_gov, "-");
+    snprintf(g_cpu_cur, sizeof g_cpu_cur, "-");
+    snprintf(g_cpu_min, sizeof g_cpu_min, "-");
+    snprintf(g_cpu_max, sizeof g_cpu_max, "-");
+    if (access(ctl, X_OK) != 0) return;
+    snprintf(cmd, sizeof cmd, "'%s' status 2>/dev/null", ctl);
+    fp = popen(cmd, "r");
+    if (!fp) return;
+    while (fgets(line, sizeof line, fp)) {
+        if      (!strncmp(line, "CPU_INST=", 9)) g_cpu_installed = atoi(line + 9);
+        else if (!strncmp(line, "CPU_MODE=", 9)) line_value(g_cpu_mode, sizeof g_cpu_mode, line, 9);
+        else if (!strncmp(line, "CPU_GOV=", 8))  line_value(g_cpu_gov, sizeof g_cpu_gov, line, 8);
+        else if (!strncmp(line, "CPU_CUR=", 8))  line_value(g_cpu_cur, sizeof g_cpu_cur, line, 8);
+        else if (!strncmp(line, "CPU_MIN=", 8))  line_value(g_cpu_min, sizeof g_cpu_min, line, 8);
+        else if (!strncmp(line, "CPU_MAX=", 8))  line_value(g_cpu_max, sizeof g_cpu_max, line, 8);
+    }
+    pclose(fp);
+}
+
+static void wg_peer_add(const char *pub, const char *endpoint, const char *allowed,
+                        long long handshake, unsigned long long rx, unsigned long long tx)
+{
+    int idx = g_wg_peer_total++;
+    if (handshake > 0 && time(NULL) - handshake <= 180) g_wg_peer_active++;
+    if (idx >= WG_MAX_PEERS) return;
+    struct wg_peer_state *peer = &g_wg_peers[g_wg_peer_n++];
+    snprintf(peer->public_key, sizeof peer->public_key, "%s", pub && *pub ? pub : "-");
+    snprintf(peer->endpoint, sizeof peer->endpoint, "%s", endpoint && *endpoint ? endpoint : "-");
+    snprintf(peer->allowed_ips, sizeof peer->allowed_ips, "%s", allowed && *allowed ? allowed : "-");
+    peer->latest_handshake = handshake;
+    peer->rx_bytes = rx;
+    peer->tx_bytes = tx;
+}
+
+static void wg_load_config_peers(const char *dir)
+{
+    char path[320], line[512], pub[96] = "", endpoint[128] = "", allowed[256] = "";
+    int in_peer = 0;
+    FILE *fp;
+    snprintf(path, sizeof path, "%s/wg-ufi0.conf", dir);
+    fp = fopen(path, "r");
+    if (!fp) return;
+    while (fgets(line, sizeof line, fp)) {
+        char *s = trim_text(line), *eq;
+        if (*s == '[') {
+            if (in_peer && pub[0]) wg_peer_add(pub, endpoint, allowed, 0, 0, 0);
+            in_peer = !strcasecmp(s, "[Peer]");
+            pub[0] = endpoint[0] = allowed[0] = 0;
+            continue;
+        }
+        if (!in_peer || !(eq = strchr(s, '='))) continue;
+        *eq++ = 0;
+        char *key = trim_text(s), *value = trim_text(eq);
+        if (!strcasecmp(key, "PublicKey")) snprintf(pub, sizeof pub, "%s", value);
+        else if (!strcasecmp(key, "Endpoint")) snprintf(endpoint, sizeof endpoint, "%s", value);
+        else if (!strcasecmp(key, "AllowedIPs")) snprintf(allowed, sizeof allowed, "%s", value);
+    }
+    if (in_peer && pub[0]) wg_peer_add(pub, endpoint, allowed, 0, 0, 0);
+    fclose(fp);
+}
+
+static void wg_load_running_peers(const struct plugin_candidate *p)
+{
+    FILE *fp;
+    char cmd[512], line[1024];
+    int first = 1;
+    snprintf(cmd, sizeof cmd, "'%s' show '%s' dump 2>/dev/null", p->bin, g_wg_iface);
+    fp = popen(cmd, "r");
+    if (!fp) return;
+    while (fgets(line, sizeof line, fp)) {
+        char *save = NULL, *cols[8] = {0};
+        int n = 0;
+        if (first) { first = 0; continue; }
+        for (char *v = strtok_r(line, "\t\r\n", &save); v && n < 8; v = strtok_r(NULL, "\t\r\n", &save)) cols[n++] = v;
+        if (n < 7) continue;
+        wg_peer_add(cols[0], cols[2], cols[3], atoll(cols[4]), strtoull(cols[5], NULL, 10), strtoull(cols[6], NULL, 10));
+    }
+    pclose(fp);
+}
+
+static void refresh_wireguard_status(void)
+{
+    const struct plugin_candidate *p = plugin_candidate_select(g_wg_candidates, ARRAY_LEN(g_wg_candidates), 0);
+    FILE *fp;
+    char line[512], cmd[512];
+    int have_wg = 0, have_kmod = 0;
+
+    g_wg_installed = g_wg_running = g_wg_deps = g_wg_boot = 0;
+    g_wg_peer_n = g_wg_peer_total = g_wg_peer_active = 0;
+    memset(g_wg_peers, 0, sizeof g_wg_peers);
+    snprintf(g_wg_iface, sizeof g_wg_iface, "wg-ufi0");
+    snprintf(g_wg_address, sizeof g_wg_address, "-");
+    snprintf(g_wg_port, sizeof g_wg_port, "-");
+    snprintf(g_wg_mode, sizeof g_wg_mode, "stopped");
+    snprintf(g_wg_uptime, sizeof g_wg_uptime, "-");
+    if (!p) return;
+    g_wg_installed = 1;
+    snprintf(cmd, sizeof cmd, "'%s' status 2>/dev/null", p->ctl);
+    fp = popen(cmd, "r");
+    if (fp) {
+        while (fgets(line, sizeof line, fp)) {
+            if      (!strncmp(line, "wg=", 3))           have_wg = !strncmp(line + 3, "true", 4);
+            else if (!strncmp(line, "kmod=", 5))         have_kmod = !strncmp(line + 5, "true", 4);
+            else if (!strncmp(line, "running=", 8))      g_wg_running = !strncmp(line + 8, "true", 4);
+            else if (!strncmp(line, "interface=", 10))   line_value(g_wg_iface, sizeof g_wg_iface, line, 10);
+            else if (!strncmp(line, "listen_port=", 12)) line_value(g_wg_port, sizeof g_wg_port, line, 12);
+            else if (!strncmp(line, "addresses=", 10))   line_value(g_wg_address, sizeof g_wg_address, line, 10);
+            else if (!strncmp(line, "start_mode=", 11))  line_value(g_wg_mode, sizeof g_wg_mode, line, 11);
+            else if (!strncmp(line, "uptime=", 7))       duration_short(g_wg_uptime, sizeof g_wg_uptime, atoll(line + 7));
+            else if (!strncmp(line, "boot_enabled=", 13)) g_wg_boot = !strncmp(line + 13, "true", 4);
+        }
+        pclose(fp);
+    }
+    g_wg_deps = have_wg && have_kmod;
+    if (g_wg_running && p->bin && access(p->bin, X_OK) == 0) wg_load_running_peers(p);
+    else wg_load_config_peers(p->dir);
+}
+
+static void operator_env_load(const char *path)
+{
+    FILE *fp = fopen(path, "r");
+    char line[256];
+    if (!fp) return;
+    while (fgets(line, sizeof line, fp)) {
+        if      (!strncmp(line, "sim_state=", 10)) line_value(g_op_sim, sizeof g_op_sim, line, 10);
+        else if (!strncmp(line, "operator=", 9))   line_value(g_op_operator, sizeof g_op_operator, line, 9);
+        else if (!strncmp(line, "rat=", 4))        line_value(g_op_rat, sizeof g_op_rat, line, 4);
+        else if (!strncmp(line, "cops_mode=", 10)) line_value(g_op_mode, sizeof g_op_mode, line, 10);
+        else if (!strncmp(line, "registered=", 11)) g_op_registered = !strncmp(line + 11, "true", 4);
+    }
+    fclose(fp);
+}
+
+static int operator_quoted_field(const char **cursor, char *dst, size_t cap)
+{
+    const char *a = strchr(*cursor, '\"'), *b;
+    size_t len;
+    if (!a || !(b = strchr(a + 1, '\"'))) return 0;
+    len = (size_t)(b - a - 1);
+    if (len >= cap) len = cap - 1;
+    memcpy(dst, a + 1, len);
+    dst[len] = 0;
+    *cursor = b + 1;
+    return 1;
+}
+
+static void operator_candidate_add(int status, const char *plmn, const char *name)
+{
+    for (int i = 0; i < g_op_candidate_n; i++) {
+        if (strcmp(g_op_scan[i].plmn, plmn)) continue;
+        if (status == 2 || (status == 1 && g_op_scan[i].status != 2)) g_op_scan[i].status = status;
+        if (!g_op_scan[i].name[0] && name && *name) snprintf(g_op_scan[i].name, sizeof g_op_scan[i].name, "%s", name);
+        return;
+    }
+    g_op_candidate_total++;
+    if (g_op_candidate_n >= OP_MAX_CANDIDATES) return;
+    struct operator_candidate_state *item = &g_op_scan[g_op_candidate_n++];
+    item->status = status;
+    snprintf(item->plmn, sizeof item->plmn, "%s", plmn);
+    snprintf(item->name, sizeof item->name, "%s", name && *name ? name : plmn);
+}
+
+static void operator_scan_load(const char *path)
+{
+    char *raw = read_file(path);
+    const char *p;
+    if (!raw) return;
+    p = raw;
+    while ((p = strchr(p, '('))) {
+        char *end = NULL, long_name[80] = "", short_name[80] = "", plmn[8] = "";
+        long status = strtol(p + 1, &end, 10);
+        const char *q = end;
+        if (end == p + 1 || status < 0 || status > 3 ||
+            !operator_quoted_field(&q, long_name, sizeof long_name) ||
+            !operator_quoted_field(&q, short_name, sizeof short_name) ||
+            !operator_quoted_field(&q, plmn, sizeof plmn)) {
+            p++;
+            continue;
+        }
+        if ((strlen(plmn) == 5 || strlen(plmn) == 6) && strspn(plmn, "0123456789") == strlen(plmn))
+            operator_candidate_add((int)status, plmn, long_name[0] ? long_name : short_name);
+        p = q;
+    }
+    free(raw);
+}
+
+static int operator_rat_valid(const char *value)
+{
+    return value && (!strcmp(value, "auto") || !strcmp(value, "wcdma") ||
+                     !strcmp(value, "lte") || !strcmp(value, "nr_sa"));
+}
+
+static int operator_policy_valid(const char *value)
+{
+    return value && (!strcmp(value, "stay_offline") || !strcmp(value, "restore_auto"));
+}
+
+static void refresh_operator_status(void)
+{
+    const struct plugin_candidate *p = plugin_candidate_select(g_operator_candidates, ARRAY_LEN(g_operator_candidates), 0);
+    char path[320], tmp[192];
+    char *json;
+
+    g_op_installed = g_op_registered = g_op_job_running = g_op_at_busy = 0;
+    g_op_candidate_n = g_op_candidate_total = 0;
+    memset(g_op_scan, 0, sizeof g_op_scan);
+    snprintf(g_op_sim, sizeof g_op_sim, "-");
+    snprintf(g_op_operator, sizeof g_op_operator, "-");
+    snprintf(g_op_rat, sizeof g_op_rat, "-");
+    snprintf(g_op_mode, sizeof g_op_mode, "-");
+    snprintf(g_op_job_status, sizeof g_op_job_status, "idle");
+    snprintf(g_op_job_message, sizeof g_op_job_message, "-");
+    snprintf(g_op_rat_pref, sizeof g_op_rat_pref, "auto");
+    snprintf(g_op_failure_policy, sizeof g_op_failure_policy, "stay_offline");
+    if (!p) return;
+    g_op_installed = 1;
+    snprintf(path, sizeof path, "%s/status.env", p->dir);
+    operator_env_load(path);
+    snprintf(path, sizeof path, "%s/config.json", p->dir);
+    json = read_file(path);
+    if (json) {
+        if (json_get(json, "rat", tmp, sizeof tmp) && operator_rat_valid(tmp))
+            snprintf(g_op_rat_pref, sizeof g_op_rat_pref, "%s", tmp);
+        if (json_get(json, "failure_policy", tmp, sizeof tmp) && operator_policy_valid(tmp))
+            snprintf(g_op_failure_policy, sizeof g_op_failure_policy, "%s", tmp);
+        if (!g_op_selected[0] && json_get(json, "target_plmn", tmp, sizeof tmp) && (strlen(tmp) == 5 || strlen(tmp) == 6))
+            snprintf(g_op_selected, sizeof g_op_selected, "%s", tmp);
+        free(json);
+    }
+    snprintf(path, sizeof path, "%s/job.json", p->dir);
+    json = read_file(path);
+    if (json) {
+        if (json_get(json, "status", tmp, sizeof tmp) && tmp[0]) snprintf(g_op_job_status, sizeof g_op_job_status, "%s", tmp);
+        if (json_get(json, "message", tmp, sizeof tmp) && tmp[0]) snprintf(g_op_job_message, sizeof g_op_job_message, "%s", tmp);
+        g_op_job_running = !strcmp(g_op_job_status, "queued") || !strcmp(g_op_job_status, "running");
+        free(json);
+    }
+    g_op_at_busy = g_op_job_running;
+    snprintf(path, sizeof path, "%s/scan.raw", p->dir);
+    operator_scan_load(path);
+}
+
+static void plugin_status_refresh(const char *path, int force)
+{
+    uint32_t now = millis();
+    uint32_t interval = plugin_page_named(path, "operator-lock.html") && !g_op_job_running ? 10000 : 2000;
+
+    if (!plugin_status_page(path)) return;
+    if (!force && g_plugin_status_at && now - g_plugin_status_at < interval) return;
+    g_plugin_status_at = now;
+    if (plugin_page_named(path, "tailscale.html")) refresh_tailscale_status();
+    else if (plugin_page_named(path, "clash.html") || plugin_page_named(path, "mihomo.html")) refresh_mihomo_status();
+    else if (plugin_page_named(path, "cpu-performance.html")) refresh_cpu_status();
+    else if (plugin_page_named(path, "wireguard.html")) refresh_wireguard_status();
+    else if (plugin_page_named(path, "operator-lock.html")) refresh_operator_status();
 }
 
 /* ---- screen lock (PIN) persistence. The PIN lives in a dotfile under the UI
@@ -1376,11 +1735,15 @@ static int function_control_api_available(const char *name)
 {
     if (!name) return 0;
     if (!strcmp(name, "tailscale.html"))
-        return access(TAILSCALE_CTL, X_OK) == 0;
+        return plugin_candidate_select(g_ts_candidates, ARRAY_LEN(g_ts_candidates), 0) != NULL;
     if (!strcmp(name, "clash.html") || !strcmp(name, "mihomo.html"))
-        return access(MIHOMO_CTL, X_OK) == 0;
+        return plugin_candidate_select(g_mh_candidates, ARRAY_LEN(g_mh_candidates), 0) != NULL;
     if (!strcmp(name, "cpu-performance.html"))
-        return access(CPU_CTL_BUNDLED, X_OK) == 0 || access(CPU_CTL_LEGACY, X_OK) == 0;
+        return access(cpu_ctl_path(), X_OK) == 0;
+    if (!strcmp(name, "wireguard.html"))
+        return plugin_candidate_select(g_wg_candidates, ARRAY_LEN(g_wg_candidates), 0) != NULL;
+    if (!strcmp(name, "operator-lock.html"))
+        return plugin_candidate_select(g_operator_candidates, ARRAY_LEN(g_operator_candidates), 0) != NULL;
     return 1;
 }
 
@@ -1534,6 +1897,8 @@ static const char *custom_function_tiles_html(void)
         if (!strcmp(names[i], "tailscale.html")) desc = "组网状态与子网路由";
         else if (!strcmp(names[i], "clash.html") || !strcmp(names[i], "mihomo.html")) desc = "代理状态与服务控制";
         else if (!strcmp(names[i], "cpu-performance.html")) desc = "频率策略与温控状态";
+        else if (!strcmp(names[i], "wireguard.html")) desc = "隧道状态与 Peer";
+        else if (!strcmp(names[i], "operator-lock.html")) desc = "扫描并锁定运营商";
         o += snprintf(buf + o, sizeof buf - o,
                       "<a href=\"act:func:%s\" class=\"func-tile func-custom\">"
                       "<span class=\"func-name\">%s</span>"
@@ -1542,6 +1907,93 @@ static const char *custom_function_tiles_html(void)
                       href, title, desc);
         if (o >= (int)sizeof(buf) - 256) break;
     }
+    return buf;
+}
+
+static void bytes_short(char *dst, size_t cap, unsigned long long n)
+{
+    if (n >= 1024ULL * 1024ULL * 1024ULL) snprintf(dst, cap, "%.1f GB", (double)n / (1024.0 * 1024.0 * 1024.0));
+    else if (n >= 1024ULL * 1024ULL) snprintf(dst, cap, "%.1f MB", (double)n / (1024.0 * 1024.0));
+    else if (n >= 1024ULL) snprintf(dst, cap, "%.1f KB", (double)n / 1024.0);
+    else snprintf(dst, cap, "%llu B", n);
+}
+
+static const char *wireguard_peer_html(void)
+{
+    static char buf[14000];
+    int o = 0;
+    time_t now = time(NULL);
+    buf[0] = 0;
+    if (!g_wg_peer_n) {
+        snprintf(buf, sizeof buf, "<div class='compact-empty'>暂无 Peer 配置</div>");
+        return buf;
+    }
+    for (int i = 0; i < g_wg_peer_n && o < (int)sizeof(buf) - 600; i++) {
+        struct wg_peer_state *p = &g_wg_peers[i];
+        char key[24], endpoint[240], allowed[420], rx[32], tx[32], age[48];
+        const char *state = "未连接", *cls = "muted";
+        snprintf(key, sizeof key, "%.12s...", p->public_key);
+        html_esc(endpoint, sizeof endpoint, p->endpoint);
+        html_esc(allowed, sizeof allowed, p->allowed_ips);
+        bytes_short(rx, sizeof rx, p->rx_bytes);
+        bytes_short(tx, sizeof tx, p->tx_bytes);
+        if (p->latest_handshake > 0) {
+            long long sec = (long long)now - p->latest_handshake;
+            if (sec < 0) sec = 0;
+            duration_short(age, sizeof age, sec);
+            if (sec <= 180) { state = "活跃"; cls = "ok"; }
+            else { state = "过期"; cls = "warn"; }
+        } else snprintf(age, sizeof age, "从未握手");
+        o += snprintf(buf + o, sizeof buf - (size_t)o,
+                      "<div class='peer-row'>"
+                      "<div class='peer-head'><span class='peer-key'>%s</span><span class='peer-state %s'>%s</span></div>"
+                      "<div class='peer-detail'>%s · %s</div>"
+                      "<div class='peer-meta'>%s · RX %s · TX %s</div>"
+                      "</div>", key, cls, state, endpoint, allowed, age, rx, tx);
+    }
+    if (g_wg_peer_total > g_wg_peer_n)
+        snprintf(buf + o, sizeof buf - (size_t)o,
+                 "<div class='compact-more'>另有 %d 个 Peer，请在网页端查看</div>",
+                 g_wg_peer_total - g_wg_peer_n);
+    return buf;
+}
+
+static const char *operator_list_html(void)
+{
+    static char buf[15000];
+    int o = 0;
+    if (!g_op_candidate_n) {
+        snprintf(buf, sizeof buf, "<div class='compact-empty'>暂无扫描结果</div>");
+        return buf;
+    }
+    if (!g_op_selected[0]) {
+        for (int i = 0; i < g_op_candidate_n; i++)
+            if (g_op_scan[i].status == 2) {
+                snprintf(g_op_selected, sizeof g_op_selected, "%s", g_op_scan[i].plmn);
+                break;
+            }
+    }
+    for (int i = 0; i < g_op_candidate_n && o < (int)sizeof(buf) - 500; i++) {
+        struct operator_candidate_state *item = &g_op_scan[i];
+        char name[200];
+        const char *state = item->status == 2 ? "当前" : item->status == 1 ? "可用" : item->status == 3 ? "禁止" : "未知";
+        const char *state_cls = item->status == 2 ? "ok" : item->status == 1 ? "ready" : item->status == 3 ? "bad" : "muted";
+        int selected = !strcmp(g_op_selected, item->plmn);
+        html_esc(name, sizeof name, item->name);
+        if (item->status == 3) {
+            o += snprintf(buf + o, sizeof buf - (size_t)o,
+                          "<div class='operator-row disabled%s'><span class='operator-main'>%s<small>%s</small></span><span class='operator-state %s'>%s</span></div>",
+                          selected ? " selected" : "", name, item->plmn, state_cls, state);
+        } else {
+            o += snprintf(buf + o, sizeof buf - (size_t)o,
+                          "<a href='act:opselect:%s' class='operator-row%s'><span class='operator-main'>%s<small>%s</small></span><span class='operator-state %s'>%s</span></a>",
+                          item->plmn, selected ? " selected" : "", name, item->plmn, state_cls, state);
+        }
+    }
+    if (g_op_candidate_total > g_op_candidate_n)
+        snprintf(buf + o, sizeof buf - (size_t)o,
+                 "<div class='compact-more'>另有 %d 项，请在网页端查看</div>",
+                 g_op_candidate_total - g_op_candidate_n);
     return buf;
 }
 
@@ -4696,6 +5148,11 @@ static int build_kv(struct kv *t, const char *path)
      * the live lock unless the user is editing in the modal ---- */
     static char s_netseg[640], s_cursa[300], s_curnsa[300], s_curlte[300], s_toast[120];
     static char s_ts_action_log[2200], s_mh_action_log[2200], s_cpu_action_log[2200];
+    static char s_wg_action_log[2200], s_op_action_log[2200];
+    static char s_wg_peers[24], s_wg_active[24], s_op_selected[16], s_op_job[440];
+    static char s_wg_iface[80], s_wg_address[220], s_wg_port[48], s_wg_mode[64];
+    static char s_op_sim[80], s_op_operator[96], s_op_rat[80], s_op_mode[64];
+    static char s_op_rat_pref[48], s_op_policy[64], s_op_job_raw[220];
     if (band_count(d.sa_bands)  >= band_count(g_uni_sa))  snprintf(g_uni_sa,  sizeof g_uni_sa,  "%s", d.sa_bands);
     if (band_count(d.nsa_bands) >= band_count(g_uni_nsa)) snprintf(g_uni_nsa, sizeof g_uni_nsa, "%s", d.nsa_bands);
     if (band_count(d.lte_bands) >= band_count(g_uni_lte)) snprintf(g_uni_lte, sizeof g_uni_lte, "%s", d.lte_bands);
@@ -5011,6 +5468,55 @@ static int build_kv(struct kv *t, const char *path)
     t[i++] = (struct kv){ "CPUMAX", g_cpu_max };
     plugin_action_log_html(s_cpu_action_log, sizeof s_cpu_action_log, CPU_ACTION_LOG);
     t[i++] = (struct kv){ "CPUACTIONLOG", s_cpu_action_log };
+    snprintf(s_wg_peers, sizeof s_wg_peers, "%d", g_wg_peer_total);
+    snprintf(s_wg_active, sizeof s_wg_active, "%d", g_wg_peer_active);
+    html_esc(s_wg_iface, sizeof s_wg_iface, g_wg_iface);
+    html_esc(s_wg_address, sizeof s_wg_address, g_wg_address);
+    html_esc(s_wg_port, sizeof s_wg_port, g_wg_port);
+    html_esc(s_wg_mode, sizeof s_wg_mode, g_wg_mode);
+    t[i++] = (struct kv){ "WGSTATE", !g_wg_installed ? "未安装" : g_wg_running ? "运行中" : g_wg_deps ? "已停止" : "依赖未就绪" };
+    t[i++] = (struct kv){ "WGSTATECLASS", g_wg_running ? "ok" : g_wg_deps ? "muted" : "warn" };
+    t[i++] = (struct kv){ "WGRUNCLASS", g_wg_running ? "seg-on" : "" };
+    t[i++] = (struct kv){ "WGSTOPCLASS", g_wg_installed && !g_wg_running ? "seg-on" : "" };
+    t[i++] = (struct kv){ "WGIFACE", s_wg_iface };
+    t[i++] = (struct kv){ "WGADDRESS", s_wg_address };
+    t[i++] = (struct kv){ "WGPORT", s_wg_port };
+    t[i++] = (struct kv){ "WGMODE", s_wg_mode };
+    t[i++] = (struct kv){ "WGUPTIME", g_wg_uptime };
+    t[i++] = (struct kv){ "WGBOOT", g_wg_boot ? "已开启" : "已关闭" };
+    t[i++] = (struct kv){ "WGPEERS", s_wg_peers };
+    t[i++] = (struct kv){ "WGACTIVE", s_wg_active };
+    t[i++] = (struct kv){ "WGPEERLIST", wireguard_peer_html() };
+    plugin_action_log_html(s_wg_action_log, sizeof s_wg_action_log, WIREGUARD_ACTION_LOG);
+    t[i++] = (struct kv){ "WGACTIONLOG", s_wg_action_log };
+    snprintf(s_op_selected, sizeof s_op_selected, "%s", g_op_selected[0] ? g_op_selected : "未选择");
+    snprintf(s_op_job_raw, sizeof s_op_job_raw, "%s%s%s",
+             g_op_job_status, strcmp(g_op_job_message, "-") ? " · " : "",
+             strcmp(g_op_job_message, "-") ? g_op_job_message : "");
+    html_esc(s_op_job, sizeof s_op_job, s_op_job_raw);
+    html_esc(s_op_sim, sizeof s_op_sim, g_op_sim);
+    html_esc(s_op_operator, sizeof s_op_operator, g_op_operator);
+    html_esc(s_op_rat, sizeof s_op_rat, g_op_rat);
+    html_esc(s_op_mode, sizeof s_op_mode,
+             !strcmp(g_op_mode, "1") ? "手动选网" : !strcmp(g_op_mode, "0") ? "自动选网" : g_op_mode);
+    html_esc(s_op_rat_pref, sizeof s_op_rat_pref, g_op_rat_pref);
+    html_esc(s_op_policy, sizeof s_op_policy, g_op_failure_policy);
+    t[i++] = (struct kv){ "OPSTATE", !g_op_installed ? "未安装" : g_op_job_running ? "任务运行中" : g_op_registered ? "已注册" : "未注册" };
+    t[i++] = (struct kv){ "OPSTATECLASS", g_op_registered ? "ok" : g_op_job_running ? "warn" : "muted" };
+    t[i++] = (struct kv){ "OPSIM", s_op_sim };
+    t[i++] = (struct kv){ "OPOPERATOR", s_op_operator };
+    t[i++] = (struct kv){ "OPRAT", s_op_rat };
+    t[i++] = (struct kv){ "OPMODE", s_op_mode };
+    t[i++] = (struct kv){ "OPJOB", s_op_job };
+    t[i++] = (struct kv){ "OPSELECTED", s_op_selected };
+    t[i++] = (struct kv){ "OPRATPREF", s_op_rat_pref };
+    t[i++] = (struct kv){ "OPPOLICY", s_op_policy };
+    t[i++] = (struct kv){ "OPLIST", operator_list_html() };
+    t[i++] = (struct kv){ "OPLOCKLABEL", g_op_confirm_until && (int32_t)(g_op_confirm_until - millis()) > 0 ? "再次确认锁定" : "锁定选中" };
+    t[i++] = (struct kv){ "OPLOCKCLASS", g_op_confirm_until && (int32_t)(g_op_confirm_until - millis()) > 0 ? "armed" : "" };
+    t[i++] = (struct kv){ "OPCANCELCLASS", g_op_job_running ? "" : "disabled" };
+    plugin_action_log_html(s_op_action_log, sizeof s_op_action_log, OPERATOR_ACTION_LOG);
+    t[i++] = (struct kv){ "OPACTIONLOG", s_op_action_log };
     return i;
 }
 
@@ -6814,18 +7320,19 @@ queued_done:
                         }
                         else if (!strcmp(a, "tsstart") || !strcmp(a, "tsstop") ||
                                  !strcmp(a, "tsrestart") || !strcmp(a, "tsrefresh")) {
+                            const struct plugin_candidate *pc = plugin_candidate_select(g_ts_candidates, ARRAY_LEN(g_ts_candidates), 0);
                             const char *verb = !strcmp(a, "tsstart") ? "start" :
                                                !strcmp(a, "tsstop") ? "stop" : "restart";
                             if (!strcmp(a, "tsrefresh")) {
                                 plugin_status_refresh(CUR_PATH, 1);
                                 plugin_action_note(TAILSCALE_ACTION_LOG, "手动刷新状态");
                                 snprintf(g_toast, sizeof g_toast, "Tailscale 状态已刷新");
-                            } else if (!g_ts_installed) {
+                            } else if (!g_ts_installed || !pc) {
                                 snprintf(g_toast, sizeof g_toast, "Tailscale 尚未安装");
                             } else {
                                 const char *label = !strcmp(verb, "start") ? "启动" :
                                                     !strcmp(verb, "stop") ? "停止" : "重启";
-                                plugin_action_submit(TAILSCALE_ACTION_LOG, "", TAILSCALE_CTL, verb, label);
+                                plugin_action_submit(TAILSCALE_ACTION_LOG, "", pc->ctl, verb, label);
                                 snprintf(g_toast, sizeof g_toast, "Tailscale %s已提交", label);
                                 g_plugin_status_at = 0;
                             }
@@ -6835,19 +7342,98 @@ queued_done:
                         }
                         else if (!strcmp(a, "mhstart") || !strcmp(a, "mhstop") ||
                                  !strcmp(a, "mhrestart") || !strcmp(a, "mhrefresh")) {
+                            const struct plugin_candidate *pc = plugin_candidate_select(g_mh_candidates, ARRAY_LEN(g_mh_candidates), 0);
                             const char *verb = !strcmp(a, "mhstart") ? "start" :
                                                !strcmp(a, "mhstop") ? "stop" : "restart";
                             if (!strcmp(a, "mhrefresh")) {
                                 plugin_status_refresh(CUR_PATH, 1);
                                 plugin_action_note(MIHOMO_ACTION_LOG, "手动刷新状态");
                                 snprintf(g_toast, sizeof g_toast, "Mihomo 状态已刷新");
-                            } else if (!g_mh_installed) {
+                            } else if (!g_mh_installed || !pc) {
                                 snprintf(g_toast, sizeof g_toast, "Mihomo 尚未安装");
                             } else {
                                 const char *label = !strcmp(verb, "start") ? "启动" :
                                                     !strcmp(verb, "stop") ? "停止" : "重启";
-                                plugin_action_submit(MIHOMO_ACTION_LOG, "sh ", MIHOMO_CTL, verb, label);
+                                plugin_action_submit(MIHOMO_ACTION_LOG, "sh ", pc->ctl, verb, label);
                                 snprintf(g_toast, sizeof g_toast, "Mihomo %s已提交", label);
+                                g_plugin_status_at = 0;
+                            }
+                            g_toast_until = now + 1800;
+                            last_act = now;
+                            need_render = 1;
+                        }
+                        else if (!strcmp(a, "wgstart") || !strcmp(a, "wgstop") ||
+                                 !strcmp(a, "wgrestart") || !strcmp(a, "wgrefresh")) {
+                            const struct plugin_candidate *pc = plugin_candidate_select(g_wg_candidates, ARRAY_LEN(g_wg_candidates), 0);
+                            const char *verb = !strcmp(a, "wgstart") ? "start" :
+                                               !strcmp(a, "wgstop") ? "stop" : "restart";
+                            if (!strcmp(a, "wgrefresh")) {
+                                plugin_status_refresh(CUR_PATH, 1);
+                                plugin_action_note(WIREGUARD_ACTION_LOG, "手动刷新状态");
+                                snprintf(g_toast, sizeof g_toast, "WireGuard 状态已刷新");
+                            } else if (!g_wg_installed || !pc) {
+                                snprintf(g_toast, sizeof g_toast, "WireGuard 尚未安装");
+                            } else {
+                                const char *label = !strcmp(verb, "start") ? "启动" :
+                                                    !strcmp(verb, "stop") ? "停止" : "重启";
+                                plugin_action_submit(WIREGUARD_ACTION_LOG, "", pc->ctl, verb, label);
+                                snprintf(g_toast, sizeof g_toast, "WireGuard %s已提交", label);
+                                g_plugin_status_at = 0;
+                            }
+                            g_toast_until = now + 1800;
+                            last_act = now;
+                            need_render = 1;
+                        }
+                        else if (!strncmp(a, "opselect:", 9)) {
+                            const char *plmn = a + 9;
+                            size_t len = strlen(plmn);
+                            if ((len == 5 || len == 6) && strspn(plmn, "0123456789") == len) {
+                                snprintf(g_op_selected, sizeof g_op_selected, "%s", plmn);
+                                g_op_confirm_until = 0;
+                                snprintf(g_toast, sizeof g_toast, "已选择运营商 %s", plmn);
+                            } else snprintf(g_toast, sizeof g_toast, "运营商编号无效");
+                            g_toast_until = now + 1800;
+                            last_act = now;
+                            need_render = 1;
+                        }
+                        else if (!strcmp(a, "oprefresh") || !strcmp(a, "opscan") ||
+                                 !strcmp(a, "opapply") || !strcmp(a, "opauto") ||
+                                 !strcmp(a, "opcancel")) {
+                            const struct plugin_candidate *pc = plugin_candidate_select(g_operator_candidates, ARRAY_LEN(g_operator_candidates), 0);
+                            if (!pc) {
+                                snprintf(g_toast, sizeof g_toast, "漫游锁卡插件尚未安装");
+                            } else if (!strcmp(a, "oprefresh")) {
+                                plugin_action_submit(OPERATOR_ACTION_LOG, "", pc->ctl, "status", "刷新运营商状态");
+                                snprintf(g_toast, sizeof g_toast, "状态刷新已提交");
+                                g_plugin_status_at = 0;
+                            } else if (!strcmp(a, "opscan")) {
+                                plugin_action_submit(OPERATOR_ACTION_LOG, "", pc->ctl, "scan-start", "扫描运营商");
+                                snprintf(g_toast, sizeof g_toast, "运营商扫描已提交");
+                                g_plugin_status_at = 0;
+                            } else if (!strcmp(a, "opauto")) {
+                                plugin_action_submit(OPERATOR_ACTION_LOG, "", pc->ctl, "auto-start", "恢复自动选网");
+                                snprintf(g_toast, sizeof g_toast, "恢复自动选网已提交");
+                                g_op_confirm_until = 0;
+                                g_plugin_status_at = 0;
+                            } else if (!strcmp(a, "opcancel")) {
+                                if (!g_op_job_running) snprintf(g_toast, sizeof g_toast, "当前没有运行中的任务");
+                                else {
+                                    plugin_action_submit(OPERATOR_ACTION_LOG, "", pc->ctl, "cancel", "取消当前任务");
+                                    snprintf(g_toast, sizeof g_toast, "取消任务已提交");
+                                    g_plugin_status_at = 0;
+                                }
+                            } else if (!g_op_selected[0]) {
+                                snprintf(g_toast, sizeof g_toast, "请先选择运营商");
+                            } else if (!g_op_confirm_until || (int32_t)(g_op_confirm_until - now) <= 0) {
+                                g_op_confirm_until = now + 4000;
+                                snprintf(g_toast, sizeof g_toast, "请再次点击确认锁定 %s", g_op_selected);
+                            } else {
+                                char verb[128];
+                                snprintf(verb, sizeof verb, "apply-start %s %s %s",
+                                         g_op_selected, g_op_rat_pref, g_op_failure_policy);
+                                plugin_action_submit(OPERATOR_ACTION_LOG, "", pc->ctl, verb, "锁定运营商");
+                                snprintf(g_toast, sizeof g_toast, "运营商锁定已提交");
+                                g_op_confirm_until = 0;
                                 g_plugin_status_at = 0;
                             }
                             g_toast_until = now + 1800;
@@ -6989,7 +7575,9 @@ action_done:
             uint32_t poll_ms = g_refresh_ms > 0 ? (uint32_t)g_refresh_ms : 1000;
             int keep_fast = (g_npages > 0 && !strcmp(CUR_PATH, g_pages[0])) ||
                             path_is_speedtest(CUR_PATH) || g_st_home_open;
-            if (!keep_fast && g_refresh_ms > 0 && g_refresh_ms < 2000 && now - last_act >= 10000)
+            if (plugin_status_page(CUR_PATH))
+                poll_ms = plugin_page_named(CUR_PATH, "operator-lock.html") && !g_op_job_running ? 10000 : 2000;
+            if (!plugin_status_page(CUR_PATH) && !keep_fast && g_refresh_ms > 0 && g_refresh_ms < 2000 && now - last_act >= 10000)
                 poll_ms = 2000;
             if (!dragging && !scroll_inertia && now - last_data >= poll_ms) {
                 time_t now_t = time(NULL);
