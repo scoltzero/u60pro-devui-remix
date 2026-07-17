@@ -2,6 +2,13 @@
 
 > 当前正式命名与安装路径已经统一为：`zwrt-datad`、`/data/plugins/zwrt-datad/zwrt-datad`、`/data/plugins/u60pro-devui/`、`/data/plugins/u60pro-devui/ui`。历史条目里如果出现 `u60-datad`、`/data/u60pro` 或 `/data/ui`，表示当时版本记录。
 
+## v1.2.12-remix.4 - 2026-07-18
+
+### 修复
+
+- WireGuard 功能入口现在同时要求 `wgctl.sh` 与插件自带的 `bin/wg` 可执行，完全卸载后遗留的配置和控制器骨架不再被误判为已安装。
+- WireGuard 页面打开、状态刷新和服务操作统一使用相同的完整安装判断。
+
 ## v1.2.12-remix.3 - 2026-07-17
 
 ### 变更

@@ -1142,7 +1142,7 @@ static void wg_load_running_peers(const struct plugin_candidate *p)
 
 static void refresh_wireguard_status(void)
 {
-    const struct plugin_candidate *p = plugin_candidate_select(g_wg_candidates, ARRAY_LEN(g_wg_candidates), 0);
+    const struct plugin_candidate *p = plugin_candidate_select(g_wg_candidates, ARRAY_LEN(g_wg_candidates), 1);
     FILE *fp;
     char line[512], cmd[512];
     int have_wg = 0, have_kmod = 0;
@@ -1741,7 +1741,7 @@ static int function_control_api_available(const char *name)
     if (!strcmp(name, "cpu-performance.html"))
         return access(cpu_ctl_path(), X_OK) == 0;
     if (!strcmp(name, "wireguard.html"))
-        return plugin_candidate_select(g_wg_candidates, ARRAY_LEN(g_wg_candidates), 0) != NULL;
+        return plugin_candidate_select(g_wg_candidates, ARRAY_LEN(g_wg_candidates), 1) != NULL;
     if (!strcmp(name, "operator-lock.html"))
         return plugin_candidate_select(g_operator_candidates, ARRAY_LEN(g_operator_candidates), 0) != NULL;
     return 1;
@@ -7364,7 +7364,7 @@ queued_done:
                         }
                         else if (!strcmp(a, "wgstart") || !strcmp(a, "wgstop") ||
                                  !strcmp(a, "wgrestart") || !strcmp(a, "wgrefresh")) {
-                            const struct plugin_candidate *pc = plugin_candidate_select(g_wg_candidates, ARRAY_LEN(g_wg_candidates), 0);
+                            const struct plugin_candidate *pc = plugin_candidate_select(g_wg_candidates, ARRAY_LEN(g_wg_candidates), 1);
                             const char *verb = !strcmp(a, "wgstart") ? "start" :
                                                !strcmp(a, "wgstop") ? "stop" : "restart";
                             if (!strcmp(a, "wgrefresh")) {

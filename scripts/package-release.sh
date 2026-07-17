@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 DEVUI_BIN="$ROOT/u60pro-devui.stripped"
 DATAD_BIN=
-OUT="$ROOT/dist/v1.2.12-remix.3"
+OUT="$ROOT/dist/v1.2.12-remix.4"
 
 usage() {
     echo "usage: $0 --datad PATH [--devui PATH] [--out DIR]" >&2

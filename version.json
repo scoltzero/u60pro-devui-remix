@@ -6,9 +6,9 @@
     "notes": "增加 U60Pro 邻区和信令兼容接口"
   },
   "devui": {
-    "version": "1.2.12-remix.3",
+    "version": "1.2.12-remix.4",
     "asset": "u60pro-devui-aarch64",
-    "notes": "Taste 仪表盘、plugins 目录兼容及 WireGuard/漫游锁卡页面"
+    "notes": "修复 WireGuard 完全卸载后残留控制器导致入口误显示"
   },
   "ui": {
     "version": "0.4.10-remix.2",
