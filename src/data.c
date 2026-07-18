@@ -34,6 +34,10 @@
 #define DEVUI_BACKEND_EVENTS_PATH "/events"
 #endif
 
+#ifndef DEVUI_BACKEND_CHART_PATH
+#define DEVUI_BACKEND_CHART_PATH "/chart-metrics"
+#endif
+
 #ifndef DEVUI_BACKEND_RETRY_MS
 #define DEVUI_BACKEND_RETRY_MS 1000
 #endif
@@ -41,6 +45,9 @@
 #ifndef DEVUI_BACKEND_IO_TIMEOUT_MS
 #define DEVUI_BACKEND_IO_TIMEOUT_MS 300
 #endif
+
+#define DEVUI_CHART_HTTP_TIMEOUT_MS 60
+#define DEVUI_CHART_HTTP_BUF_MAX 4096
 
 #ifndef DEVUI_SMS_BUF_MAX
 #define DEVUI_SMS_BUF_MAX 1048576
@@ -841,5 +848,73 @@ int data_refresh_live(devui_data_t *d)
     }
     *d = g_backend.live_data;
     if (force_hsr_enabled()) d->hsr = 1;
+    return 1;
+}
+
+int data_chart_metrics(devui_data_t *d)
+{
+    char req[256];
+    char resp[DEVUI_CHART_HTTP_BUF_MAX];
+    char *body;
+    size_t n = 0;
+    int fd;
+
+    if (!d) return 0;
+    memset(d, 0, sizeof *d);
+    d->cpu_usage = -1;
+    fd = connect_tcp(DEVUI_BACKEND_HOST, DEVUI_BACKEND_PORT,
+                     DEVUI_CHART_HTTP_TIMEOUT_MS);
+    if (fd < 0) return 0;
+    snprintf(req, sizeof req,
+             "GET %s HTTP/1.1\r\n"
+             "Host: %s:%d\r\n"
+             "Connection: close\r\n"
+             "\r\n",
+             DEVUI_BACKEND_CHART_PATH, DEVUI_BACKEND_HOST, DEVUI_BACKEND_PORT);
+    if (!send_all(fd, req, strlen(req), DEVUI_CHART_HTTP_TIMEOUT_MS)) {
+        close(fd);
+        return 0;
+    }
+    for (;;) {
+        ssize_t rd;
+        if (n + 1 >= sizeof resp ||
+            wait_fd_ready(fd, 0, DEVUI_CHART_HTTP_TIMEOUT_MS) <= 0) {
+            close(fd);
+            return 0;
+        }
+        rd = read(fd, resp + n, sizeof resp - 1 - n);
+        if (rd == 0) break;
+        if (rd < 0) {
+            if (errno == EINTR) continue;
+            close(fd);
+            return 0;
+        }
+        n += (size_t)rd;
+    }
+    close(fd);
+    resp[n] = 0;
+    if (strncmp(resp, "HTTP/1.1 200", 12) != 0 &&
+        strncmp(resp, "HTTP/1.0 200", 12) != 0)
+        return 0;
+    body = strstr(resp, "\r\n\r\n");
+    if (body) body += 4;
+    else {
+        body = strstr(resp, "\n\n");
+        if (body) body += 2;
+    }
+    if (!body || *body != '{') return 0;
+
+    d->cpu_usage = (int)json_get_int(body, "cpu_usage", -1);
+    d->cpu_temp = json_get_int(body, "cpu_temp", 0);
+    d->mem_used_pct = json_get_int(body, "mem_used_pct", -1);
+    d->rx_speed = json_get_int(body, "rx_speed", -1);
+    d->tx_speed = json_get_int(body, "tx_speed", -1);
+    d->bat_temp = (int)json_get_int(body, "battery_temp", 0);
+    d->bat_uv = json_get_int(body, "bat_uv", 0);
+    d->bat_ua = json_get_int(body, "bat_ua", 0);
+    if (d->cpu_usage < 0 || d->mem_used_pct < 0 ||
+        d->rx_speed < 0 || d->tx_speed < 0)
+        return 0;
+    d->valid = 1;
     return 1;
 }

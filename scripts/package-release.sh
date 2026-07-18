@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 DEVUI_BIN="$ROOT/u60pro-devui.stripped"
 DATAD_BIN=
-OUT="$ROOT/dist/v1.2.12-remix.4"
+OUT="$ROOT/dist/v1.2.12-remix.5"
 
 usage() {
     echo "usage: $0 --datad PATH [--devui PATH] [--out DIR]" >&2
@@ -59,6 +59,9 @@ grep -qx '01-signal.html' "$OUT/.tar-list"
 grep -qx '02-functions.html' "$OUT/.tar-list"
 grep -qx 'style.css' "$OUT/.tar-list"
 grep -qx 'functions/cpuctl.sh' "$OUT/.tar-list"
+for page in tailscale clash cpu-performance wireguard operator-lock; do
+    grep -qx "functions/$page.html" "$OUT/.tar-list"
+done
 grep -q '^subpages/.*\.html$' "$OUT/.tar-list"
 if grep -Eq '^(\./|ui/)|(^|/)\._' "$OUT/.tar-list"; then
     echo "invalid ui.tar.gz path layout" >&2

@@ -2,6 +2,22 @@
 
 > 当前正式命名与安装路径已经统一为：`zwrt-datad`、`/data/plugins/zwrt-datad/zwrt-datad`、`/data/plugins/u60pro-devui/`、`/data/plugins/u60pro-devui/ui`。历史条目里如果出现 `u60-datad`、`/data/u60pro` 或 `/data/ui`，表示当时版本记录。
 
+## v1.2.12-remix.5 - 2026-07-18
+
+### 变更
+
+- 第三页四张图分别支持 `30s / 48s / 1min / 2min / 5min` 固定时间窗口，设置独立保存。
+- 图表历史改为 301 个 monotonic 时间戳环形样本，页面刷新、当前页面和熄屏不再决定是否采样。
+- datad 新增只读取缓存快照的 `/chart-metrics`，熄屏时继续低资源记录历史。
+- Tailscale、Mihomo、WireGuard 必须在同一候选目录同时具备可读控制器和可执行核心二进制才显示。
+- 漫游锁卡必须在同一目录具备 `operatorctl.sh` 和 `config.json`；CPU 页面必须具备可读控制器和可写 cpufreq 节点。
+
+### 修复
+
+- 折线改为时间轴定位和覆盖率抗锯齿，减少 RGB565 上的毛刺与方块感。
+- 允许一次主循环调度漏秒，避免正常重绘被误判为图表断点；连续缺失仍保留真实空白。
+- 发布打包强制校验五个插件功能页面，避免 UI 包缺页。
+
 ## v1.2.12-remix.4 - 2026-07-18
 
 ### 修复

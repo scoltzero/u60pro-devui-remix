@@ -18,6 +18,7 @@
 
 #include <arpa/inet.h>
 #include <dirent.h>
+#include <limits.h>
 #include <math.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -48,6 +49,11 @@ extern const char *html_view_click(float x, float y);
 extern int         html_view_rect(const char *sel, int *x, int *y, int *w, int *h);
 extern void        html_view_polyline(int x, int y, int w, int h, const int *vals, int n,
                                       int vmin, int vmax, int r, int g, int b, int thick, int fill_a);
+extern void        html_view_timed_polyline(int x, int y, int w, int h,
+                                            const uint32_t *times, const int *vals, int n,
+                                            uint32_t now_sec, int window_sec,
+                                            int vmin, int vmax, int r, int g, int b,
+                                            int thick, int fill_a);
 extern void        html_view_set_scroll(int y);
 extern void        html_view_set_clip_top(int y);
 extern void        html_view_fill_rect(int x, int y, int w, int h, int r, int g, int b, int a);
@@ -82,6 +88,12 @@ static uint32_t millis(void)
 {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+}
+
+static uint32_t monotonic_seconds(void)
+{
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)ts.tv_sec;
 }
 
 /* Optional service pages under ui/functions/.  These fixed paths intentionally
@@ -123,18 +135,43 @@ static const struct plugin_candidate g_operator_candidates[] = {
     { "/data/kano_plugins/operator-lock", "/data/kano_plugins/operator-lock/operatorctl.sh", NULL },
 };
 
-static const struct plugin_candidate *plugin_candidate_select(
+#define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
+
+/* Shell adapters are valid APIs even when an importer preserved them as 0644;
+ * these two plugins are invoked through `sh`, so readability is sufficient. */
+static const struct plugin_candidate *plugin_script_select(
     const struct plugin_candidate *items, size_t count, int require_bin)
 {
     for (size_t i = 0; i < count; i++) {
-        if (access(items[i].ctl, X_OK) != 0) continue;
+        if (access(items[i].ctl, R_OK) != 0) continue;
         if (require_bin && items[i].bin && access(items[i].bin, X_OK) != 0) continue;
         return &items[i];
     }
     return NULL;
 }
 
-#define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
+static const struct plugin_candidate *plugin_complete_select(
+    const struct plugin_candidate *items, size_t count)
+{
+    for (size_t i = 0; i < count; i++)
+        if (access(items[i].ctl, R_OK) == 0 && items[i].bin &&
+            access(items[i].bin, X_OK) == 0)
+            return &items[i];
+    return NULL;
+}
+
+static const struct plugin_candidate *operator_complete_select(void)
+{
+    char config[320];
+    for (size_t i = 0; i < ARRAY_LEN(g_operator_candidates); i++) {
+        snprintf(config, sizeof config, "%s/config.json", g_operator_candidates[i].dir);
+        if (access(g_operator_candidates[i].ctl, R_OK) == 0 &&
+            access(config, R_OK) == 0)
+            return &g_operator_candidates[i];
+    }
+    return NULL;
+}
+
 #define WG_MAX_PEERS 16
 #define OP_MAX_CANDIDATES 24
 
@@ -179,9 +216,15 @@ static struct operator_candidate_state g_op_scan[OP_MAX_CANDIDATES];
 
 static const char *cpu_ctl_path(void)
 {
-    if (access(CPU_CTL_BUNDLED, X_OK) == 0) return CPU_CTL_BUNDLED;
-    if (access(CPU_CTL_LEGACY, X_OK) == 0) return CPU_CTL_LEGACY;
+    if (access(CPU_CTL_BUNDLED, R_OK) == 0) return CPU_CTL_BUNDLED;
+    if (access(CPU_CTL_LEGACY, R_OK) == 0) return CPU_CTL_LEGACY;
     return CPU_CTL_OLD;
+}
+
+static int cpu_control_available(void)
+{
+    return access(cpu_ctl_path(), R_OK) == 0 &&
+           access("/sys/devices/system/cpu/cpufreq/policy0/scaling_governor", R_OK | W_OK) == 0;
 }
 
 #define TEMPLATE_CACHE_CAP 8
@@ -217,6 +260,10 @@ static int  g_scroll;     /* current page vertical scroll offset */
 static int  g_page_h;     /* last rendered page content height */
 static int  g_autooff_ms; /* auto screen-off timeout, 0 = never */
 static int  g_refresh_ms = 1000; /* state refresh interval, 0 = paused */
+static int  g_chart_cpu_sec = 48;
+static int  g_chart_mem_sec = 48;
+static int  g_chart_net_sec = 48;
+static int  g_chart_batt_sec = 48;
 static int  g_sig_read;   /* ML1/raw signaling read switch */
 static int  g_sig_parse;  /* decoded LTE/NR signaling parse switch + page visibility */
 static int  g_neighbor_open; /* expand neighbor-cell list on the first signal page */
@@ -252,6 +299,7 @@ static long long g_render_html_cache_css_mtime = -1;
 static long long g_pages_dir_mtime = -1;
 static uint32_t g_pages_scan_at;
 static int normalize_refresh_ms(int ms);
+static int normalize_chart_sec(int sec);
 
 static void invalidate_render_html_cache(void);
 
@@ -979,7 +1027,7 @@ static void duration_short(char *dst, size_t cap, long long sec)
 
 static void refresh_tailscale_status(void)
 {
-    const struct plugin_candidate *p = plugin_candidate_select(g_ts_candidates, ARRAY_LEN(g_ts_candidates), 1);
+    const struct plugin_candidate *p = plugin_complete_select(g_ts_candidates, ARRAY_LEN(g_ts_candidates));
     FILE *fp;
     char line[512], cmd[2048];
 
@@ -1016,7 +1064,7 @@ static void refresh_tailscale_status(void)
 
 static void refresh_mihomo_status(void)
 {
-    const struct plugin_candidate *p = plugin_candidate_select(g_mh_candidates, ARRAY_LEN(g_mh_candidates), 1);
+    const struct plugin_candidate *p = plugin_complete_select(g_mh_candidates, ARRAY_LEN(g_mh_candidates));
     FILE *fp;
     char line[512], cmd[2048];
 
@@ -1064,8 +1112,8 @@ static void refresh_cpu_status(void)
     snprintf(g_cpu_cur, sizeof g_cpu_cur, "-");
     snprintf(g_cpu_min, sizeof g_cpu_min, "-");
     snprintf(g_cpu_max, sizeof g_cpu_max, "-");
-    if (access(ctl, X_OK) != 0) return;
-    snprintf(cmd, sizeof cmd, "'%s' status 2>/dev/null", ctl);
+    if (!cpu_control_available()) return;
+    snprintf(cmd, sizeof cmd, "sh '%s' status 2>/dev/null", ctl);
     fp = popen(cmd, "r");
     if (!fp) return;
     while (fgets(line, sizeof line, fp)) {
@@ -1142,7 +1190,7 @@ static void wg_load_running_peers(const struct plugin_candidate *p)
 
 static void refresh_wireguard_status(void)
 {
-    const struct plugin_candidate *p = plugin_candidate_select(g_wg_candidates, ARRAY_LEN(g_wg_candidates), 1);
+    const struct plugin_candidate *p = plugin_complete_select(g_wg_candidates, ARRAY_LEN(g_wg_candidates));
     FILE *fp;
     char line[512], cmd[512];
     int have_wg = 0, have_kmod = 0;
@@ -1157,7 +1205,7 @@ static void refresh_wireguard_status(void)
     snprintf(g_wg_uptime, sizeof g_wg_uptime, "-");
     if (!p) return;
     g_wg_installed = 1;
-    snprintf(cmd, sizeof cmd, "'%s' status 2>/dev/null", p->ctl);
+    snprintf(cmd, sizeof cmd, "sh '%s' status 2>/dev/null", p->ctl);
     fp = popen(cmd, "r");
     if (fp) {
         while (fgets(line, sizeof line, fp)) {
@@ -1259,7 +1307,7 @@ static int operator_policy_valid(const char *value)
 
 static void refresh_operator_status(void)
 {
-    const struct plugin_candidate *p = plugin_candidate_select(g_operator_candidates, ARRAY_LEN(g_operator_candidates), 0);
+    const struct plugin_candidate *p = operator_complete_select();
     char path[320], tmp[192];
     char *json;
 
@@ -1365,6 +1413,10 @@ static void load_conf(void)
         else if (sscanf(line, "show_batpct=%d", &v) == 1) g_show_batpct = !!v;
         else if (sscanf(line, "autooff=%d", &v) == 1)    g_autooff_ms = v;
         else if (sscanf(line, "refresh_ms=%d", &v) == 1) g_refresh_ms = normalize_refresh_ms(v);
+        else if (sscanf(line, "chart_cpu_sec=%d", &v) == 1) g_chart_cpu_sec = normalize_chart_sec(v);
+        else if (sscanf(line, "chart_mem_sec=%d", &v) == 1) g_chart_mem_sec = normalize_chart_sec(v);
+        else if (sscanf(line, "chart_net_sec=%d", &v) == 1) g_chart_net_sec = normalize_chart_sec(v);
+        else if (sscanf(line, "chart_batt_sec=%d", &v) == 1) g_chart_batt_sec = normalize_chart_sec(v);
         else if (sscanf(line, "sig_read=%d", &v) == 1)   g_sig_read = !!v;
         else if (sscanf(line, "sig_parse=%d", &v) == 1)  g_sig_parse = !!v;
         else if (sscanf(line, "bright=%d", &v) == 1)     g_saved_bright = v;
@@ -1379,10 +1431,42 @@ static void save_conf(void)
     FILE *fp = fopen(CONF_FILE, "w");
     if (!fp) return;
     fprintf(fp,
-            "theme=%d\nspeed_bits=%d\nshow_batpct=%d\nautooff=%d\nrefresh_ms=%d\nsig_read=%d\nsig_parse=%d\nbright=%d\nst_src=%s\nst_dir=%s\nst_dur=%d\n",
+            "theme=%d\nspeed_bits=%d\nshow_batpct=%d\nautooff=%d\nrefresh_ms=%d\n"
+            "chart_cpu_sec=%d\nchart_mem_sec=%d\nchart_net_sec=%d\nchart_batt_sec=%d\n"
+            "sig_read=%d\nsig_parse=%d\nbright=%d\nst_src=%s\nst_dir=%s\nst_dur=%d\n",
             g_theme, g_speed_bits, g_show_batpct, g_autooff_ms, g_refresh_ms,
+            g_chart_cpu_sec, g_chart_mem_sec, g_chart_net_sec, g_chart_batt_sec,
             g_sig_read, g_sig_parse, backlight_get(), g_st_src, g_st_dir, g_st_dur);
     fclose(fp);
+}
+
+static const char *chart_intervals_html(void)
+{
+    static char buf[4096];
+    static const int secs[] = { 30, 48, 60, 120, 300 };
+    static const char *labels[] = { "30s", "48s", "1min", "2min", "5min" };
+    static const struct { const char *id, *label; int *value; } rows[] = {
+        { "cpu", "CPU", &g_chart_cpu_sec },
+        { "mem", "内存", &g_chart_mem_sec },
+        { "net", "网速", &g_chart_net_sec },
+        { "batt", "电池", &g_chart_batt_sec }
+    };
+    int o = 0;
+
+    o += snprintf(buf + o, sizeof buf - (size_t)o,
+                  "<div class='card chart-settings'><div class='ctitle'>显示区间</div>");
+    for (size_t row = 0; row < sizeof rows / sizeof rows[0]; row++) {
+        o += snprintf(buf + o, sizeof buf - (size_t)o,
+                      "<div class='chart-range-row'><span class='chart-range-label'>%s</span>"
+                      "<span class='chart-range-seg'>", rows[row].label);
+        for (size_t k = 0; k < sizeof secs / sizeof secs[0]; k++)
+            o += snprintf(buf + o, sizeof buf - (size_t)o,
+                          "<a href='act:chartsec:%s:%d' class='chart-range-cell%s'>%s</a>",
+                          rows[row].id, secs[k], *rows[row].value == secs[k] ? " chart-range-on" : "", labels[k]);
+        o += snprintf(buf + o, sizeof buf - (size_t)o, "</span></div>");
+    }
+    snprintf(buf + o, sizeof buf - (size_t)o, "</div>");
+    return buf;
 }
 
 static const char *speedtest_norm_src(const char *src)
@@ -1735,15 +1819,15 @@ static int function_control_api_available(const char *name)
 {
     if (!name) return 0;
     if (!strcmp(name, "tailscale.html"))
-        return plugin_candidate_select(g_ts_candidates, ARRAY_LEN(g_ts_candidates), 0) != NULL;
+        return plugin_complete_select(g_ts_candidates, ARRAY_LEN(g_ts_candidates)) != NULL;
     if (!strcmp(name, "clash.html") || !strcmp(name, "mihomo.html"))
-        return plugin_candidate_select(g_mh_candidates, ARRAY_LEN(g_mh_candidates), 0) != NULL;
+        return plugin_complete_select(g_mh_candidates, ARRAY_LEN(g_mh_candidates)) != NULL;
     if (!strcmp(name, "cpu-performance.html"))
-        return access(cpu_ctl_path(), X_OK) == 0;
+        return cpu_control_available();
     if (!strcmp(name, "wireguard.html"))
-        return plugin_candidate_select(g_wg_candidates, ARRAY_LEN(g_wg_candidates), 1) != NULL;
+        return plugin_complete_select(g_wg_candidates, ARRAY_LEN(g_wg_candidates)) != NULL;
     if (!strcmp(name, "operator-lock.html"))
-        return plugin_candidate_select(g_operator_candidates, ARRAY_LEN(g_operator_candidates), 0) != NULL;
+        return operator_complete_select() != NULL;
     return 1;
 }
 
@@ -2584,12 +2668,21 @@ static int signal_level(int rsrp)
     return lvl;
 }
 
-/* ---- rolling history for the charts page (sampled once per second) ---- */
-#define HIST 48
-static int    h_n;
-static int    h_cpu[HIST], h_mem[HIST], h_ct[HIST], h_bt[HIST], h_pwr[HIST];
-static long   h_rx[HIST], h_tx[HIST];
-static time_t h_last;
+/* ---- rolling chart history, independent from page rendering ---- */
+#define CHART_HIST 301
+struct chart_sample {
+    uint32_t monotonic_sec;
+    int32_t cpu_usage;
+    int32_t cpu_temp;
+    int32_t mem_used_pct;
+    int32_t rx_speed;
+    int32_t tx_speed;
+    int32_t battery_temp;
+    int32_t battery_power_mw;
+};
+static struct chart_sample g_chart_hist[CHART_HIST];
+static int g_chart_head, g_chart_count;
+static uint32_t g_chart_last_attempt_sec;
 
 /* charge (charger input) or discharge (battery) power, in milliwatts. */
 /* Battery power in milliwatts (use battery_voltage * |battery_current|). */
@@ -2599,26 +2692,74 @@ static int power_mw(const devui_data_t *d)
     return (int)(w * 1000);
 }
 
-static void hist_push(const devui_data_t *d)
+static int32_t chart_i32(long v)
 {
-    if (h_n < HIST) h_n++;
-    else {
-        memmove(h_cpu, h_cpu + 1, (HIST - 1) * sizeof h_cpu[0]);
-        memmove(h_mem, h_mem + 1, (HIST - 1) * sizeof h_mem[0]);
-        memmove(h_ct,  h_ct + 1,  (HIST - 1) * sizeof h_ct[0]);
-        memmove(h_bt,  h_bt + 1,  (HIST - 1) * sizeof h_bt[0]);
-        memmove(h_pwr, h_pwr + 1, (HIST - 1) * sizeof h_pwr[0]);
-        memmove(h_rx,  h_rx + 1,  (HIST - 1) * sizeof h_rx[0]);
-        memmove(h_tx,  h_tx + 1,  (HIST - 1) * sizeof h_tx[0]);
+    if (v > INT32_MAX) return INT32_MAX;
+    if (v < INT32_MIN) return INT32_MIN;
+    return (int32_t)v;
+}
+
+static void chart_hist_push(uint32_t sec, const devui_data_t *d)
+{
+    int i;
+    if (!d || d->cpu_usage < 0 || d->mem_used_pct < 0 ||
+        d->rx_speed < 0 || d->tx_speed < 0)
+        return;
+    if (g_chart_count < CHART_HIST) {
+        i = (g_chart_head + g_chart_count) % CHART_HIST;
+        g_chart_count++;
+    } else {
+        i = g_chart_head;
+        g_chart_head = (g_chart_head + 1) % CHART_HIST;
     }
-    int i = h_n - 1;
-    h_cpu[i] = d->cpu_usage < 0 ? 0 : (int)d->cpu_usage;
-    h_mem[i] = d->mem_used_pct < 0 ? 0 : (int)d->mem_used_pct;
-    h_ct[i]  = (int)d->cpu_temp;
-    h_bt[i]  = d->bat_temp;
-    h_pwr[i] = power_mw(d);
-    h_rx[i]  = d->rx_speed;
-    h_tx[i]  = d->tx_speed;
+    g_chart_hist[i].monotonic_sec = sec;
+    g_chart_hist[i].cpu_usage = chart_i32(d->cpu_usage);
+    g_chart_hist[i].cpu_temp = chart_i32(d->cpu_temp);
+    g_chart_hist[i].mem_used_pct = chart_i32(d->mem_used_pct);
+    g_chart_hist[i].rx_speed = chart_i32(d->rx_speed);
+    g_chart_hist[i].tx_speed = chart_i32(d->tx_speed);
+    g_chart_hist[i].battery_temp = chart_i32(d->bat_temp);
+    g_chart_hist[i].battery_power_mw = chart_i32(power_mw(d));
+}
+
+static void chart_sample_tick(int awake)
+{
+    uint32_t sec = monotonic_seconds();
+    devui_data_t d;
+    if (sec == g_chart_last_attempt_sec) return;
+    g_chart_last_attempt_sec = sec;
+    if ((awake ? data_refresh_live(&d) : data_chart_metrics(&d)))
+        chart_hist_push(sec, &d);
+}
+
+enum chart_field {
+    CHART_CPU, CHART_CPU_TEMP, CHART_MEM, CHART_RX, CHART_TX,
+    CHART_BATT_TEMP, CHART_BATT_POWER
+};
+
+static int chart_history_values(enum chart_field field, uint32_t *times, int *vals,
+                                int window_sec, uint32_t now_sec)
+{
+    int n = 0;
+    uint32_t left = now_sec > (uint32_t)window_sec ? now_sec - (uint32_t)window_sec : 0;
+    for (int k = 0; k < g_chart_count; k++) {
+        const struct chart_sample *s = &g_chart_hist[(g_chart_head + k) % CHART_HIST];
+        int32_t v;
+        if (s->monotonic_sec < left || s->monotonic_sec > now_sec) continue;
+        switch (field) {
+        case CHART_CPU:        v = s->cpu_usage; break;
+        case CHART_CPU_TEMP:   v = s->cpu_temp; break;
+        case CHART_MEM:        v = s->mem_used_pct; break;
+        case CHART_RX:         v = s->rx_speed; break;
+        case CHART_TX:         v = s->tx_speed; break;
+        case CHART_BATT_TEMP:  v = s->battery_temp; break;
+        default:               v = s->battery_power_mw; break;
+        }
+        times[n] = s->monotonic_sec;
+        vals[n] = (int)v;
+        n++;
+    }
+    return n;
 }
 
 /* Draw the chart placeholders (#chart-cpu/#chart-mem/#chart-net) natively as
@@ -2626,28 +2767,46 @@ static void hist_push(const devui_data_t *d)
  * no-op on pages without those elements. */
 static void draw_charts(void)
 {
+    static uint32_t times[CHART_HIST];
+    static int a[CHART_HIST], bvals[CHART_HIST];
+    uint32_t now_sec = monotonic_seconds();
+    int n, nb;
     int x, y, w, h;
     if (html_view_rect("#chart-cpu", &x, &y, &w, &h)) {
-        html_view_polyline(x, y, w, h, h_cpu, h_n, 0, 100, 0x4f, 0x8f, 0xe8, 2, 26); /* CPU usage, blue */
-        html_view_polyline(x, y, w, h, h_ct,  h_n, 20, 70, 0xd5, 0xa6, 0x3d, 2, 0);  /* temperature, amber */
+        n = chart_history_values(CHART_CPU, times, a, g_chart_cpu_sec, now_sec);
+        html_view_timed_polyline(x, y, w, h, times, a, n, now_sec, g_chart_cpu_sec,
+                                 0, 100, 0x4f, 0x8f, 0xe8, 2, 26);
+        n = chart_history_values(CHART_CPU_TEMP, times, a, g_chart_cpu_sec, now_sec);
+        html_view_timed_polyline(x, y, w, h, times, a, n, now_sec, g_chart_cpu_sec,
+                                 20, 70, 0xd5, 0xa6, 0x3d, 2, 0);
     }
-    if (html_view_rect("#chart-mem", &x, &y, &w, &h))
-        html_view_polyline(x, y, w, h, h_mem, h_n, 0, 100, 0x55, 0xbc, 0x7b, 2, 34); /* memory, green */
+    if (html_view_rect("#chart-mem", &x, &y, &w, &h)) {
+        n = chart_history_values(CHART_MEM, times, a, g_chart_mem_sec, now_sec);
+        html_view_timed_polyline(x, y, w, h, times, a, n, now_sec, g_chart_mem_sec,
+                                 0, 100, 0x55, 0xbc, 0x7b, 2, 34);
+    }
     if (html_view_rect("#chart-net", &x, &y, &w, &h)) {
-        static int rxi[HIST], txi[HIST];
-        long mx = 1;
-        for (int i = 0; i < h_n; i++) { if (h_rx[i] > mx) mx = h_rx[i]; if (h_tx[i] > mx) mx = h_tx[i]; }
-        for (int i = 0; i < h_n; i++) { rxi[i] = (int)h_rx[i]; txi[i] = (int)h_tx[i]; }
-        html_view_polyline(x, y, w, h, rxi, h_n, 0, (int)mx, 0x4f, 0x8f, 0xe8, 2, 22); /* downlink, blue */
-        html_view_polyline(x, y, w, h, txi, h_n, 0, (int)mx, 0xd5, 0xa6, 0x3d, 2, 0);  /* uplink, amber */
+        int mx = 1;
+        n = chart_history_values(CHART_RX, times, a, g_chart_net_sec, now_sec);
+        nb = chart_history_values(CHART_TX, times, bvals, g_chart_net_sec, now_sec);
+        for (int i = 0; i < n; i++) if (a[i] > mx) mx = a[i];
+        for (int i = 0; i < nb; i++) if (bvals[i] > mx) mx = bvals[i];
+        html_view_timed_polyline(x, y, w, h, times, a, n, now_sec, g_chart_net_sec,
+                                 0, mx, 0x4f, 0x8f, 0xe8, 2, 22);
+        html_view_timed_polyline(x, y, w, h, times, bvals, nb, now_sec, g_chart_net_sec,
+                                 0, mx, 0xd5, 0xa6, 0x3d, 2, 0);
     }
     if (html_view_rect("#chart-batt", &x, &y, &w, &h)) {
-        static int tn[HIST], pn[HIST];
         int mx = 1;
-        for (int i = 0; i < h_n; i++) if (h_pwr[i] > mx) mx = h_pwr[i];
-        for (int i = 0; i < h_n; i++) { tn[i] = (h_bt[i] - 20) * 2; pn[i] = (int)((long)h_pwr[i] * 100 / mx); }
-        html_view_polyline(x, y, w, h, pn, h_n, 0, 100, 0x4f, 0x8f, 0xe8, 2, 22); /* power, blue */
-        html_view_polyline(x, y, w, h, tn, h_n, 0, 100, 0xd5, 0xa6, 0x3d, 2, 0);  /* temperature, amber */
+        n = chart_history_values(CHART_BATT_POWER, times, a, g_chart_batt_sec, now_sec);
+        nb = chart_history_values(CHART_BATT_TEMP, times, bvals, g_chart_batt_sec, now_sec);
+        for (int i = 0; i < n; i++) if (a[i] > mx) mx = a[i];
+        for (int i = 0; i < n; i++) a[i] = (int)((int64_t)a[i] * 100 / mx);
+        for (int i = 0; i < nb; i++) bvals[i] = (bvals[i] - 20) * 2;
+        html_view_timed_polyline(x, y, w, h, times, a, n, now_sec, g_chart_batt_sec,
+                                 0, 100, 0x4f, 0x8f, 0xe8, 2, 22);
+        html_view_timed_polyline(x, y, w, h, times, bvals, nb, now_sec, g_chart_batt_sec,
+                                 0, 100, 0xd5, 0xa6, 0x3d, 2, 0);
     }
 }
 
@@ -2988,6 +3147,20 @@ static int normalize_refresh_ms(int ms)
         return ms;
     default:
         return 1000;
+    }
+}
+
+static int normalize_chart_sec(int sec)
+{
+    switch (sec) {
+    case 30:
+    case 48:
+    case 60:
+    case 120:
+    case 300:
+        return sec;
+    default:
+        return 48;
     }
 }
 
@@ -4571,7 +4744,6 @@ static int build_kv(struct kv *t, const char *path)
     snprintf(s_np, sizeof s_np, "%d", g_npages);
 
     time_t now = time(NULL); struct tm tmv; localtime_r(&now, &tmv);
-    if (now != h_last) { hist_push(&d); h_last = now; }   /* sample once per second */
     snprintf(s_time, sizeof s_time, "%02d:%02d", tmv.tm_hour, tmv.tm_min);
     snprintf(s_sigrefresh, sizeof s_sigrefresh, "%02d:%02d:%02d",
              tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
@@ -5359,6 +5531,7 @@ static int build_kv(struct kv *t, const char *path)
     t[i++] = (struct kv){ "IMEIBTN", g_show_imei ? "隐藏" : "显示" };
     t[i++] = (struct kv){ "BRIGHT", s_bright };   t[i++] = (struct kv){ "AUTOOFF", s_autooff };
     t[i++] = (struct kv){ "REFRESHSEG", s_refreshseg };
+    t[i++] = (struct kv){ "CHARTINTERVALS", chart_intervals_html() };
     t[i++] = (struct kv){ "STSRCSEG", speedtest_src_html() };
     t[i++] = (struct kv){ "STDIRSEG", speedtest_dir_html() };
     t[i++] = (struct kv){ "STDURSEG", speedtest_dur_html() };
@@ -6461,6 +6634,7 @@ int main(void)
         int need_render = 0, animating = 0;
         int live_changed = data_backend_poll(now);
         if (live_changed) state_pending = 1;
+        chart_sample_tick(backlight_is_on());
 
         if (backlight_is_on() && ext_ok && g_lock_state && devui_ext_active(&ext)) {
             devui_ext_deactivate(&ext);
@@ -7269,6 +7443,21 @@ queued_done:
                             save_conf();
                             need_render = 1;
                         }
+                        else if (!strncmp(a, "chartsec:", 9)) {
+                            char which[8];
+                            int sec;
+                            if (sscanf(a + 9, "%7[^:]:%d", which, &sec) == 2) {
+                                sec = normalize_chart_sec(sec);
+                                if (!strcmp(which, "cpu")) g_chart_cpu_sec = sec;
+                                else if (!strcmp(which, "mem")) g_chart_mem_sec = sec;
+                                else if (!strcmp(which, "net")) g_chart_net_sec = sec;
+                                else if (!strcmp(which, "batt")) g_chart_batt_sec = sec;
+                                else goto action_done;
+                                save_conf();
+                                invalidate_render_html_cache();
+                                need_render = 1;
+                            }
+                        }
                         else if (!strcmp(a, "stpage")) {
                             if (subpage_open("speedtest.html")) {
                                 menu = 0;
@@ -7320,19 +7509,21 @@ queued_done:
                         }
                         else if (!strcmp(a, "tsstart") || !strcmp(a, "tsstop") ||
                                  !strcmp(a, "tsrestart") || !strcmp(a, "tsrefresh")) {
-                            const struct plugin_candidate *pc = plugin_candidate_select(g_ts_candidates, ARRAY_LEN(g_ts_candidates), 0);
+                            const struct plugin_candidate *pc = plugin_script_select(g_ts_candidates, ARRAY_LEN(g_ts_candidates), 1);
                             const char *verb = !strcmp(a, "tsstart") ? "start" :
                                                !strcmp(a, "tsstop") ? "stop" : "restart";
                             if (!strcmp(a, "tsrefresh")) {
                                 plugin_status_refresh(CUR_PATH, 1);
                                 plugin_action_note(TAILSCALE_ACTION_LOG, "手动刷新状态");
                                 snprintf(g_toast, sizeof g_toast, "Tailscale 状态已刷新");
-                            } else if (!g_ts_installed || !pc) {
+                            } else if (!g_ts_installed) {
                                 snprintf(g_toast, sizeof g_toast, "Tailscale 尚未安装");
+                            } else if (!pc) {
+                                snprintf(g_toast, sizeof g_toast, "Tailscale 控制接口未初始化");
                             } else {
                                 const char *label = !strcmp(verb, "start") ? "启动" :
                                                     !strcmp(verb, "stop") ? "停止" : "重启";
-                                plugin_action_submit(TAILSCALE_ACTION_LOG, "", pc->ctl, verb, label);
+                                plugin_action_submit(TAILSCALE_ACTION_LOG, "sh ", pc->ctl, verb, label);
                                 snprintf(g_toast, sizeof g_toast, "Tailscale %s已提交", label);
                                 g_plugin_status_at = 0;
                             }
@@ -7342,15 +7533,17 @@ queued_done:
                         }
                         else if (!strcmp(a, "mhstart") || !strcmp(a, "mhstop") ||
                                  !strcmp(a, "mhrestart") || !strcmp(a, "mhrefresh")) {
-                            const struct plugin_candidate *pc = plugin_candidate_select(g_mh_candidates, ARRAY_LEN(g_mh_candidates), 0);
+                            const struct plugin_candidate *pc = plugin_script_select(g_mh_candidates, ARRAY_LEN(g_mh_candidates), 1);
                             const char *verb = !strcmp(a, "mhstart") ? "start" :
                                                !strcmp(a, "mhstop") ? "stop" : "restart";
                             if (!strcmp(a, "mhrefresh")) {
                                 plugin_status_refresh(CUR_PATH, 1);
                                 plugin_action_note(MIHOMO_ACTION_LOG, "手动刷新状态");
                                 snprintf(g_toast, sizeof g_toast, "Mihomo 状态已刷新");
-                            } else if (!g_mh_installed || !pc) {
+                            } else if (!g_mh_installed) {
                                 snprintf(g_toast, sizeof g_toast, "Mihomo 尚未安装");
+                            } else if (!pc) {
+                                snprintf(g_toast, sizeof g_toast, "Mihomo 控制接口未初始化");
                             } else {
                                 const char *label = !strcmp(verb, "start") ? "启动" :
                                                     !strcmp(verb, "stop") ? "停止" : "重启";
@@ -7364,7 +7557,7 @@ queued_done:
                         }
                         else if (!strcmp(a, "wgstart") || !strcmp(a, "wgstop") ||
                                  !strcmp(a, "wgrestart") || !strcmp(a, "wgrefresh")) {
-                            const struct plugin_candidate *pc = plugin_candidate_select(g_wg_candidates, ARRAY_LEN(g_wg_candidates), 1);
+                            const struct plugin_candidate *pc = plugin_complete_select(g_wg_candidates, ARRAY_LEN(g_wg_candidates));
                             const char *verb = !strcmp(a, "wgstart") ? "start" :
                                                !strcmp(a, "wgstop") ? "stop" : "restart";
                             if (!strcmp(a, "wgrefresh")) {
@@ -7376,7 +7569,7 @@ queued_done:
                             } else {
                                 const char *label = !strcmp(verb, "start") ? "启动" :
                                                     !strcmp(verb, "stop") ? "停止" : "重启";
-                                plugin_action_submit(WIREGUARD_ACTION_LOG, "", pc->ctl, verb, label);
+                                plugin_action_submit(WIREGUARD_ACTION_LOG, "sh ", pc->ctl, verb, label);
                                 snprintf(g_toast, sizeof g_toast, "WireGuard %s已提交", label);
                                 g_plugin_status_at = 0;
                             }
@@ -7399,26 +7592,26 @@ queued_done:
                         else if (!strcmp(a, "oprefresh") || !strcmp(a, "opscan") ||
                                  !strcmp(a, "opapply") || !strcmp(a, "opauto") ||
                                  !strcmp(a, "opcancel")) {
-                            const struct plugin_candidate *pc = plugin_candidate_select(g_operator_candidates, ARRAY_LEN(g_operator_candidates), 0);
+                            const struct plugin_candidate *pc = operator_complete_select();
                             if (!pc) {
                                 snprintf(g_toast, sizeof g_toast, "漫游锁卡插件尚未安装");
                             } else if (!strcmp(a, "oprefresh")) {
-                                plugin_action_submit(OPERATOR_ACTION_LOG, "", pc->ctl, "status", "刷新运营商状态");
+                                plugin_action_submit(OPERATOR_ACTION_LOG, "sh ", pc->ctl, "status", "刷新运营商状态");
                                 snprintf(g_toast, sizeof g_toast, "状态刷新已提交");
                                 g_plugin_status_at = 0;
                             } else if (!strcmp(a, "opscan")) {
-                                plugin_action_submit(OPERATOR_ACTION_LOG, "", pc->ctl, "scan-start", "扫描运营商");
+                                plugin_action_submit(OPERATOR_ACTION_LOG, "sh ", pc->ctl, "scan-start", "扫描运营商");
                                 snprintf(g_toast, sizeof g_toast, "运营商扫描已提交");
                                 g_plugin_status_at = 0;
                             } else if (!strcmp(a, "opauto")) {
-                                plugin_action_submit(OPERATOR_ACTION_LOG, "", pc->ctl, "auto-start", "恢复自动选网");
+                                plugin_action_submit(OPERATOR_ACTION_LOG, "sh ", pc->ctl, "auto-start", "恢复自动选网");
                                 snprintf(g_toast, sizeof g_toast, "恢复自动选网已提交");
                                 g_op_confirm_until = 0;
                                 g_plugin_status_at = 0;
                             } else if (!strcmp(a, "opcancel")) {
                                 if (!g_op_job_running) snprintf(g_toast, sizeof g_toast, "当前没有运行中的任务");
                                 else {
-                                    plugin_action_submit(OPERATOR_ACTION_LOG, "", pc->ctl, "cancel", "取消当前任务");
+                                    plugin_action_submit(OPERATOR_ACTION_LOG, "sh ", pc->ctl, "cancel", "取消当前任务");
                                     snprintf(g_toast, sizeof g_toast, "取消任务已提交");
                                     g_plugin_status_at = 0;
                                 }
@@ -7431,7 +7624,7 @@ queued_done:
                                 char verb[128];
                                 snprintf(verb, sizeof verb, "apply-start %s %s %s",
                                          g_op_selected, g_op_rat_pref, g_op_failure_policy);
-                                plugin_action_submit(OPERATOR_ACTION_LOG, "", pc->ctl, verb, "锁定运营商");
+                                plugin_action_submit(OPERATOR_ACTION_LOG, "sh ", pc->ctl, verb, "锁定运营商");
                                 snprintf(g_toast, sizeof g_toast, "运营商锁定已提交");
                                 g_op_confirm_until = 0;
                                 g_plugin_status_at = 0;
@@ -7456,7 +7649,7 @@ queued_done:
                                 const char *label = !strcmp(mode, "powersave") ? "省电模式" :
                                                     !strcmp(mode, "balance") ? "均衡模式" :
                                                     !strcmp(mode, "performance") ? "性能模式" : "极致模式";
-                                plugin_action_submit(CPU_ACTION_LOG, "", cpu_ctl_path(), mode, label);
+                                plugin_action_submit(CPU_ACTION_LOG, "sh ", cpu_ctl_path(), mode, label);
                                 snprintf(g_toast, sizeof g_toast, "CPU %s已提交", label);
                                 g_plugin_status_at = 0;
                             }

@@ -97,4 +97,9 @@ int data_refresh(devui_data_t *d);
 /* Copy the latest live snapshot even if UI-visible refresh is paused. */
 int data_refresh_live(devui_data_t *d);
 
+/* Fetch the compact cached chart snapshot without restoring the suspended SSE
+ * transport or its large parser buffers. Intended for low-power dark-screen
+ * sampling; returns 1 only when a complete sample was received. */
+int data_chart_metrics(devui_data_t *d);
+
 #endif /* U60PRO_DATA_H */

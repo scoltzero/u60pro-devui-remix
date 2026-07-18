@@ -153,6 +153,14 @@ body.light .nrow { border-bottom: 1px solid #d7e0ea; }
 .chart.sm { height: 46px; }
 body.dark  .chart { background: #172232; }
 body.light .chart { background: #f1f3f6; }
+.chart-settings { padding-bottom: 7px; }
+.chart-range-row { height: 29px; line-height: 29px; white-space: nowrap; overflow: hidden; }
+.chart-range-label { display: inline-block; width: 34px; font-size: 11px; font-weight: 700; color: #718196; }
+.chart-range-seg { display: inline-block; width: 244px; height: 23px; line-height: 23px; vertical-align: middle; border-radius: 5px; overflow: hidden; font-size: 0; }
+body.dark  .chart-range-seg { background: #202b38; }
+body.light .chart-range-seg { background: #e6ebf1; }
+.chart-range-cell { display: inline-block; box-sizing: border-box; width: 20%; height: 23px; color: #8e9aaa; font-size: 10px; font-weight: 700; text-align: center; text-decoration: none; }
+.chart-range-cell.chart-range-on { background: #4f8fe8; color: #ffffff; }
 
 /* ---- two-column data grid with a continuous center divider ---- */
 .grid2 { width: 100%; border-collapse: collapse; }

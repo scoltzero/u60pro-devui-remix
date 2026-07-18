@@ -776,6 +776,35 @@ static void chart_line(int x0, int y0, int x1, int y1,
     }
 }
 
+/* Coverage-based stroke for small chart lines. The geometry remains a straight
+ * segment; only edge pixels are blended, so this does not smooth the data. */
+static void chart_line_aa(int x0, int y0, int x1, int y1,
+                          int rx, int ry, int rw, int rh,
+                          int r, int g, int b, int thick)
+{
+    float vx = (float)(x1 - x0), vy = (float)(y1 - y0);
+    float len2 = vx * vx + vy * vy;
+    float half = std::max(0.5f, thick * 0.5f);
+    int pad = (int)std::ceil(half + 0.5f);
+    int left = std::max(rx, std::min(x0, x1) - pad);
+    int right = std::min(rx + rw - 1, std::max(x0, x1) + pad);
+    int top = std::max(ry, std::min(y0, y1) - pad);
+    int bottom = std::min(ry + rh - 1, std::max(y0, y1) + pad);
+
+    for (int py = top; py <= bottom; py++) {
+        for (int px = left; px <= right; px++) {
+            float qx = px + 0.5f - x0, qy = py + 0.5f - y0;
+            float t = len2 > 0.0f ? (qx * vx + qy * vy) / len2 : 0.0f;
+            t = std::max(0.0f, std::min(1.0f, t));
+            float dx = qx - t * vx, dy = qy - t * vy;
+            float coverage = half + 0.5f - std::sqrt(dx * dx + dy * dy);
+            if (coverage <= 0.0f) continue;
+            int alpha = (int)(std::min(1.0f, coverage) * 255.0f + 0.5f);
+            put_px(px, py, r, g, b, alpha);
+        }
+    }
+}
+
 /* Find an element by CSS selector and return its laid-out box. 1 if found. */
 extern "C" int html_view_rect(const char *sel, int *x, int *y, int *w, int *h)
 {
@@ -819,5 +848,107 @@ extern "C" void html_view_polyline(int x, int y, int w, int h,
         int cy = y + (h - 1) - (int)((long)(v - vmin) * (h - 1) / (vmax - vmin));
         if (i > 0) chart_line(px, py, cx, cy, x, y, w, h, r, g, b, thick);
         px = cx; py = cy;
+    }
+}
+
+
+struct chart_column {
+    bool used = false;
+    int first_y = 0, min_y = 0, max_y = 0, last_y = 0;
+    uint32_t first_ts = 0, min_ts = 0, max_ts = 0, last_ts = 0;
+};
+
+/* Timestamp-aware chart renderer. Samples are mapped to a fixed time window,
+ * partial history stays right-aligned, and missing seconds remain visible. */
+extern "C" void html_view_timed_polyline(int x, int y, int w, int h,
+                                          const uint32_t *times, const int *vals, int n,
+                                          uint32_t now_sec, int window_sec,
+                                          int vmin, int vmax, int r, int g, int b,
+                                          int thick, int fill_a)
+{
+    if (!times || !vals || n <= 0 || w <= 1 || h <= 1 || window_sec <= 0) return;
+    if (vmax <= vmin) vmax = vmin + 1;
+    uint32_t left_sec = now_sec > (uint32_t)window_sec ? now_sec - (uint32_t)window_sec : 0;
+    std::vector<chart_column> cols((size_t)w);
+
+    for (int i = 0; i < n; i++) {
+        uint32_t ts = times[i];
+        int v = vals[i];
+        int col, py;
+        chart_column *c;
+        if (ts < left_sec || ts > now_sec) continue;
+        if (v < vmin) v = vmin;
+        if (v > vmax) v = vmax;
+        col = (int)(((uint64_t)(ts - left_sec) * (uint32_t)(w - 1)) /
+                    (uint32_t)window_sec);
+        py = y + (h - 1) - (int)((int64_t)(v - vmin) * (h - 1) / (vmax - vmin));
+        c = &cols[(size_t)col];
+        if (!c->used) {
+            c->used = true;
+            c->first_y = c->min_y = c->max_y = c->last_y = py;
+            c->first_ts = c->min_ts = c->max_ts = c->last_ts = ts;
+        } else {
+            if (py < c->min_y) { c->min_y = py; c->min_ts = ts; }
+            if (py > c->max_y) { c->max_y = py; c->max_ts = ts; }
+            c->last_y = py;
+            c->last_ts = ts;
+        }
+    }
+
+    if (fill_a > 0) {
+        bool have_prev = false;
+        int prev_col = 0, prev_y = 0;
+        uint32_t prev_ts = 0;
+        for (int i = 0; i < n; i++) {
+            uint32_t ts = times[i];
+            int v = vals[i];
+            int col, py, from, to;
+            if (ts < left_sec || ts > now_sec) continue;
+            if (v < vmin) v = vmin;
+            if (v > vmax) v = vmax;
+            col = (int)(((uint64_t)(ts - left_sec) * (uint32_t)(w - 1)) /
+                        (uint32_t)window_sec);
+            py = y + (h - 1) - (int)((int64_t)(v - vmin) * (h - 1) / (vmax - vmin));
+            from = col;
+            to = col;
+            /* One missed scheduler second is common during a full page redraw.
+             * Keep that continuous; two consecutive misses remain a real gap. */
+            if (have_prev && ts >= prev_ts && ts - prev_ts <= 2) from = prev_col;
+            for (int cc = from; cc <= to; cc++) {
+                int top_y = py;
+                if (to > from)
+                    top_y = prev_y + (py - prev_y) * (cc - from) / (to - from);
+                for (int yy = top_y; yy < y + h; yy++)
+                    if (((cc + yy) & 1) == 0) put_px(x + cc, yy, r, g, b, fill_a);
+            }
+            prev_col = col;
+            prev_y = py;
+            prev_ts = ts;
+            have_prev = true;
+        }
+    }
+
+    bool have_prev = false;
+    int prev_x = 0, prev_y = 0;
+    uint32_t prev_ts = 0;
+    for (int col = 0; col < w; col++) {
+        const chart_column &c = cols[(size_t)col];
+        struct point { int y; uint32_t ts; } p[4] = {
+            {c.first_y, c.first_ts}, {c.min_y, c.min_ts},
+            {c.max_y, c.max_ts}, {c.last_y, c.last_ts}
+        };
+        if (!c.used) continue;
+        std::sort(p, p + 4, [](const point &a, const point &b) { return a.ts < b.ts; });
+        for (int k = 0; k < 4; k++) {
+            if (k > 0 && p[k].ts == p[k - 1].ts && p[k].y == p[k - 1].y) continue;
+            int cx = x + col;
+            if (have_prev && p[k].ts >= prev_ts && p[k].ts - prev_ts <= 2)
+                chart_line_aa(prev_x, prev_y, cx, p[k].y,
+                              x, y, w, h, r, g, b, thick);
+            prev_x = cx;
+            prev_y = p[k].y;
+            prev_ts = p[k].ts;
+            have_prev = true;
+        }
     }
 }
