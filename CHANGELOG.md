@@ -2,6 +2,14 @@
 
 > 当前正式命名与安装路径已经统一为：`zwrt-datad`、`/data/plugins/zwrt-datad/zwrt-datad`、`/data/plugins/u60pro-devui/`、`/data/plugins/u60pro-devui/ui`。历史条目里如果出现 `u60-datad`、`/data/u60pro` 或 `/data/ui`，表示当时版本记录。
 
+## 未发布
+
+### 修复
+
+- WiFi 节能模式改由 DevUI 单独持久化到 `wifi-power-save.conf`，统一使用 `99-devui-wifi-powersave` 在接口启动时恢复。
+- 首次启动清理旧 `psm`、`99-disable-powersave` 和 `psm_boot` 自启行，避免“WiFi 节能控制”插件残留把节能模式重新覆盖为高性能。
+- 修正状态读取：U60Pro 的 `wlan0` 驱动拒绝 `power_save on`，改以支持 PSM 的 `wlan2/wlan3` 为准；发现状态被外部规则改写时，按保存状态限频复核并恢复。
+
 ## v1.2.12-remix.5 - 2026-07-18
 
 ### 变更

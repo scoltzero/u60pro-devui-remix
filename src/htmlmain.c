@@ -306,12 +306,18 @@ static void invalidate_render_html_cache(void);
 /* ---- page-2 aux state, cached (-1 = unknown). Like the reference plugin,
  * bands are controlled purely with `ifconfig wlanN up/down` and read back from
  * operstate (wlan0=main 2.4G, wlan2=main 5G); uci/`wifi reload`/`zwrt_wlan
- * reload` are NOT used (they don't work / wedge the radios). PSM = `iw
- * power_save`, persisted via a self-written /etc/hotplug.d/iface/99-disable-powersave
- * script that re-applies the chosen mode on every ifup (so power_save=on sticks
- * across reconnect/reboot). The DHCP pool is computed live from uci. Toggles flip
- * optimistically; a throttle reconciles. */
+ * reload` are NOT used (they don't work / wedge the radios). DevUI is the sole
+ * owner of WiFi PSM: the selected target is persisted under the plugin data
+ * directory and one hotplug script reads it on every ifup. The DHCP pool is
+ * computed live from uci. Toggles flip optimistically; a throttle reconciles. */
+#define WIFI_PSM_STATE_FILE "/data/plugins/u60pro-devui/wifi-power-save.conf"
+#define WIFI_PSM_STATE_TMP  "/data/plugins/u60pro-devui/wifi-power-save.conf.tmp"
+#define WIFI_PSM_HOTPLUG    "/etc/hotplug.d/iface/99-devui-wifi-powersave"
+#define WIFI_PSM_LEGACY     "/etc/hotplug.d/iface/99-disable-powersave"
+#define WIFI_PSM_PLUGIN     "/etc/hotplug.d/iface/psm"
+#define WIFI_PSM_UFI_BOOT   "/data/ufi-tools/sdcard/ufi_tools_boot.sh"
 static int  g_w24 = -1, g_w5 = -1, g_wpsm = -1;
+static int  g_wpsm_target = -1;
 static int  g_dps = -1;   /* power direct-supply mode (zwrt_bsp.charger), -1 unknown */
 static int  g_adb_pending = -1; /* optimistic ADB state while USB re-enumerates */
 static int  g_usb_net = -1;     /* Type-C network sharing composition active */
@@ -326,6 +332,7 @@ static char g_dhcp_pool[48];
  * station dump) to match the vendor's "only connected" behavior. */
 static char g_assoc_macs[640];
 static uint32_t g_wifi_aux_at;
+static uint32_t g_wifi_psm_repair_at;
 
 /* Is this MAC currently associated to a radio? (case-insensitive substring) */
 static int mac_assoc(const char *mac)
@@ -857,6 +864,148 @@ static void usb_net_watchdog_start(void)
            "nohup /tmp/u60-usbnet-watchdog.sh >/tmp/u60-usbnet-watchdog.log 2>&1 &");
 }
 
+/* Kiwi rejects `power_save on` on the 2.4G AP (wlan0) with EINVAL, while the
+ * 5G AP supports it. Treat the 5G radio(s) as the authoritative PSM state;
+ * otherwise the unsupported wlan0 would make the switch immediately flip off. */
+static int wifi_psm_live_state(void)
+{
+    FILE *fp = popen(
+        "for w in wlan2 wlan3; do "
+        "[ -d /sys/class/net/$w ] || continue; "
+        "iw dev $w get power_save 2>/dev/null | awk '/Power save:/{print $3; exit}'; "
+        "done", "r");
+    int seen = 0, on = 0, off = 0;
+    char line[32];
+    if (!fp) return -1;
+    while (fgets(line, sizeof line, fp)) {
+        if (!strncmp(line, "on", 2)) { on = 1; seen = 1; }
+        else if (!strncmp(line, "off", 3)) { off = 1; seen = 1; }
+    }
+    pclose(fp);
+    if (!seen) return -1;
+    if (on && off) return -2;
+    return on ? 1 : 0;
+}
+
+static int wifi_psm_read_target(void)
+{
+    FILE *fp = fopen(WIFI_PSM_STATE_FILE, "r");
+    char value[16];
+    if (!fp) return -1;
+    value[0] = 0;
+    if (!fgets(value, sizeof value, fp)) value[0] = 0;
+    fclose(fp);
+    if (!strncmp(value, "on", 2)) return 1;
+    if (!strncmp(value, "off", 3)) return 0;
+    return -1;
+}
+
+static int wifi_psm_write_target(int on)
+{
+    FILE *fp;
+    int ok;
+    mkdir("/data/plugins/u60pro-devui", 0755);
+    fp = fopen(WIFI_PSM_STATE_TMP, "w");
+    if (!fp) return -1;
+    ok = fprintf(fp, "%s\n", on ? "on" : "off") >= 0;
+    if (fclose(fp) != 0) ok = 0;
+    if (!ok) {
+        unlink(WIFI_PSM_STATE_TMP);
+        return -1;
+    }
+    if (rename(WIFI_PSM_STATE_TMP, WIFI_PSM_STATE_FILE) != 0) {
+        unlink(WIFI_PSM_STATE_TMP);
+        return -1;
+    }
+    return 0;
+}
+
+static int wifi_psm_install_hotplug(void)
+{
+    const char *tmp = "/etc/hotplug.d/iface/99-devui-wifi-powersave.tmp";
+    FILE *fp;
+    mkdir("/etc/hotplug.d/iface", 0755);
+    fp = fopen(tmp, "w");
+    if (!fp) return -1;
+    fputs("#!/bin/sh\n"
+          "[ \"$ACTION\" = ifup ] || [ \"$ACTION\" = ifupdate ] || exit 0\n"
+          "mode=$(cat " WIFI_PSM_STATE_FILE " 2>/dev/null)\n"
+          "case \"$mode\" in on|off) ;; *) exit 0 ;; esac\n"
+          "(\n"
+          "  i=0\n"
+          "  while [ $i -lt 8 ]; do\n"
+          "    applied=0\n"
+          "    for w in wlan0 wlan1 wlan2 wlan3; do\n"
+          "      [ -d /sys/class/net/$w ] || continue\n"
+          "      iw dev $w set power_save $mode 2>/dev/null && applied=1\n"
+          "    done\n"
+          "    [ $applied -eq 1 ] && exit 0\n"
+          "    i=$((i+1))\n"
+          "    sleep 1\n"
+          "  done\n"
+          ") >/dev/null 2>&1 &\n", fp);
+    if (fclose(fp) != 0) { unlink(tmp); return -1; }
+    if (chmod(tmp, 0755) != 0 || rename(tmp, WIFI_PSM_HOTPLUG) != 0) {
+        unlink(tmp);
+        return -1;
+    }
+    return 0;
+}
+
+static void wifi_psm_cleanup_legacy(void)
+{
+    unlink(WIFI_PSM_PLUGIN);
+    unlink(WIFI_PSM_LEGACY);
+    if (access(WIFI_PSM_UFI_BOOT, F_OK) == 0)
+        (void)system("sed -i '/psm_boot/d' " WIFI_PSM_UFI_BOOT " >/dev/null 2>&1");
+}
+
+static int wifi_psm_apply_now(int on)
+{
+    const char *mode = on ? "on" : "off";
+    char cmd[256];
+    int live;
+    snprintf(cmd, sizeof cmd,
+             "for w in wlan0 wlan1 wlan2 wlan3; do "
+             "[ -d /sys/class/net/$w ] || continue; "
+             "iw dev $w set power_save %s 2>/dev/null; done", mode);
+    (void)system(cmd);
+    usleep(300000);
+    live = wifi_psm_live_state();
+    if (live >= 0 && live != on) {
+        (void)system(cmd);
+        usleep(300000);
+        live = wifi_psm_live_state();
+    }
+    return live;
+}
+
+static int wifi_psm_set_target(int on)
+{
+    wifi_psm_cleanup_legacy();
+    if (wifi_psm_write_target(on) != 0 || wifi_psm_install_hotplug() != 0)
+        return -1;
+    g_wpsm_target = on;
+    g_wpsm = wifi_psm_apply_now(on);
+    if (g_wpsm == -1) g_wpsm = on;
+    return g_wpsm == on ? 0 : -1;
+}
+
+static void wifi_psm_prepare(void)
+{
+    int target = wifi_psm_read_target();
+    int live = wifi_psm_live_state();
+
+    /* The first upgraded boot preserves the currently effective mode. */
+    if (target < 0) target = live == 1 ? 1 : 0;
+    wifi_psm_cleanup_legacy();
+    if (wifi_psm_write_target(target) == 0 && wifi_psm_install_hotplug() == 0) {
+        g_wpsm_target = target;
+        g_wpsm = wifi_psm_apply_now(target);
+        if (g_wpsm == -1) g_wpsm = target;
+    }
+}
+
 /* Read page-2 aux state into the cache: band on/off from netdev operstate (the
  * live truth on this firmware), PSM from `iw power_save`, and the DHCP pool
  * range computed live from uci (lan ip + start/limit offsets). One shell
@@ -866,9 +1015,6 @@ static void wifi_aux_refresh(void)
     FILE *fp = popen(
         "echo W0=$(cat /sys/class/net/wlan0/operstate 2>/dev/null);"
         "echo W2=$(cat /sys/class/net/wlan2/operstate 2>/dev/null);"
-        "ps=$(iw dev wlan0 get power_save 2>/dev/null | grep -o 'o[nf]*' | tail -1);"
-        "[ -z \"$ps\" ] && ps=$(iw dev wlan2 get power_save 2>/dev/null | grep -o 'o[nf]*' | tail -1);"
-        "echo PSM=$([ \"$ps\" = on ] && echo 1 || echo 0);"
         "ip=$(uci -q get network.lan.ipaddr); st=$(uci -q get dhcp.lan.start); lim=$(uci -q get dhcp.lan.limit);"
         "if [ -n \"$ip\" ] && [ -n \"$st\" ]; then pre=${ip%.*}; end=$((st+lim-1)); [ $end -gt 254 ] && end=254;"
         "echo \"POOL=$pre.$st - $pre.$end\"; fi;"
@@ -887,7 +1033,6 @@ static void wifi_aux_refresh(void)
     while (fgets(line, sizeof line, fp)) {
         if      (!strncmp(line, "W0=", 3))   g_w24 = strstr(line, "=up") != NULL;
         else if (!strncmp(line, "W2=", 3))   g_w5  = strstr(line, "=up") != NULL;
-        else if (!strncmp(line, "PSM=", 4))  g_wpsm = atoi(line + 4);
         else if (!strncmp(line, "POOL=", 5)) {
             char *nl = strchr(line, '\n'); if (nl) *nl = 0;
             snprintf(g_dhcp_pool, sizeof g_dhcp_pool, "%s", line + 5);
@@ -912,6 +1057,19 @@ static void wifi_aux_refresh(void)
         }
     }
     pclose(fp);
+
+    {
+        int live = wifi_psm_live_state();
+        uint32_t now = millis();
+        g_wpsm = live == -1 ? g_wpsm_target : live;
+        if (g_wpsm_target >= 0 && live != -1 && live != g_wpsm_target &&
+            (!g_wifi_psm_repair_at || now - g_wifi_psm_repair_at >= 10000)) {
+            g_wifi_psm_repair_at = now;
+            wifi_psm_cleanup_legacy();
+            (void)wifi_psm_install_hotplug();
+            g_wpsm = wifi_psm_apply_now(g_wpsm_target);
+        }
+    }
 }
 
 static void line_value(char *dst, size_t cap, const char *line, size_t prefix_len)
@@ -5577,7 +5735,7 @@ static int build_kv(struct kv *t, const char *path)
     t[i++] = (struct kv){ "DPSCLASS", g_dps == 1 ? "on" : "off" };
     t[i++] = (struct kv){ "DPSSTATE", g_dps < 0 ? "—" : g_dps ? "已开启" : "已关闭" };
     t[i++] = (struct kv){ "PSMCLASS", g_wpsm == 1 ? "on" : "off" };
-    t[i++] = (struct kv){ "PSMSTATE", g_wpsm < 0 ? "—" : g_wpsm ? "已开启（省电）" : "已关闭（高性能）" };
+    t[i++] = (struct kv){ "PSMSTATE", g_wpsm == -2 ? "状态不一致" : g_wpsm < 0 ? "—" : g_wpsm ? "已开启（省电）" : "已关闭（高性能）" };
     t[i++] = (struct kv){ "CLIENTLIST", s_clist }; t[i++] = (struct kv){ "DHCP_IP", d.dhcp_ip[0] ? d.dhcp_ip : "-" };
     t[i++] = (struct kv){ "SMSLIST", s_smslist };
     t[i++] = (struct kv){ "DHCP_POOL", g_dhcp_pool[0] ? g_dhcp_pool : s_pool };
@@ -6618,6 +6776,7 @@ int main(void)
     if (g_saved_bright >= 0) backlight_set(g_saved_bright);   /* restore brightness */
     if (!g_charge_boot) {
         load_pin();
+        wifi_psm_prepare();                     /* migrate old plugin rules and restore PSM */
         wifi_aux_refresh();                   /* prime page-2 switch states */
         if (usb_pid_is("9057") || usb_pid_is("90b1") || usb_pid_is("90B1"))
             usb_net_watchdog_start();
@@ -7319,27 +7478,11 @@ queued_done:
                         }
                         else if (!strcmp(a, "psm")) {
                             int turn_on = g_wpsm == 1 ? 0 : 1;   /* power_save on = battery saving */
-                            const char *m = turn_on ? "on" : "off";
-                            /* The switch owns /etc/hotplug.d/iface/99-disable-powersave: it writes
-                             * the script itself (re-applying the chosen mode on every ifup) and
-                             * applies it now, so the feature is self-contained; nothing needs to be
-                             * pre-installed. (Also drop the legacy "psm" file from older builds, which
-                             * sorts later and would otherwise override this one.) */
-                            char cmd[700];
-                            snprintf(cmd, sizeof cmd,
-                                "(mkdir -p /etc/hotplug.d/iface; rm -f /etc/hotplug.d/iface/psm; "
-                                "{ echo '#!/bin/sh'; echo '[ \"$ACTION\" = ifup ] && {'; "
-                                "echo '  iw dev wlan0 set power_save %s 2>/dev/null'; "
-                                "echo '  iw dev wlan1 set power_save %s 2>/dev/null'; "
-                                "echo '  iw dev wlan2 set power_save %s 2>/dev/null'; "
-                                "echo '  iw dev wlan3 set power_save %s 2>/dev/null'; echo '}'; } "
-                                "> /etc/hotplug.d/iface/99-disable-powersave; "
-                                "chmod +x /etc/hotplug.d/iface/99-disable-powersave; "
-                                "for w in wlan0 wlan1 wlan2 wlan3; do iw dev $w set power_save %s 2>/dev/null; done) "
-                                ">/dev/null 2>&1 &",
-                                m, m, m, m, m);
-                            system(cmd);
-                            g_wpsm = turn_on;
+                            if (wifi_psm_set_target(turn_on) == 0)
+                                snprintf(g_toast, sizeof g_toast, "WiFi %s已开启", turn_on ? "节能模式" : "高性能模式");
+                            else
+                                snprintf(g_toast, sizeof g_toast, "WiFi 模式设置失败");
+                            g_toast_until = now + 1800;
                             need_render = 1;
                         }
                         else if (!strcmp(a, "adb")) {
