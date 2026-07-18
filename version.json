@@ -1,18 +1,18 @@
 {
   "schema": 1,
   "datad": {
-    "version": "0.6.7-remix.2",
+    "version": "0.6.7-remix.3",
     "asset": "zwrt-datad-aarch64",
-    "notes": "增加 U60Pro 邻区和信令兼容接口"
+    "notes": "增加缓存图表指标接口，支持熄屏低资源采样"
   },
   "devui": {
-    "version": "1.2.12-remix.4",
+    "version": "1.2.12-remix.5",
     "asset": "u60pro-devui-aarch64",
-    "notes": "修复 WireGuard 完全卸载后残留控制器导致入口误显示"
+    "notes": "时间轴图表、抗锯齿折线及可选插件严格完整安装检测"
   },
   "ui": {
-    "version": "0.4.10-remix.2",
+    "version": "0.4.10-remix.3",
     "asset": "ui.tar.gz",
-    "notes": "新增 WireGuard 与漫游锁卡紧凑控制页面"
+    "notes": "新增四图独立显示区间设置并保留完整插件功能页面"
   }
 }
