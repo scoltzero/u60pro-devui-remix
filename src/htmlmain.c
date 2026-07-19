@@ -1946,6 +1946,15 @@ static int path_is_signal_page(const char *path)
     return path_is_signal_home(path) || path_is_signal_detail(path);
 }
 
+static int path_is_lock_page(const char *path)
+{
+    const char *base;
+    if (!path) return 0;
+    base = strrchr(path, '/');
+    if (!base) base = path; else base++;
+    return !strcmp(base, "lock.html");
+}
+
 static int signal_live_enabled(void)
 {
     /* Raw reads may stay on for datad, but UI decoded cards obey parse only. */
@@ -3230,6 +3239,151 @@ static uint32_t g_pwr_until;   /* millis the armed state auto-resets at */
 static char g_net_pending[16]; /* optimistic net mode until net_select catches up */
 static char g_uni_sa[256], g_uni_nsa[256], g_uni_lte[256];   /* available bands (max seen) */
 static char g_sel_sa[256], g_sel_nsa[256], g_sel_lte[256];   /* selected (to lock) */
+
+/* ---- dual-SIM slot switch (U60 Pro dual-SIM models only) ----
+ * Slot 1 is the removable/self-inserted SIM; slot 2 is the built-in SIM. The
+ * stock modem API may leave the inactive slot's SIM fields empty, so presence
+ * is determined only by support_dual_sim and never by sim2_states. */
+#define SIM_SWITCH_RC  "/tmp/u60-devui-sim-switch.rc"
+#define SIM_SWITCH_LOG "/tmp/u60-devui-sim-switch.log"
+static int g_sim_dual = -1;          /* -1 unknown, 0 single-SIM, 1 dual-SIM */
+static int g_sim_slot = -1;          /* 1 removable, 2 built-in */
+static int g_sim_confirm_slot;
+static int g_sim_switch_target;
+static int g_sim_switching;
+static uint32_t g_sim_refresh_at;
+static uint32_t g_sim_confirm_until;
+static uint32_t g_sim_switch_until;
+
+static const char *sim_slot_label(int slot)
+{
+    return slot == 1 ? "自插卡" : slot == 2 ? "内置卡" : "未知卡槽";
+}
+
+static int sim_switch_rc_read(int *rc)
+{
+    char line[24];
+    char *end = NULL;
+    long value;
+    if (!read_line_path(SIM_SWITCH_RC, line, sizeof line)) return 0;
+    value = strtol(line, &end, 10);
+    if (end == line) return 0;
+    *rc = (int)value;
+    return 1;
+}
+
+static void sim_switch_finish(uint32_t now, int ok, const char *reason)
+{
+    int target = g_sim_switch_target;
+    g_sim_switching = 0;
+    g_sim_switch_target = 0;
+    g_sim_switch_until = 0;
+    unlink(SIM_SWITCH_RC);
+    if (ok)
+        snprintf(g_toast, sizeof g_toast, "已切换到%s", sim_slot_label(target));
+    else
+        snprintf(g_toast, sizeof g_toast, "%s", reason ? reason : "SIM 卡切换失败");
+    g_toast_until = now + 2200;
+}
+
+/* Returns 1 when visible SIM state changed. A failed read preserves the last
+ * known dual-SIM capability and slot so a transient modem restart does not
+ * make the controls disappear or falsely highlight the target slot. */
+static int sim_slot_refresh(uint32_t now, int force)
+{
+    uint32_t interval = g_sim_switching ? 1000U : 5000U;
+    FILE *fp;
+    char line[64];
+    int dual = -1, slot = -1;
+    int old_dual = g_sim_dual, old_slot = g_sim_slot;
+    int old_switching = g_sim_switching;
+    int rc;
+
+    if (!force && g_sim_refresh_at && now - g_sim_refresh_at < interval) return 0;
+    g_sim_refresh_at = now;
+    fp = popen(
+        "j=$(ubus -t 3 call zwrt_zte_mdm.api get_sim_info_before '{}' 2>/dev/null); "
+        "printf 'DUAL=%s\\nSLOT=%s\\n' "
+        "\"$(printf '%s' \"$j\" | jsonfilter -e '@.support_dual_sim' 2>/dev/null)\" "
+        "\"$(printf '%s' \"$j\" | jsonfilter -e '@.current_sim_slot' 2>/dev/null)\"",
+        "r");
+    if (fp) {
+        while (fgets(line, sizeof line, fp)) {
+            if (!strncmp(line, "DUAL=", 5) && (line[5] == '0' || line[5] == '1')) dual = line[5] - '0';
+            else if (!strncmp(line, "SLOT=", 5) && (line[5] == '1' || line[5] == '2')) slot = line[5] - '0';
+        }
+        pclose(fp);
+    }
+    if (dual >= 0) g_sim_dual = dual;
+    if (slot >= 0) g_sim_slot = slot;
+
+    if (g_sim_switching) {
+        if (g_sim_slot == g_sim_switch_target) {
+            sim_switch_finish(now, 1, NULL);
+        } else if (sim_switch_rc_read(&rc) && rc != 0) {
+            sim_switch_finish(now, 0, "SIM 卡切换命令失败");
+        } else if ((int32_t)(now - g_sim_switch_until) >= 0) {
+            sim_switch_finish(now, 0, "SIM 卡切换超时");
+        }
+    }
+    return old_dual != g_sim_dual || old_slot != g_sim_slot || old_switching != g_sim_switching;
+}
+
+static int sim_switch_start(int slot, uint32_t now)
+{
+    char cmd[384];
+    if (slot != 1 && slot != 2) return -1;
+    unlink(SIM_SWITCH_RC);
+    unlink(SIM_SWITCH_LOG);
+    if (snprintf(cmd, sizeof cmd,
+                 "(ubus -t 20 call zwrt_zte_mdm.api zwrt_zte_mdm_activate_sim "
+                 "'{\"sim_card_id\":%d}' >" SIM_SWITCH_LOG " 2>&1; "
+                 "echo $? >" SIM_SWITCH_RC ") &", slot) >= (int)sizeof cmd)
+        return -1;
+    if (system(cmd) != 0) return -1;
+    g_sim_switching = 1;
+    g_sim_switch_target = slot;
+    g_sim_switch_until = now + 60000U;
+    g_sim_confirm_slot = 0;
+    g_sim_confirm_until = 0;
+    g_sim_refresh_at = 0;
+    snprintf(g_toast, sizeof g_toast, "正在切换到%s", sim_slot_label(slot));
+    g_toast_until = now + 2200;
+    return 0;
+}
+
+static void sim_slot_action(int slot, uint32_t now)
+{
+    (void)sim_slot_refresh(now, 1);
+    if (g_sim_dual != 1) {
+        snprintf(g_toast, sizeof g_toast, "当前设备不支持双卡切换");
+        g_toast_until = now + 1800;
+        return;
+    }
+    if (g_sim_switching) {
+        snprintf(g_toast, sizeof g_toast, "SIM 卡正在切换中");
+        g_toast_until = now + 1800;
+        return;
+    }
+    if (slot == g_sim_slot) {
+        g_sim_confirm_slot = 0;
+        g_sim_confirm_until = 0;
+        snprintf(g_toast, sizeof g_toast, "当前正在使用%s", sim_slot_label(slot));
+        g_toast_until = now + 1800;
+        return;
+    }
+    if (g_sim_confirm_slot == slot && (int32_t)(g_sim_confirm_until - now) > 0) {
+        if (sim_switch_start(slot, now) != 0) {
+            snprintf(g_toast, sizeof g_toast, "无法启动 SIM 卡切换");
+            g_toast_until = now + 1800;
+        }
+        return;
+    }
+    g_sim_confirm_slot = slot;
+    g_sim_confirm_until = now + 4000U;
+    snprintf(g_toast, sizeof g_toast, "请再次点击%s确认", sim_slot_label(slot));
+    g_toast_until = now + 1800;
+}
 
 static int band_count(const char *s) { if (!s[0]) return 0; int n = 1; for (; *s; s++) if (*s == ',') n++; return n; }
 
@@ -5476,7 +5630,7 @@ static int build_kv(struct kv *t, const char *path)
 
     /* ---- band lock: universe grows to the largest set seen; selection mirrors
      * the live lock unless the user is editing in the modal ---- */
-    static char s_netseg[640], s_cursa[300], s_curnsa[300], s_curlte[300], s_toast[120];
+    static char s_netseg[640], s_simswitch[1200], s_cursa[300], s_curnsa[300], s_curlte[300], s_toast[120];
     static char s_ts_action_log[2200], s_mh_action_log[2200], s_cpu_action_log[2200];
     static char s_wg_action_log[2200], s_op_action_log[2200];
     static char s_wg_peers[24], s_wg_active[24], s_op_selected[16], s_op_job[440];
@@ -5505,6 +5659,36 @@ static int build_kv(struct kv *t, const char *path)
             o += snprintf(s_netseg + o, sizeof s_netseg - o, "<a href='act:net:%s' class='segc%s'>%s</a>",
                           g_netmodes[k].v, k == hl ? " seg-on" : "", g_netmodes[k].lab);
         snprintf(s_netseg + o, sizeof s_netseg - o, "</div>");
+    }
+    s_simswitch[0] = 0;
+    if (g_sim_dual == 1) {
+        const char *hint = "切卡会短暂断网，点击目标卡后需在 4 秒内再次点击确认";
+        char dynamic_hint[160];
+        int o = snprintf(s_simswitch, sizeof s_simswitch,
+                         "<div class='card simcard'><div class='title'>SIM 卡切换</div>"
+                         "<div class='seg seg2 simseg'>");
+        for (int slot = 1; slot <= 2; slot++) {
+            const char *cls = slot == g_sim_slot ? " seg-on" :
+                              g_sim_switching && slot == g_sim_switch_target ? " sim-busy" :
+                              g_sim_confirm_slot == slot ? " sim-armed" : "";
+            const char *sub = g_sim_switching && slot == g_sim_switch_target ? "切换中" :
+                              g_sim_confirm_slot == slot ? "再次按下" : "";
+            o += snprintf(s_simswitch + o, sizeof s_simswitch - o,
+                          "<a href='act:simslot:%d' class='segc%s'><span class='sim-main'>%s</span>%s%s%s</a>",
+                          slot, cls, sim_slot_label(slot), sub[0] ? "<br><span class='sim-sub'>" : "",
+                          sub, sub[0] ? "</span>" : "");
+        }
+        if (g_sim_switching) {
+            snprintf(dynamic_hint, sizeof dynamic_hint, "正在切换到%s，蜂窝网络会短暂中断。",
+                     sim_slot_label(g_sim_switch_target));
+            hint = dynamic_hint;
+        } else if (g_sim_confirm_slot) {
+            snprintf(dynamic_hint, sizeof dynamic_hint, "4 秒内再次点击%s确认切换。",
+                     sim_slot_label(g_sim_confirm_slot));
+            hint = dynamic_hint;
+        }
+        snprintf(s_simswitch + o, sizeof s_simswitch - o,
+                 "</div><div class='simhint'>%s</div></div>", hint);
     }
     s_toast[0] = 0;
     if (g_toast[0]) snprintf(s_toast, sizeof s_toast, "<div class='toast'>%s</div>", g_toast);
@@ -5717,7 +5901,9 @@ static int build_kv(struct kv *t, const char *path)
         t[i++] = (struct kv){ "BATPWR", "" };
         t[i++] = (struct kv){ "BATPWRLBL", "" };
     }
-    t[i++] = (struct kv){ "NETSEG", s_netseg };   t[i++] = (struct kv){ "TOAST", s_toast };
+    t[i++] = (struct kv){ "NETSEG", s_netseg };
+    t[i++] = (struct kv){ "SIMSWITCH", s_simswitch };
+    t[i++] = (struct kv){ "TOAST", s_toast };
     t[i++] = (struct kv){ "PWROFFLBL",  g_pwr_confirm == 1 ? "再按一次" : "关机" };
     t[i++] = (struct kv){ "PWROFFCLS",  g_pwr_confirm == 1 ? "armed" : "" };
     t[i++] = (struct kv){ "PWRREBLBL",  g_pwr_confirm == 2 ? "再按一次" : "重启" };
@@ -7387,6 +7573,7 @@ queued_done:
                         else if (!strcmp(a, "menu"))      { backlight_on(); menu = 1; g_pwr_confirm = 0; need_render = 1; }
                         else if (!strncmp(a, "sub:", 4)) {
                             if (subpage_open(a + 4)) {
+                                if (!strcmp(a + 4, "lock.html")) (void)sim_slot_refresh(now, 1);
                                 menu = 0;
                                 g_modal = 0;
                                 g_sms_open = -1;
@@ -7831,6 +8018,10 @@ queued_done:
                             snprintf(g_net_pending, sizeof g_net_pending, "%s", a + 4);
                             snprintf(g_toast, sizeof g_toast, "网络模式已切换"); g_toast_until = now + 1600;
                         }
+                        else if (!strncmp(a, "simslot:", 8)) {
+                            sim_slot_action(atoi(a + 8), now);
+                            need_render = 1;
+                        }
                         else if (!strncmp(a, "openmodal:", 10)) {   /* open band-lock dialog */
                             const char *r = a + 10;
                             if (!strcmp(r, "sig")) g_modal = 4;
@@ -7896,6 +8087,13 @@ action_done:
         /* power-menu armed state auto-reverts if the second tap doesn't come */
         if (g_pwr_confirm && now >= g_pwr_until) { g_pwr_confirm = 0; if (menu) need_render = 1; }
 
+        /* SIM target confirmation uses the same four-second safety window. */
+        if (g_sim_confirm_slot && (int32_t)(now - g_sim_confirm_until) >= 0) {
+            g_sim_confirm_slot = 0;
+            g_sim_confirm_until = 0;
+            if (path_is_lock_page(CUR_PATH)) need_render = 1;
+        }
+
         /* auto screen-off after the configured idle timeout (locks if enabled) */
         if (g_autooff_ms > 0 && backlight_is_on() && now - last_act >= (uint32_t)g_autooff_ms) {
             screen_off(&disp);
@@ -7945,6 +8143,11 @@ action_done:
 
         /* reconcile page-2 WiFi switch states from uci/iw on a slow throttle */
         if (!dragging && !scroll_inertia && now - g_wifi_aux_at >= 4000) { g_wifi_aux_at = now; wifi_aux_refresh(); }
+
+        /* SIM polling is page-local and pauses during gestures and while dark. */
+        if (backlight_is_on() && path_is_lock_page(CUR_PATH) && !dragging && !scroll_inertia) {
+            if (sim_slot_refresh(now, 0)) need_render = 1;
+        }
 
         if (!g_charge_boot && now - g_pages_scan_at >= 1000) {
             g_pages_scan_at = now;
