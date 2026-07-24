@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>飞猫分身切卡</title><base target="_blank">
+<style>
+.toast-mask{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:999;display:flex;align-items:center;justify-content:center;animation:fadeIn .2s ease}
+.toast-box{background:linear-gradient(145deg,#1e1e3a,#2a2a4a);border:1px solid rgba(255,255,255,0.08);border-radius:14px;padding:24px 32px;min-width:220px;max-width:80%;text-align:center;box-shadow:0 12px 40px rgba(0,0,0,0.5);animation:scaleIn .25s ease}
+.toast-icon{font-size:2.2rem;margin-bottom:10px}
+.toast-title{color:#fff;font-size:.9rem;font-weight:600;margin-bottom:6px}
+.toast-desc{color:rgba(255,255,255,0.6);font-size:.75rem;line-height:1.4}
+.toast.success{border-color:rgba(76,175,80,0.3)}.toast.success .toast-icon{color:#4CAF50}
+.toast.warn{border-color:rgba(255,152,0,0.3)}.toast.warn .toast-icon{color:#ff9800}
+.toast.error{border-color:rgba(244,67,54,0.3)}.toast.error .toast-icon{color:#f44336}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+@keyframes scaleIn{from{opacity:0;transform:scale(.85)}to{opacity:1;transform:scale(1)}}
+.lockcard{position:relative;transition:all .2s ease}
+.lockcard.active{border:2px solid #4CAF50!important;background:rgba(76,175,80,0.12)!important;box-shadow:0 0 12px rgba(76,175,80,0.25)!important}
+.lockcard.active .lc-t{color:#4CAF50!important;font-weight:bold}
+.lockcard.active .lc-b{color:rgba(76,175,80,0.8)!important}
+.lockcard.active::after{content:"✓ 使用中";position:absolute;top:4px;right:4px;background:#4CAF50;color:#fff;font-size:.5rem;padding:2px 5px;border-radius:6px;font-weight:600;letter-spacing:.3px;box-shadow:0 1px 4px rgba(0,0,0,0.3)}
+.net-current{border-left:3px solid #4CAF50!important}.net-current .title{color:#4CAF50!important}
+.pin-val{color:#4CAF50;font-weight:600;font-family:monospace;background:rgba(76,175,80,0.1);padding:1px 6px;border-radius:4px;font-size:.8em}
+.log-box{max-height:100px;overflow-y:auto;font-size:.6rem;line-height:1.4;padding:6px;background:rgba(0,0,0,0.15);border-radius:4px;color:#aaa}
+.skip-hint{background:rgba(255,152,0,0.1);border:1px solid rgba(255,152,0,0.3);border-radius:6px;padding:8px 12px;margin:8px 0;color:#ff9800;font-size:.7rem;text-align:center}
+</style>
+<base target="_blank">
+</head>
+<body class="{{THEME}}">
+{{STATUSBAR}}
+{{FMTOAST}}
+<div class="card {{FMCURRNETCLS}}">
+  <div class="title">当前网络 <span class="r {{FMSTATECLASS}}">{{FMSTATE}}</span></div>
+  <table class="kv">
+    <tr><td class="kv-l">运营商</td><td class="val">{{FMOPERATOR}}</td></tr>
+    <tr><td class="kv-l">PIN码</td><td class="val"><span class="pin-val">{{FMCURPIN}}</span></td></tr>
+    <tr><td class="kv-l">网络类型</td><td class="val">{{FMNETTYPE}}</td></tr>
+    <tr><td class="kv-l">频段</td><td class="val">{{FMBAND}}</td></tr>
+    <tr><td class="kv-l">信号</td><td class="val">{{FMSIGNAL}}</td></tr>
+    <tr><td class="kv-l">MCC/MNC</td><td class="val">{{FMMCC}}/{{FMMNC}}</td></tr>
+  </table>
+</div>
+<div class="card">
+  <div class="title">一键切卡 <span class="r muted">飞猫分身</span></div>
+  <div class="sec" style="color:#ff6b6b;font-size:.65rem"><i>! 非飞猫分身卡请勿操作</i></div>
+  <a href="act:fmswitch:0200" class="card lockcard {{FMSLOT0200CLS}}">
+    <div class="lc-t">[移] 中国移动</div>
+    <div class="lc-b">pin=0200 | n41</div>
+  </a>
+  <a href="act:fmswitch:0300" class="card lockcard {{FMSLOT0300CLS}}">
+    <div class="lc-t">[电] 中国电信</div>
+    <div class="lc-b">pin=0300 | n78</div>
+  </a>
+  <a href="act:fmswitch:0100" class="card lockcard {{FMSLOT0100CLS}}">
+    <div class="lc-t">[联] 中国联通</div>
+    <div class="lc-b">pin=0100 | n78</div>
+  </a>
+</div>
+<div class="card">
+  <div class="title">操作日志</div>
+  <div class="log-box">{{FMLOG}}</div>
+</div>
+<div class="pgpad"></div>
+</body>
+</html>
