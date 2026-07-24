@@ -18,6 +18,7 @@
 
 #include <arpa/inet.h>
 #include <dirent.h>
+#include <limits.h>
 #include <math.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -48,6 +49,11 @@ extern const char *html_view_click(float x, float y);
 extern int         html_view_rect(const char *sel, int *x, int *y, int *w, int *h);
 extern void        html_view_polyline(int x, int y, int w, int h, const int *vals, int n,
                                       int vmin, int vmax, int r, int g, int b, int thick, int fill_a);
+extern void        html_view_timed_polyline(int x, int y, int w, int h,
+                                            const uint32_t *times, const int *vals, int n,
+                                            uint32_t now_sec, int window_sec,
+                                            int vmin, int vmax, int r, int g, int b,
+                                            int thick, int fill_a);
 extern void        html_view_set_scroll(int y);
 extern void        html_view_set_clip_top(int y);
 extern void        html_view_fill_rect(int x, int y, int w, int h, int r, int g, int b, int a);
@@ -84,28 +90,157 @@ static uint32_t millis(void)
     return (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
 }
 
+static uint32_t monotonic_seconds(void)
+{
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)ts.tv_sec;
+}
+
 /* Optional service pages under ui/functions/.  These fixed paths intentionally
  * avoid a generic "run shell from HTML" action: custom pages remain data-only,
  * while known local services get a small, auditable control surface. */
-#define TAILSCALE_CTL "/data/plugins/tailscale/tsctl.sh"
-#define TAILSCALE_DIR "/data/plugins/tailscale"
 #define TAILSCALE_ACTION_LOG "/tmp/devui-tailscale-action.log"
-#define MIHOMO_CTL    "/data/ufi-tools/mihomo/mm.sh"
-#define MIHOMO_DIR    "/data/ufi-tools/mihomo"
 #define MIHOMO_ACTION_LOG "/tmp/devui-mihomo-action.log"
-#define CPU_CTL UI_DIR "/../cpuctl.sh"
+#define WIREGUARD_ACTION_LOG "/tmp/devui-wireguard-action.log"
+#define OPERATOR_ACTION_LOG "/tmp/devui-operator-action.log"
+#define CPU_CTL_BUNDLED UI_DIR "/functions/cpuctl.sh"
+#define CPU_CTL_LEGACY  UI_DIR "/../cpuctl.sh"
+#define CPU_CTL_OLD     "/data/ufi-tools/u60pro-devui/cpuctl.sh"
 #define CPU_ACTION_LOG "/tmp/devui-cpu-action.log"
+#define FMSWITCH_ACTION_LOG "/tmp/devui-fmswitch-action.log"
+
+struct plugin_candidate {
+    const char *dir;
+    const char *ctl;
+    const char *bin;
+};
+
+static const struct plugin_candidate g_fm_candidates[] = {
+    { "/data/plugins/u60pro-devui/ui/functions/", "/data/plugins/u60pro-devui/ui/functions/fmsimpin.sh", NULL },
+    { "/data/ufi-tools", "/data/ufi-tools/fmsimpin.sh", NULL },
+    { "/data/kano_plugins", "/data/kano_plugins/fmsimpin.sh", NULL },
+};
+
+static const struct plugin_candidate g_ts_candidates[] = {
+    { "/data/plugins/tailscale", "/data/plugins/tailscale/tsctl.sh", "/data/plugins/tailscale/bin/tailscale" },
+    { "/data/ufi-tools/tailscale", "/data/ufi-tools/tailscale/tsctl.sh", "/data/ufi-tools/tailscale/bin/tailscale" },
+    { "/data/kano_plugins/tailscale", "/data/kano_plugins/tailscale/tsctl.sh", "/data/kano_plugins/tailscale/bin/tailscale" },
+};
+static const struct plugin_candidate g_mh_candidates[] = {
+    { "/data/plugins/mihomo", "/data/plugins/mihomo/mm.sh", "/data/plugins/mihomo/mihomo" },
+    { "/data/ufi-tools/mihomo", "/data/ufi-tools/mihomo/mm.sh", "/data/ufi-tools/mihomo/mihomo" },
+    { "/data/kano_plugins/mihomo", "/data/kano_plugins/mihomo/mm.sh", "/data/kano_plugins/mihomo/mihomo" },
+};
+static const struct plugin_candidate g_wg_candidates[] = {
+    { "/data/plugins/wireguard", "/data/plugins/wireguard/wgctl.sh", "/data/plugins/wireguard/bin/wg" },
+    { "/data/ufi-tools/wireguard", "/data/ufi-tools/wireguard/wgctl.sh", "/data/ufi-tools/wireguard/bin/wg" },
+    { "/data/kano_plugins/wireguard", "/data/kano_plugins/wireguard/wgctl.sh", "/data/kano_plugins/wireguard/bin/wg" },
+};
+static const struct plugin_candidate g_operator_candidates[] = {
+    { "/data/plugins/operator-lock", "/data/plugins/operator-lock/operatorctl.sh", NULL },
+    { "/data/ufi-tools/operator-lock", "/data/ufi-tools/operator-lock/operatorctl.sh", NULL },
+    { "/data/kano_plugins/operator-lock", "/data/kano_plugins/operator-lock/operatorctl.sh", NULL },
+};
+
+#define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
+
+/* Shell adapters are valid APIs even when an importer preserved them as 0644;
+ * these two plugins are invoked through `sh`, so readability is sufficient. */
+static const struct plugin_candidate *plugin_script_select(
+    const struct plugin_candidate *items, size_t count, int require_bin)
+{
+    for (size_t i = 0; i < count; i++) {
+        if (access(items[i].ctl, R_OK) != 0) continue;
+        if (require_bin && items[i].bin && access(items[i].bin, X_OK) != 0) continue;
+        return &items[i];
+    }
+    return NULL;
+}
+
+static const struct plugin_candidate *plugin_complete_select(
+    const struct plugin_candidate *items, size_t count)
+{
+    for (size_t i = 0; i < count; i++)
+        if (access(items[i].ctl, R_OK) == 0 && items[i].bin &&
+            access(items[i].bin, X_OK) == 0)
+            return &items[i];
+    return NULL;
+}
+
+static const struct plugin_candidate *operator_complete_select(void)
+{
+    char config[320];
+    for (size_t i = 0; i < ARRAY_LEN(g_operator_candidates); i++) {
+        snprintf(config, sizeof config, "%s/config.json", g_operator_candidates[i].dir);
+        if (access(g_operator_candidates[i].ctl, R_OK) == 0 &&
+            access(config, R_OK) == 0)
+            return &g_operator_candidates[i];
+    }
+    return NULL;
+}
+
+#define WG_MAX_PEERS 16
+#define OP_MAX_CANDIDATES 24
+
+struct wg_peer_state {
+    char public_key[48];
+    char endpoint[96];
+    char allowed_ips[192];
+    long long latest_handshake;
+    unsigned long long rx_bytes;
+    unsigned long long tx_bytes;
+};
+
+struct operator_candidate_state {
+    int status;
+    char plmn[8];
+    char name[80];
+};
 
 static uint32_t g_plugin_status_at;
 static int g_ts_installed, g_ts_running, g_ts_connected, g_ts_boot;
 static int g_mh_installed, g_mh_running, g_mh_tun, g_mh_rules;
 static int g_cpu_installed;
+static int g_wg_installed, g_wg_running, g_wg_deps, g_wg_boot;
+static int g_wg_peer_n, g_wg_peer_total, g_wg_peer_active;
+static int g_op_installed, g_op_registered, g_op_job_running, g_op_at_busy;
+static int g_op_candidate_n, g_op_candidate_total;
 static char g_ts_pid[16] = "-", g_ts_ip[48] = "-", g_ts_version[32] = "-";
 static char g_ts_host[64] = "-", g_ts_routes[160] = "-";
 static char g_mh_pid[16] = "-", g_mh_version[64] = "-", g_mh_mode[24] = "-";
 static char g_mh_port[16] = "-", g_mh_ipset[24] = "-";
 static char g_cpu_mode[24] = "unknown", g_cpu_gov[24] = "-";
 static char g_cpu_cur[24] = "-", g_cpu_min[24] = "-", g_cpu_max[24] = "-";
+static char g_wg_iface[32] = "wg-ufi0", g_wg_address[96] = "-", g_wg_port[16] = "-";
+static char g_wg_mode[24] = "stopped", g_wg_uptime[32] = "-";
+static struct wg_peer_state g_wg_peers[WG_MAX_PEERS];
+static char g_op_sim[32] = "-", g_op_operator[32] = "-", g_op_rat[32] = "-";
+static char g_op_mode[24] = "-", g_op_job_status[24] = "idle", g_op_job_message[160] = "-";
+static char g_op_rat_pref[16] = "auto", g_op_failure_policy[24] = "stay_offline";
+static char g_op_selected[8];
+static uint32_t g_op_confirm_until;
+static struct operator_candidate_state g_op_scan[OP_MAX_CANDIDATES];
+static int g_fm_installed, g_fm_switching;
+static char g_fm_provider[48] = "-";
+static char g_fm_nettype[16] = "-";
+static char g_fm_band[16] = "-";
+static char g_fm_signal[8] = "-";
+static char g_fm_mcc[8] = "-";
+static char g_fm_mnc[8] = "-";
+static char g_fm_pin[8] = "-";
+
+static const char *cpu_ctl_path(void)
+{
+    if (access(CPU_CTL_BUNDLED, R_OK) == 0) return CPU_CTL_BUNDLED;
+    if (access(CPU_CTL_LEGACY, R_OK) == 0) return CPU_CTL_LEGACY;
+    return CPU_CTL_OLD;
+}
+
+static int cpu_control_available(void)
+{
+    return access(cpu_ctl_path(), R_OK) == 0 &&
+           access("/sys/devices/system/cpu/cpufreq/policy0/scaling_governor", R_OK | W_OK) == 0;
+}
 
 #define TEMPLATE_CACHE_CAP 8
 #define PAGE_HTML_CACHE_CAP 1048576
@@ -140,6 +275,10 @@ static int  g_scroll;     /* current page vertical scroll offset */
 static int  g_page_h;     /* last rendered page content height */
 static int  g_autooff_ms; /* auto screen-off timeout, 0 = never */
 static int  g_refresh_ms = 1000; /* state refresh interval, 0 = paused */
+static int  g_chart_cpu_sec = 48;
+static int  g_chart_mem_sec = 48;
+static int  g_chart_net_sec = 48;
+static int  g_chart_batt_sec = 48;
 static int  g_sig_read;   /* ML1/raw signaling read switch */
 static int  g_sig_parse;  /* decoded LTE/NR signaling parse switch + page visibility */
 static int  g_neighbor_open; /* expand neighbor-cell list on the first signal page */
@@ -175,18 +314,25 @@ static long long g_render_html_cache_css_mtime = -1;
 static long long g_pages_dir_mtime = -1;
 static uint32_t g_pages_scan_at;
 static int normalize_refresh_ms(int ms);
+static int normalize_chart_sec(int sec);
 
 static void invalidate_render_html_cache(void);
 
 /* ---- page-2 aux state, cached (-1 = unknown). Like the reference plugin,
  * bands are controlled purely with `ifconfig wlanN up/down` and read back from
  * operstate (wlan0=main 2.4G, wlan2=main 5G); uci/`wifi reload`/`zwrt_wlan
- * reload` are NOT used (they don't work / wedge the radios). PSM = `iw
- * power_save`, persisted via a self-written /etc/hotplug.d/iface/99-disable-powersave
- * script that re-applies the chosen mode on every ifup (so power_save=on sticks
- * across reconnect/reboot). The DHCP pool is computed live from uci. Toggles flip
- * optimistically; a throttle reconciles. */
+ * reload` are NOT used (they don't work / wedge the radios). DevUI is the sole
+ * owner of WiFi PSM: the selected target is persisted under the plugin data
+ * directory and one hotplug script reads it on every ifup. The DHCP pool is
+ * computed live from uci. Toggles flip optimistically; a throttle reconciles. */
+#define WIFI_PSM_STATE_FILE "/data/plugins/u60pro-devui/wifi-power-save.conf"
+#define WIFI_PSM_STATE_TMP  "/data/plugins/u60pro-devui/wifi-power-save.conf.tmp"
+#define WIFI_PSM_HOTPLUG    "/etc/hotplug.d/iface/99-devui-wifi-powersave"
+#define WIFI_PSM_LEGACY     "/etc/hotplug.d/iface/99-disable-powersave"
+#define WIFI_PSM_PLUGIN     "/etc/hotplug.d/iface/psm"
+#define WIFI_PSM_UFI_BOOT   "/data/ufi-tools/sdcard/ufi_tools_boot.sh"
 static int  g_w24 = -1, g_w5 = -1, g_wpsm = -1;
+static int  g_wpsm_target = -1;
 static int  g_dps = -1;   /* power direct-supply mode (zwrt_bsp.charger), -1 unknown */
 static int  g_adb_pending = -1; /* optimistic ADB state while USB re-enumerates */
 static int  g_usb_net = -1;     /* Type-C network sharing composition active */
@@ -201,6 +347,7 @@ static char g_dhcp_pool[48];
  * station dump) to match the vendor's "only connected" behavior. */
 static char g_assoc_macs[640];
 static uint32_t g_wifi_aux_at;
+static uint32_t g_wifi_psm_repair_at;
 
 /* Is this MAC currently associated to a radio? (case-insensitive substring) */
 static int mac_assoc(const char *mac)
@@ -732,6 +879,148 @@ static void usb_net_watchdog_start(void)
            "nohup /tmp/u60-usbnet-watchdog.sh >/tmp/u60-usbnet-watchdog.log 2>&1 &");
 }
 
+/* Kiwi rejects `power_save on` on the 2.4G AP (wlan0) with EINVAL, while the
+ * 5G AP supports it. Treat the 5G radio(s) as the authoritative PSM state;
+ * otherwise the unsupported wlan0 would make the switch immediately flip off. */
+static int wifi_psm_live_state(void)
+{
+    FILE *fp = popen(
+        "for w in wlan2 wlan3; do "
+        "[ -d /sys/class/net/$w ] || continue; "
+        "iw dev $w get power_save 2>/dev/null | awk '/Power save:/{print $3; exit}'; "
+        "done", "r");
+    int seen = 0, on = 0, off = 0;
+    char line[32];
+    if (!fp) return -1;
+    while (fgets(line, sizeof line, fp)) {
+        if (!strncmp(line, "on", 2)) { on = 1; seen = 1; }
+        else if (!strncmp(line, "off", 3)) { off = 1; seen = 1; }
+    }
+    pclose(fp);
+    if (!seen) return -1;
+    if (on && off) return -2;
+    return on ? 1 : 0;
+}
+
+static int wifi_psm_read_target(void)
+{
+    FILE *fp = fopen(WIFI_PSM_STATE_FILE, "r");
+    char value[16];
+    if (!fp) return -1;
+    value[0] = 0;
+    if (!fgets(value, sizeof value, fp)) value[0] = 0;
+    fclose(fp);
+    if (!strncmp(value, "on", 2)) return 1;
+    if (!strncmp(value, "off", 3)) return 0;
+    return -1;
+}
+
+static int wifi_psm_write_target(int on)
+{
+    FILE *fp;
+    int ok;
+    mkdir("/data/plugins/u60pro-devui", 0755);
+    fp = fopen(WIFI_PSM_STATE_TMP, "w");
+    if (!fp) return -1;
+    ok = fprintf(fp, "%s\n", on ? "on" : "off") >= 0;
+    if (fclose(fp) != 0) ok = 0;
+    if (!ok) {
+        unlink(WIFI_PSM_STATE_TMP);
+        return -1;
+    }
+    if (rename(WIFI_PSM_STATE_TMP, WIFI_PSM_STATE_FILE) != 0) {
+        unlink(WIFI_PSM_STATE_TMP);
+        return -1;
+    }
+    return 0;
+}
+
+static int wifi_psm_install_hotplug(void)
+{
+    const char *tmp = "/etc/hotplug.d/iface/99-devui-wifi-powersave.tmp";
+    FILE *fp;
+    mkdir("/etc/hotplug.d/iface", 0755);
+    fp = fopen(tmp, "w");
+    if (!fp) return -1;
+    fputs("#!/bin/sh\n"
+          "[ \"$ACTION\" = ifup ] || [ \"$ACTION\" = ifupdate ] || exit 0\n"
+          "mode=$(cat " WIFI_PSM_STATE_FILE " 2>/dev/null)\n"
+          "case \"$mode\" in on|off) ;; *) exit 0 ;; esac\n"
+          "(\n"
+          "  i=0\n"
+          "  while [ $i -lt 8 ]; do\n"
+          "    applied=0\n"
+          "    for w in wlan0 wlan1 wlan2 wlan3; do\n"
+          "      [ -d /sys/class/net/$w ] || continue\n"
+          "      iw dev $w set power_save $mode 2>/dev/null && applied=1\n"
+          "    done\n"
+          "    [ $applied -eq 1 ] && exit 0\n"
+          "    i=$((i+1))\n"
+          "    sleep 1\n"
+          "  done\n"
+          ") >/dev/null 2>&1 &\n", fp);
+    if (fclose(fp) != 0) { unlink(tmp); return -1; }
+    if (chmod(tmp, 0755) != 0 || rename(tmp, WIFI_PSM_HOTPLUG) != 0) {
+        unlink(tmp);
+        return -1;
+    }
+    return 0;
+}
+
+static void wifi_psm_cleanup_legacy(void)
+{
+    unlink(WIFI_PSM_PLUGIN);
+    unlink(WIFI_PSM_LEGACY);
+    if (access(WIFI_PSM_UFI_BOOT, F_OK) == 0)
+        (void)system("sed -i '/psm_boot/d' " WIFI_PSM_UFI_BOOT " >/dev/null 2>&1");
+}
+
+static int wifi_psm_apply_now(int on)
+{
+    const char *mode = on ? "on" : "off";
+    char cmd[256];
+    int live;
+    snprintf(cmd, sizeof cmd,
+             "for w in wlan0 wlan1 wlan2 wlan3; do "
+             "[ -d /sys/class/net/$w ] || continue; "
+             "iw dev $w set power_save %s 2>/dev/null; done", mode);
+    (void)system(cmd);
+    usleep(300000);
+    live = wifi_psm_live_state();
+    if (live >= 0 && live != on) {
+        (void)system(cmd);
+        usleep(300000);
+        live = wifi_psm_live_state();
+    }
+    return live;
+}
+
+static int wifi_psm_set_target(int on)
+{
+    wifi_psm_cleanup_legacy();
+    if (wifi_psm_write_target(on) != 0 || wifi_psm_install_hotplug() != 0)
+        return -1;
+    g_wpsm_target = on;
+    g_wpsm = wifi_psm_apply_now(on);
+    if (g_wpsm == -1) g_wpsm = on;
+    return g_wpsm == on ? 0 : -1;
+}
+
+static void wifi_psm_prepare(void)
+{
+    int target = wifi_psm_read_target();
+    int live = wifi_psm_live_state();
+
+    /* The first upgraded boot preserves the currently effective mode. */
+    if (target < 0) target = live == 1 ? 1 : 0;
+    wifi_psm_cleanup_legacy();
+    if (wifi_psm_write_target(target) == 0 && wifi_psm_install_hotplug() == 0) {
+        g_wpsm_target = target;
+        g_wpsm = wifi_psm_apply_now(target);
+        if (g_wpsm == -1) g_wpsm = target;
+    }
+}
+
 /* Read page-2 aux state into the cache: band on/off from netdev operstate (the
  * live truth on this firmware), PSM from `iw power_save`, and the DHCP pool
  * range computed live from uci (lan ip + start/limit offsets). One shell
@@ -741,9 +1030,6 @@ static void wifi_aux_refresh(void)
     FILE *fp = popen(
         "echo W0=$(cat /sys/class/net/wlan0/operstate 2>/dev/null);"
         "echo W2=$(cat /sys/class/net/wlan2/operstate 2>/dev/null);"
-        "ps=$(iw dev wlan0 get power_save 2>/dev/null | grep -o 'o[nf]*' | tail -1);"
-        "[ -z \"$ps\" ] && ps=$(iw dev wlan2 get power_save 2>/dev/null | grep -o 'o[nf]*' | tail -1);"
-        "echo PSM=$([ \"$ps\" = on ] && echo 1 || echo 0);"
         "ip=$(uci -q get network.lan.ipaddr); st=$(uci -q get dhcp.lan.start); lim=$(uci -q get dhcp.lan.limit);"
         "if [ -n \"$ip\" ] && [ -n \"$st\" ]; then pre=${ip%.*}; end=$((st+lim-1)); [ $end -gt 254 ] && end=254;"
         "echo \"POOL=$pre.$st - $pre.$end\"; fi;"
@@ -762,7 +1048,6 @@ static void wifi_aux_refresh(void)
     while (fgets(line, sizeof line, fp)) {
         if      (!strncmp(line, "W0=", 3))   g_w24 = strstr(line, "=up") != NULL;
         else if (!strncmp(line, "W2=", 3))   g_w5  = strstr(line, "=up") != NULL;
-        else if (!strncmp(line, "PSM=", 4))  g_wpsm = atoi(line + 4);
         else if (!strncmp(line, "POOL=", 5)) {
             char *nl = strchr(line, '\n'); if (nl) *nl = 0;
             snprintf(g_dhcp_pool, sizeof g_dhcp_pool, "%s", line + 5);
@@ -787,6 +1072,19 @@ static void wifi_aux_refresh(void)
         }
     }
     pclose(fp);
+
+    {
+        int live = wifi_psm_live_state();
+        uint32_t now = millis();
+        g_wpsm = live == -1 ? g_wpsm_target : live;
+        if (g_wpsm_target >= 0 && live != -1 && live != g_wpsm_target &&
+            (!g_wifi_psm_repair_at || now - g_wifi_psm_repair_at >= 10000)) {
+            g_wifi_psm_repair_at = now;
+            wifi_psm_cleanup_legacy();
+            (void)wifi_psm_install_hotplug();
+            g_wpsm = wifi_psm_apply_now(g_wpsm_target);
+        }
+    }
 }
 
 static void line_value(char *dst, size_t cap, const char *line, size_t prefix_len)
@@ -870,84 +1168,411 @@ static int plugin_status_page(const char *path)
     return path && (strstr(path, "/functions/tailscale.html") ||
                     strstr(path, "/functions/clash.html") ||
                     strstr(path, "/functions/mihomo.html") ||
-                    strstr(path, "/functions/cpu-performance.html"));
+                    strstr(path, "/functions/cpu-performance.html") ||
+                    strstr(path, "/functions/wireguard.html") ||
+                    strstr(path, "/functions/operator-lock.html") ||
+                    strstr(path, "/functions/fmswitch.html"));
 }
 
-static void plugin_status_refresh(const char *path, int force)
+static int plugin_page_named(const char *path, const char *name)
 {
-    uint32_t now = millis();
-    FILE *fp;
-    char line[256];
+    char needle[96];
+    snprintf(needle, sizeof needle, "/functions/%s", name);
+    return path && strstr(path, needle) != NULL;
+}
 
-    if (!plugin_status_page(path)) return;
-    if (!force && g_plugin_status_at && now - g_plugin_status_at < 2000) return;
-    g_plugin_status_at = now;
+static char *trim_text(char *s)
+{
+    char *end;
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
+    end = s + strlen(s);
+    while (end > s && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '\n')) end--;
+    *end = 0;
+    return s;
+}
+
+static void duration_short(char *dst, size_t cap, long long sec)
+{
+    if (sec <= 0) snprintf(dst, cap, "-");
+    else if (sec >= 3600) snprintf(dst, cap, "%lldh %lldm", sec / 3600, (sec % 3600) / 60);
+    else if (sec >= 60) snprintf(dst, cap, "%lldm %llds", sec / 60, sec % 60);
+    else snprintf(dst, cap, "%llds", sec);
+}
+
+static void refresh_tailscale_status(void)
+{
+    const struct plugin_candidate *p = plugin_complete_select(g_ts_candidates, ARRAY_LEN(g_ts_candidates));
+    FILE *fp;
+    char line[512], cmd[2048];
 
     g_ts_installed = g_ts_running = g_ts_connected = g_ts_boot = 0;
-    g_mh_installed = g_mh_running = g_mh_tun = g_mh_rules = 0;
-    g_cpu_installed = 0;
     snprintf(g_ts_pid, sizeof g_ts_pid, "-");
     snprintf(g_ts_ip, sizeof g_ts_ip, "-");
     snprintf(g_ts_version, sizeof g_ts_version, "-");
     snprintf(g_ts_host, sizeof g_ts_host, "-");
     snprintf(g_ts_routes, sizeof g_ts_routes, "-");
-    snprintf(g_mh_pid, sizeof g_mh_pid, "-");
-    snprintf(g_mh_version, sizeof g_mh_version, "-");
-    snprintf(g_mh_mode, sizeof g_mh_mode, "-");
-    snprintf(g_mh_port, sizeof g_mh_port, "-");
-    snprintf(g_mh_ipset, sizeof g_mh_ipset, "-");
-    snprintf(g_cpu_mode, sizeof g_cpu_mode, "unknown");
-    snprintf(g_cpu_gov, sizeof g_cpu_gov, "-");
-    snprintf(g_cpu_cur, sizeof g_cpu_cur, "-");
-    snprintf(g_cpu_min, sizeof g_cpu_min, "-");
-    snprintf(g_cpu_max, sizeof g_cpu_max, "-");
-
-    fp = popen(
-        "echo TS_INST=$([ -x " TAILSCALE_CTL " ] && [ -x " TAILSCALE_DIR "/bin/tailscale ] && echo 1 || echo 0);"
-        "tpid=$(pidof tailscaled 2>/dev/null | awk '{print $1}'); echo TS_PID=${tpid:--};"
-        "tip=$(ip -4 addr show dev tailscale0 2>/dev/null | awk '/inet /{sub(/\\/.*/,\"\",$2);print $2;exit}'); echo TS_IP=${tip:--};"
-        "echo TS_VER=$(sed -n '1{s/[[:space:]].*//;p;q}' " TAILSCALE_DIR "/version.txt 2>/dev/null);"
-        "echo TS_HOST=$(sed -n 's/.*\"hostname\":\"\\([^\"]*\\)\".*/\\1/p' " TAILSCALE_DIR "/config.json 2>/dev/null);"
-        "echo TS_ROUTES=$(sed -n 's/.*\"advertise_routes\":\"\\([^\"]*\\)\".*/\\1/p' " TAILSCALE_DIR "/config.json 2>/dev/null);"
-        "grep -q '\"auto_start\":true' " TAILSCALE_DIR "/config.json 2>/dev/null && echo TS_BOOT=1 || echo TS_BOOT=0;"
-        "echo MH_INST=$([ -x " MIHOMO_CTL " ] && [ -x " MIHOMO_DIR "/mihomo ] && echo 1 || echo 0);"
-        "mpid=$(pidof mihomo 2>/dev/null | awk '{print $1}'); echo MH_PID=${mpid:--};"
-        "[ -d /sys/class/net/utun ] && echo MH_TUN=1 || echo MH_TUN=0;"
-        "ip rule show 2>/dev/null | grep -q 'lookup 2022' && echo MH_RULES=1 || echo MH_RULES=0;"
-        "echo MH_VER=$(" MIHOMO_DIR "/mihomo -v 2>/dev/null | awk 'NR==1{print $3;exit}');"
-        "echo MH_MODE=$(sed -n 's/^mode:[[:space:]]*//p' " MIHOMO_DIR "/config.yaml 2>/dev/null | head -1);"
-        "echo MH_PORT=$(sed -n 's/^mixed-port:[[:space:]]*//p' " MIHOMO_DIR "/config.yaml 2>/dev/null | head -1);"
-        "echo MH_IPSET=$(ipset list chnroute 2>/dev/null | awk -F': ' '/Number of entries/{print $2;exit}');"
-        "if [ -x " CPU_CTL " ]; then " CPU_CTL " status 2>/dev/null; else echo CPU_INST=0; fi",
-        "r");
+    if (!p) return;
+    g_ts_installed = 1;
+    snprintf(cmd, sizeof cmd,
+             "tpid=$(pidof tailscaled 2>/dev/null | awk '{print $1}'); echo TS_PID=${tpid:--};"
+             "tip=$(ip -4 addr show dev tailscale0 2>/dev/null | awk '/inet /{sub(/\\/.*/,\"\",$2);print $2;exit}'); echo TS_IP=${tip:--};"
+             "echo TS_VER=$(sed -n '1{s/[[:space:]].*//;p;q}' '%s/version.txt' 2>/dev/null);"
+             "echo TS_HOST=$(sed -n 's/.*\"hostname\":\"\\([^\"]*\\)\".*/\\1/p' '%s/config.json' 2>/dev/null);"
+             "echo TS_ROUTES=$(sed -n 's/.*\"advertise_routes\":\"\\([^\"]*\\)\".*/\\1/p' '%s/config.json' 2>/dev/null);"
+             "grep -q '\"auto_start\":true' '%s/config.json' 2>/dev/null && echo TS_BOOT=1 || echo TS_BOOT=0;",
+             p->dir, p->dir, p->dir, p->dir);
+    fp = popen(cmd, "r");
     if (!fp) return;
     while (fgets(line, sizeof line, fp)) {
-        if      (!strncmp(line, "TS_INST=", 8))   g_ts_installed = atoi(line + 8);
-        else if (!strncmp(line, "TS_PID=", 7))    line_value(g_ts_pid, sizeof g_ts_pid, line, 7);
+        if      (!strncmp(line, "TS_PID=", 7))    line_value(g_ts_pid, sizeof g_ts_pid, line, 7);
         else if (!strncmp(line, "TS_IP=", 6))     line_value(g_ts_ip, sizeof g_ts_ip, line, 6);
         else if (!strncmp(line, "TS_VER=", 7))    line_value(g_ts_version, sizeof g_ts_version, line, 7);
         else if (!strncmp(line, "TS_HOST=", 8))   line_value(g_ts_host, sizeof g_ts_host, line, 8);
         else if (!strncmp(line, "TS_ROUTES=", 10)) line_value(g_ts_routes, sizeof g_ts_routes, line, 10);
         else if (!strncmp(line, "TS_BOOT=", 8))   g_ts_boot = atoi(line + 8);
-        else if (!strncmp(line, "MH_INST=", 8))   g_mh_installed = atoi(line + 8);
-        else if (!strncmp(line, "MH_PID=", 7))    line_value(g_mh_pid, sizeof g_mh_pid, line, 7);
+    }
+    pclose(fp);
+    g_ts_running = strcmp(g_ts_pid, "-") != 0;
+    g_ts_connected = g_ts_running && strcmp(g_ts_ip, "-") != 0;
+}
+
+static void refresh_mihomo_status(void)
+{
+    const struct plugin_candidate *p = plugin_complete_select(g_mh_candidates, ARRAY_LEN(g_mh_candidates));
+    FILE *fp;
+    char line[512], cmd[2048];
+
+    g_mh_installed = g_mh_running = g_mh_tun = g_mh_rules = 0;
+    snprintf(g_mh_pid, sizeof g_mh_pid, "-");
+    snprintf(g_mh_version, sizeof g_mh_version, "-");
+    snprintf(g_mh_mode, sizeof g_mh_mode, "-");
+    snprintf(g_mh_port, sizeof g_mh_port, "-");
+    snprintf(g_mh_ipset, sizeof g_mh_ipset, "-");
+    if (!p) return;
+    g_mh_installed = 1;
+    snprintf(cmd, sizeof cmd,
+             "mpid=$(pidof mihomo 2>/dev/null | awk '{print $1}'); echo MH_PID=${mpid:--};"
+             "[ -d /sys/class/net/utun ] && echo MH_TUN=1 || echo MH_TUN=0;"
+             "ip rule show 2>/dev/null | grep -q 'lookup 2022' && echo MH_RULES=1 || echo MH_RULES=0;"
+             "echo MH_VER=$('%s' -v 2>/dev/null | awk 'NR==1{print $3;exit}');"
+             "echo MH_MODE=$(sed -n 's/^mode:[[:space:]]*//p' '%s/config.yaml' 2>/dev/null | head -1);"
+             "echo MH_PORT=$(sed -n 's/^mixed-port:[[:space:]]*//p' '%s/config.yaml' 2>/dev/null | head -1);"
+             "echo MH_IPSET=$(ipset list chnroute 2>/dev/null | awk -F': ' '/Number of entries/{print $2;exit}');",
+             p->bin, p->dir, p->dir);
+    fp = popen(cmd, "r");
+    if (!fp) return;
+    while (fgets(line, sizeof line, fp)) {
+        if      (!strncmp(line, "MH_PID=", 7))    line_value(g_mh_pid, sizeof g_mh_pid, line, 7);
         else if (!strncmp(line, "MH_TUN=", 7))    g_mh_tun = atoi(line + 7);
         else if (!strncmp(line, "MH_RULES=", 9))  g_mh_rules = atoi(line + 9);
         else if (!strncmp(line, "MH_VER=", 7))    line_value(g_mh_version, sizeof g_mh_version, line, 7);
         else if (!strncmp(line, "MH_MODE=", 8))   line_value(g_mh_mode, sizeof g_mh_mode, line, 8);
         else if (!strncmp(line, "MH_PORT=", 8))   line_value(g_mh_port, sizeof g_mh_port, line, 8);
         else if (!strncmp(line, "MH_IPSET=", 9))  line_value(g_mh_ipset, sizeof g_mh_ipset, line, 9);
-        else if (!strncmp(line, "CPU_INST=", 9))  g_cpu_installed = atoi(line + 9);
-        else if (!strncmp(line, "CPU_MODE=", 9))  line_value(g_cpu_mode, sizeof g_cpu_mode, line, 9);
-        else if (!strncmp(line, "CPU_GOV=", 8))   line_value(g_cpu_gov, sizeof g_cpu_gov, line, 8);
-        else if (!strncmp(line, "CPU_CUR=", 8))   line_value(g_cpu_cur, sizeof g_cpu_cur, line, 8);
-        else if (!strncmp(line, "CPU_MIN=", 8))   line_value(g_cpu_min, sizeof g_cpu_min, line, 8);
-        else if (!strncmp(line, "CPU_MAX=", 8))   line_value(g_cpu_max, sizeof g_cpu_max, line, 8);
     }
     pclose(fp);
-    g_ts_running = strcmp(g_ts_pid, "-") != 0;
-    g_ts_connected = g_ts_running && strcmp(g_ts_ip, "-") != 0;
     g_mh_running = strcmp(g_mh_pid, "-") != 0;
+}
+
+static void refresh_cpu_status(void)
+{
+    const char *ctl = cpu_ctl_path();
+    FILE *fp;
+    char line[256], cmd[512];
+
+    g_cpu_installed = 0;
+    snprintf(g_cpu_mode, sizeof g_cpu_mode, "unknown");
+    snprintf(g_cpu_gov, sizeof g_cpu_gov, "-");
+    snprintf(g_cpu_cur, sizeof g_cpu_cur, "-");
+    snprintf(g_cpu_min, sizeof g_cpu_min, "-");
+    snprintf(g_cpu_max, sizeof g_cpu_max, "-");
+    if (!cpu_control_available()) return;
+    snprintf(cmd, sizeof cmd, "sh '%s' status 2>/dev/null", ctl);
+    fp = popen(cmd, "r");
+    if (!fp) return;
+    while (fgets(line, sizeof line, fp)) {
+        if      (!strncmp(line, "CPU_INST=", 9)) g_cpu_installed = atoi(line + 9);
+        else if (!strncmp(line, "CPU_MODE=", 9)) line_value(g_cpu_mode, sizeof g_cpu_mode, line, 9);
+        else if (!strncmp(line, "CPU_GOV=", 8))  line_value(g_cpu_gov, sizeof g_cpu_gov, line, 8);
+        else if (!strncmp(line, "CPU_CUR=", 8))  line_value(g_cpu_cur, sizeof g_cpu_cur, line, 8);
+        else if (!strncmp(line, "CPU_MIN=", 8))  line_value(g_cpu_min, sizeof g_cpu_min, line, 8);
+        else if (!strncmp(line, "CPU_MAX=", 8))  line_value(g_cpu_max, sizeof g_cpu_max, line, 8);
+    }
+    pclose(fp);
+}
+
+static void wg_peer_add(const char *pub, const char *endpoint, const char *allowed,
+                        long long handshake, unsigned long long rx, unsigned long long tx)
+{
+    int idx = g_wg_peer_total++;
+    if (handshake > 0 && time(NULL) - handshake <= 180) g_wg_peer_active++;
+    if (idx >= WG_MAX_PEERS) return;
+    struct wg_peer_state *peer = &g_wg_peers[g_wg_peer_n++];
+    snprintf(peer->public_key, sizeof peer->public_key, "%s", pub && *pub ? pub : "-");
+    snprintf(peer->endpoint, sizeof peer->endpoint, "%s", endpoint && *endpoint ? endpoint : "-");
+    snprintf(peer->allowed_ips, sizeof peer->allowed_ips, "%s", allowed && *allowed ? allowed : "-");
+    peer->latest_handshake = handshake;
+    peer->rx_bytes = rx;
+    peer->tx_bytes = tx;
+}
+
+static void wg_load_config_peers(const char *dir)
+{
+    char path[320], line[512], pub[96] = "", endpoint[128] = "", allowed[256] = "";
+    int in_peer = 0;
+    FILE *fp;
+    snprintf(path, sizeof path, "%s/wg-ufi0.conf", dir);
+    fp = fopen(path, "r");
+    if (!fp) return;
+    while (fgets(line, sizeof line, fp)) {
+        char *s = trim_text(line), *eq;
+        if (*s == '[') {
+            if (in_peer && pub[0]) wg_peer_add(pub, endpoint, allowed, 0, 0, 0);
+            in_peer = !strcasecmp(s, "[Peer]");
+            pub[0] = endpoint[0] = allowed[0] = 0;
+            continue;
+        }
+        if (!in_peer || !(eq = strchr(s, '='))) continue;
+        *eq++ = 0;
+        char *key = trim_text(s), *value = trim_text(eq);
+        if (!strcasecmp(key, "PublicKey")) snprintf(pub, sizeof pub, "%s", value);
+        else if (!strcasecmp(key, "Endpoint")) snprintf(endpoint, sizeof endpoint, "%s", value);
+        else if (!strcasecmp(key, "AllowedIPs")) snprintf(allowed, sizeof allowed, "%s", value);
+    }
+    if (in_peer && pub[0]) wg_peer_add(pub, endpoint, allowed, 0, 0, 0);
+    fclose(fp);
+}
+
+static void wg_load_running_peers(const struct plugin_candidate *p)
+{
+    FILE *fp;
+    char cmd[512], line[1024];
+    int first = 1;
+    snprintf(cmd, sizeof cmd, "'%s' show '%s' dump 2>/dev/null", p->bin, g_wg_iface);
+    fp = popen(cmd, "r");
+    if (!fp) return;
+    while (fgets(line, sizeof line, fp)) {
+        char *save = NULL, *cols[8] = {0};
+        int n = 0;
+        if (first) { first = 0; continue; }
+        for (char *v = strtok_r(line, "\t\r\n", &save); v && n < 8; v = strtok_r(NULL, "\t\r\n", &save)) cols[n++] = v;
+        if (n < 7) continue;
+        wg_peer_add(cols[0], cols[2], cols[3], atoll(cols[4]), strtoull(cols[5], NULL, 10), strtoull(cols[6], NULL, 10));
+    }
+    pclose(fp);
+}
+
+static void refresh_wireguard_status(void)
+{
+    const struct plugin_candidate *p = plugin_complete_select(g_wg_candidates, ARRAY_LEN(g_wg_candidates));
+    FILE *fp;
+    char line[512], cmd[512];
+    int have_wg = 0, have_kmod = 0;
+
+    g_wg_installed = g_wg_running = g_wg_deps = g_wg_boot = 0;
+    g_wg_peer_n = g_wg_peer_total = g_wg_peer_active = 0;
+    memset(g_wg_peers, 0, sizeof g_wg_peers);
+    snprintf(g_wg_iface, sizeof g_wg_iface, "wg-ufi0");
+    snprintf(g_wg_address, sizeof g_wg_address, "-");
+    snprintf(g_wg_port, sizeof g_wg_port, "-");
+    snprintf(g_wg_mode, sizeof g_wg_mode, "stopped");
+    snprintf(g_wg_uptime, sizeof g_wg_uptime, "-");
+    if (!p) return;
+    g_wg_installed = 1;
+    snprintf(cmd, sizeof cmd, "sh '%s' status 2>/dev/null", p->ctl);
+    fp = popen(cmd, "r");
+    if (fp) {
+        while (fgets(line, sizeof line, fp)) {
+            if      (!strncmp(line, "wg=", 3))           have_wg = !strncmp(line + 3, "true", 4);
+            else if (!strncmp(line, "kmod=", 5))         have_kmod = !strncmp(line + 5, "true", 4);
+            else if (!strncmp(line, "running=", 8))      g_wg_running = !strncmp(line + 8, "true", 4);
+            else if (!strncmp(line, "interface=", 10))   line_value(g_wg_iface, sizeof g_wg_iface, line, 10);
+            else if (!strncmp(line, "listen_port=", 12)) line_value(g_wg_port, sizeof g_wg_port, line, 12);
+            else if (!strncmp(line, "addresses=", 10))   line_value(g_wg_address, sizeof g_wg_address, line, 10);
+            else if (!strncmp(line, "start_mode=", 11))  line_value(g_wg_mode, sizeof g_wg_mode, line, 11);
+            else if (!strncmp(line, "uptime=", 7))       duration_short(g_wg_uptime, sizeof g_wg_uptime, atoll(line + 7));
+            else if (!strncmp(line, "boot_enabled=", 13)) g_wg_boot = !strncmp(line + 13, "true", 4);
+        }
+        pclose(fp);
+    }
+    g_wg_deps = have_wg && have_kmod;
+    if (g_wg_running && p->bin && access(p->bin, X_OK) == 0) wg_load_running_peers(p);
+    else wg_load_config_peers(p->dir);
+}
+
+static void operator_env_load(const char *path)
+{
+    FILE *fp = fopen(path, "r");
+    char line[256];
+    if (!fp) return;
+    while (fgets(line, sizeof line, fp)) {
+        if      (!strncmp(line, "sim_state=", 10)) line_value(g_op_sim, sizeof g_op_sim, line, 10);
+        else if (!strncmp(line, "operator=", 9))   line_value(g_op_operator, sizeof g_op_operator, line, 9);
+        else if (!strncmp(line, "rat=", 4))        line_value(g_op_rat, sizeof g_op_rat, line, 4);
+        else if (!strncmp(line, "cops_mode=", 10)) line_value(g_op_mode, sizeof g_op_mode, line, 10);
+        else if (!strncmp(line, "registered=", 11)) g_op_registered = !strncmp(line + 11, "true", 4);
+    }
+    fclose(fp);
+}
+
+static int operator_quoted_field(const char **cursor, char *dst, size_t cap)
+{
+    const char *a = strchr(*cursor, '\"'), *b;
+    size_t len;
+    if (!a || !(b = strchr(a + 1, '\"'))) return 0;
+    len = (size_t)(b - a - 1);
+    if (len >= cap) len = cap - 1;
+    memcpy(dst, a + 1, len);
+    dst[len] = 0;
+    *cursor = b + 1;
+    return 1;
+}
+
+static void operator_candidate_add(int status, const char *plmn, const char *name)
+{
+    for (int i = 0; i < g_op_candidate_n; i++) {
+        if (strcmp(g_op_scan[i].plmn, plmn)) continue;
+        if (status == 2 || (status == 1 && g_op_scan[i].status != 2)) g_op_scan[i].status = status;
+        if (!g_op_scan[i].name[0] && name && *name) snprintf(g_op_scan[i].name, sizeof g_op_scan[i].name, "%s", name);
+        return;
+    }
+    g_op_candidate_total++;
+    if (g_op_candidate_n >= OP_MAX_CANDIDATES) return;
+    struct operator_candidate_state *item = &g_op_scan[g_op_candidate_n++];
+    item->status = status;
+    snprintf(item->plmn, sizeof item->plmn, "%s", plmn);
+    snprintf(item->name, sizeof item->name, "%s", name && *name ? name : plmn);
+}
+
+static void operator_scan_load(const char *path)
+{
+    char *raw = read_file(path);
+    const char *p;
+    if (!raw) return;
+    p = raw;
+    while ((p = strchr(p, '('))) {
+        char *end = NULL, long_name[80] = "", short_name[80] = "", plmn[8] = "";
+        long status = strtol(p + 1, &end, 10);
+        const char *q = end;
+        if (end == p + 1 || status < 0 || status > 3 ||
+            !operator_quoted_field(&q, long_name, sizeof long_name) ||
+            !operator_quoted_field(&q, short_name, sizeof short_name) ||
+            !operator_quoted_field(&q, plmn, sizeof plmn)) {
+            p++;
+            continue;
+        }
+        if ((strlen(plmn) == 5 || strlen(plmn) == 6) && strspn(plmn, "0123456789") == strlen(plmn))
+            operator_candidate_add((int)status, plmn, long_name[0] ? long_name : short_name);
+        p = q;
+    }
+    free(raw);
+}
+
+static int operator_rat_valid(const char *value)
+{
+    return value && (!strcmp(value, "auto") || !strcmp(value, "wcdma") ||
+                     !strcmp(value, "lte") || !strcmp(value, "nr_sa"));
+}
+
+static int operator_policy_valid(const char *value)
+{
+    return value && (!strcmp(value, "stay_offline") || !strcmp(value, "restore_auto"));
+}
+
+static void refresh_operator_status(void)
+{
+    const struct plugin_candidate *p = operator_complete_select();
+    char path[320], tmp[192];
+    char *json;
+
+    g_op_installed = g_op_registered = g_op_job_running = g_op_at_busy = 0;
+    g_op_candidate_n = g_op_candidate_total = 0;
+    memset(g_op_scan, 0, sizeof g_op_scan);
+    snprintf(g_op_sim, sizeof g_op_sim, "-");
+    snprintf(g_op_operator, sizeof g_op_operator, "-");
+    snprintf(g_op_rat, sizeof g_op_rat, "-");
+    snprintf(g_op_mode, sizeof g_op_mode, "-");
+    snprintf(g_op_job_status, sizeof g_op_job_status, "idle");
+    snprintf(g_op_job_message, sizeof g_op_job_message, "-");
+    snprintf(g_op_rat_pref, sizeof g_op_rat_pref, "auto");
+    snprintf(g_op_failure_policy, sizeof g_op_failure_policy, "stay_offline");
+    if (!p) return;
+    g_op_installed = 1;
+    snprintf(path, sizeof path, "%s/status.env", p->dir);
+    operator_env_load(path);
+    snprintf(path, sizeof path, "%s/config.json", p->dir);
+    json = read_file(path);
+    if (json) {
+        if (json_get(json, "rat", tmp, sizeof tmp) && operator_rat_valid(tmp))
+            snprintf(g_op_rat_pref, sizeof g_op_rat_pref, "%s", tmp);
+        if (json_get(json, "failure_policy", tmp, sizeof tmp) && operator_policy_valid(tmp))
+            snprintf(g_op_failure_policy, sizeof g_op_failure_policy, "%s", tmp);
+        if (!g_op_selected[0] && json_get(json, "target_plmn", tmp, sizeof tmp) && (strlen(tmp) == 5 || strlen(tmp) == 6))
+            snprintf(g_op_selected, sizeof g_op_selected, "%s", tmp);
+        free(json);
+    }
+    snprintf(path, sizeof path, "%s/job.json", p->dir);
+    json = read_file(path);
+    if (json) {
+        if (json_get(json, "status", tmp, sizeof tmp) && tmp[0]) snprintf(g_op_job_status, sizeof g_op_job_status, "%s", tmp);
+        if (json_get(json, "message", tmp, sizeof tmp) && tmp[0]) snprintf(g_op_job_message, sizeof g_op_job_message, "%s", tmp);
+        g_op_job_running = !strcmp(g_op_job_status, "queued") || !strcmp(g_op_job_status, "running");
+        free(json);
+    }
+    g_op_at_busy = g_op_job_running;
+    snprintf(path, sizeof path, "%s/scan.raw", p->dir);
+    operator_scan_load(path);
+}
+
+static void refresh_fmswitch_status(void)
+{
+    const struct plugin_candidate *p = plugin_script_select(g_fm_candidates, ARRAY_LEN(g_fm_candidates), 0);
+    FILE *fp;
+    char line[512], cmd[512];
+
+    g_fm_installed = 0;
+    g_fm_switching = 0;
+    snprintf(g_fm_provider, sizeof g_fm_provider, "-");
+    snprintf(g_fm_nettype, sizeof g_fm_nettype, "-");
+    snprintf(g_fm_band, sizeof g_fm_band, "-");
+    snprintf(g_fm_signal, sizeof g_fm_signal, "-");
+    snprintf(g_fm_mcc, sizeof g_fm_mcc, "-");
+    snprintf(g_fm_mnc, sizeof g_fm_mnc, "-");
+    snprintf(g_fm_pin, sizeof g_fm_pin, "-");
+    if (!p) return;
+    g_fm_installed = 1;
+    snprintf(cmd, sizeof cmd, "sh '%s' status 2>/dev/null", p->ctl);
+    fp = popen(cmd, "r");
+    if (fp) {
+        while (fgets(line, sizeof line, fp)) {
+            if      (!strncmp(line, "FM_INSTALLED=", 13)) g_fm_installed = atoi(line + 13);
+            else if (!strncmp(line, "FM_PROVIDER=", 12)) line_value(g_fm_provider, sizeof g_fm_provider, line, 12);
+            else if (!strncmp(line, "FM_NETTYPE=", 11)) line_value(g_fm_nettype, sizeof g_fm_nettype, line, 11);
+            else if (!strncmp(line, "FM_BAND=", 8)) line_value(g_fm_band, sizeof g_fm_band, line, 8);
+            else if (!strncmp(line, "FM_SIGNAL=", 10)) line_value(g_fm_signal, sizeof g_fm_signal, line, 10);
+            else if (!strncmp(line, "FM_MCC=", 7)) line_value(g_fm_mcc, sizeof g_fm_mcc, line, 7);
+            else if (!strncmp(line, "FM_MNC=", 7)) line_value(g_fm_mnc, sizeof g_fm_mnc, line, 7);
+            else if (!strncmp(line, "FM_CUR_PIN=", 11)) line_value(g_fm_pin, sizeof g_fm_pin, line, 11);
+            else if (!strncmp(line, "FM_SWITCHING=", 13)) g_fm_switching = atoi(line + 13);
+        }
+        pclose(fp);
+    }
+    if (access("/tmp/fmswitch.pid", F_OK) == 0) g_fm_switching = 1;
+}
+static void plugin_status_refresh(const char *path, int force)
+{
+    uint32_t now = millis();
+    uint32_t interval = plugin_page_named(path, "operator-lock.html") && !g_op_job_running ? 10000 : 2000;
+
+    if (!plugin_status_page(path)) return;
+    if (!force && g_plugin_status_at && now - g_plugin_status_at < interval) return;
+    g_plugin_status_at = now;
+    if (plugin_page_named(path, "tailscale.html")) refresh_tailscale_status();
+    else if (plugin_page_named(path, "clash.html") || plugin_page_named(path, "mihomo.html")) refresh_mihomo_status();
+    else if (plugin_page_named(path, "cpu-performance.html")) refresh_cpu_status();
+    else if (plugin_page_named(path, "wireguard.html")) refresh_wireguard_status();
+    else if (plugin_page_named(path, "operator-lock.html")) refresh_operator_status();
+    else if (plugin_page_named(path, "fmswitch.html")) refresh_fmswitch_status();
 }
 
 /* ---- screen lock (PIN) persistence. The PIN lives in a dotfile under the UI
@@ -998,6 +1623,10 @@ static void load_conf(void)
         else if (sscanf(line, "show_batpct=%d", &v) == 1) g_show_batpct = !!v;
         else if (sscanf(line, "autooff=%d", &v) == 1)    g_autooff_ms = v;
         else if (sscanf(line, "refresh_ms=%d", &v) == 1) g_refresh_ms = normalize_refresh_ms(v);
+        else if (sscanf(line, "chart_cpu_sec=%d", &v) == 1) g_chart_cpu_sec = normalize_chart_sec(v);
+        else if (sscanf(line, "chart_mem_sec=%d", &v) == 1) g_chart_mem_sec = normalize_chart_sec(v);
+        else if (sscanf(line, "chart_net_sec=%d", &v) == 1) g_chart_net_sec = normalize_chart_sec(v);
+        else if (sscanf(line, "chart_batt_sec=%d", &v) == 1) g_chart_batt_sec = normalize_chart_sec(v);
         else if (sscanf(line, "sig_read=%d", &v) == 1)   g_sig_read = !!v;
         else if (sscanf(line, "sig_parse=%d", &v) == 1)  g_sig_parse = !!v;
         else if (sscanf(line, "bright=%d", &v) == 1)     g_saved_bright = v;
@@ -1012,10 +1641,42 @@ static void save_conf(void)
     FILE *fp = fopen(CONF_FILE, "w");
     if (!fp) return;
     fprintf(fp,
-            "theme=%d\nspeed_bits=%d\nshow_batpct=%d\nautooff=%d\nrefresh_ms=%d\nsig_read=%d\nsig_parse=%d\nbright=%d\nst_src=%s\nst_dir=%s\nst_dur=%d\n",
+            "theme=%d\nspeed_bits=%d\nshow_batpct=%d\nautooff=%d\nrefresh_ms=%d\n"
+            "chart_cpu_sec=%d\nchart_mem_sec=%d\nchart_net_sec=%d\nchart_batt_sec=%d\n"
+            "sig_read=%d\nsig_parse=%d\nbright=%d\nst_src=%s\nst_dir=%s\nst_dur=%d\n",
             g_theme, g_speed_bits, g_show_batpct, g_autooff_ms, g_refresh_ms,
+            g_chart_cpu_sec, g_chart_mem_sec, g_chart_net_sec, g_chart_batt_sec,
             g_sig_read, g_sig_parse, backlight_get(), g_st_src, g_st_dir, g_st_dur);
     fclose(fp);
+}
+
+static const char *chart_intervals_html(void)
+{
+    static char buf[4096];
+    static const int secs[] = { 30, 48, 60, 120, 300 };
+    static const char *labels[] = { "30s", "48s", "1min", "2min", "5min" };
+    static const struct { const char *id, *label; int *value; } rows[] = {
+        { "cpu", "CPU", &g_chart_cpu_sec },
+        { "mem", "内存", &g_chart_mem_sec },
+        { "net", "网速", &g_chart_net_sec },
+        { "batt", "电池", &g_chart_batt_sec }
+    };
+    int o = 0;
+
+    o += snprintf(buf + o, sizeof buf - (size_t)o,
+                  "<div class='card chart-settings'><div class='ctitle'>显示区间</div>");
+    for (size_t row = 0; row < sizeof rows / sizeof rows[0]; row++) {
+        o += snprintf(buf + o, sizeof buf - (size_t)o,
+                      "<div class='chart-range-row'><span class='chart-range-label'>%s</span>"
+                      "<span class='chart-range-seg'>", rows[row].label);
+        for (size_t k = 0; k < sizeof secs / sizeof secs[0]; k++)
+            o += snprintf(buf + o, sizeof buf - (size_t)o,
+                          "<a href='act:chartsec:%s:%d' class='chart-range-cell%s'>%s</a>",
+                          rows[row].id, secs[k], *rows[row].value == secs[k] ? " chart-range-on" : "", labels[k]);
+        o += snprintf(buf + o, sizeof buf - (size_t)o, "</span></div>");
+    }
+    snprintf(buf + o, sizeof buf - (size_t)o, "</div>");
+    return buf;
 }
 
 static const char *speedtest_norm_src(const char *src)
@@ -1337,6 +1998,15 @@ static int path_is_signal_page(const char *path)
     return path_is_signal_home(path) || path_is_signal_detail(path);
 }
 
+static int path_is_lock_page(const char *path)
+{
+    const char *base;
+    if (!path) return 0;
+    base = strrchr(path, '/');
+    if (!base) base = path; else base++;
+    return !strcmp(base, "lock.html");
+}
+
 static int signal_live_enabled(void)
 {
     /* Raw reads may stay on for datad, but UI decoded cards obey parse only. */
@@ -1354,6 +2024,7 @@ static int subpage_name_ok(const char *name)
 {
     size_t l;
     if (!name || !*name) return 0;
+    if (name[0] == '.') return 0;
     if (strstr(name, "..") || strchr(name, '/') || strchr(name, '\\')) return 0;
     if (strpbrk(name, "\"'<>&")) return 0;
     l = strlen(name);
@@ -1367,11 +2038,15 @@ static int function_control_api_available(const char *name)
 {
     if (!name) return 0;
     if (!strcmp(name, "tailscale.html"))
-        return access(TAILSCALE_CTL, X_OK) == 0;
+        return plugin_complete_select(g_ts_candidates, ARRAY_LEN(g_ts_candidates)) != NULL;
     if (!strcmp(name, "clash.html") || !strcmp(name, "mihomo.html"))
-        return access(MIHOMO_CTL, X_OK) == 0;
+        return plugin_complete_select(g_mh_candidates, ARRAY_LEN(g_mh_candidates)) != NULL;
     if (!strcmp(name, "cpu-performance.html"))
-        return access(CPU_CTL, X_OK) == 0;
+        return cpu_control_available();
+    if (!strcmp(name, "wireguard.html"))
+        return plugin_complete_select(g_wg_candidates, ARRAY_LEN(g_wg_candidates)) != NULL;
+    if (!strcmp(name, "operator-lock.html"))
+        return operator_complete_select() != NULL;
     return 1;
 }
 
@@ -1517,18 +2192,112 @@ static const char *custom_function_tiles_html(void)
 
     for (int i = 0; i < n; i++) {
         char path[300], raw[96], title[160], href[160];
+        const char *desc = "自定义工具";
         snprintf(path, sizeof path, "%s/%s", FUNCTIONS_DIR, names[i]);
         function_title_for_file(raw, sizeof raw, path, names[i]);
         html_esc(title, sizeof title, raw);
         html_esc(href, sizeof href, names[i]);
+        if (!strcmp(names[i], "tailscale.html")) desc = "组网状态与子网路由";
+        else if (!strcmp(names[i], "clash.html") || !strcmp(names[i], "mihomo.html")) desc = "代理状态与服务控制";
+        else if (!strcmp(names[i], "cpu-performance.html")) desc = "频率策略与温控状态";
+        else if (!strcmp(names[i], "wireguard.html")) desc = "隧道状态与 Peer";
+        else if (!strcmp(names[i], "operator-lock.html")) desc = "扫描并锁定运营商";
+        else if (!strcmp(names[i], "fmswitch.html")) desc = "飞猫分身一键切卡";
         o += snprintf(buf + o, sizeof buf - o,
                       "<a href=\"act:func:%s\" class=\"func-tile func-custom\">"
                       "<span class=\"func-name\">%s</span>"
-                      "<span class=\"func-desc\">自定义页面</span>"
+                      "<span class=\"func-desc\">%s</span>"
                       "</a>",
-                      href, title);
+                      href, title, desc);
         if (o >= (int)sizeof(buf) - 256) break;
     }
+    return buf;
+}
+
+static void bytes_short(char *dst, size_t cap, unsigned long long n)
+{
+    if (n >= 1024ULL * 1024ULL * 1024ULL) snprintf(dst, cap, "%.1f GB", (double)n / (1024.0 * 1024.0 * 1024.0));
+    else if (n >= 1024ULL * 1024ULL) snprintf(dst, cap, "%.1f MB", (double)n / (1024.0 * 1024.0));
+    else if (n >= 1024ULL) snprintf(dst, cap, "%.1f KB", (double)n / 1024.0);
+    else snprintf(dst, cap, "%llu B", n);
+}
+
+static const char *wireguard_peer_html(void)
+{
+    static char buf[14000];
+    int o = 0;
+    time_t now = time(NULL);
+    buf[0] = 0;
+    if (!g_wg_peer_n) {
+        snprintf(buf, sizeof buf, "<div class='compact-empty'>暂无 Peer 配置</div>");
+        return buf;
+    }
+    for (int i = 0; i < g_wg_peer_n && o < (int)sizeof(buf) - 600; i++) {
+        struct wg_peer_state *p = &g_wg_peers[i];
+        char key[24], endpoint[240], allowed[420], rx[32], tx[32], age[48];
+        const char *state = "未连接", *cls = "muted";
+        snprintf(key, sizeof key, "%.12s...", p->public_key);
+        html_esc(endpoint, sizeof endpoint, p->endpoint);
+        html_esc(allowed, sizeof allowed, p->allowed_ips);
+        bytes_short(rx, sizeof rx, p->rx_bytes);
+        bytes_short(tx, sizeof tx, p->tx_bytes);
+        if (p->latest_handshake > 0) {
+            long long sec = (long long)now - p->latest_handshake;
+            if (sec < 0) sec = 0;
+            duration_short(age, sizeof age, sec);
+            if (sec <= 180) { state = "活跃"; cls = "ok"; }
+            else { state = "过期"; cls = "warn"; }
+        } else snprintf(age, sizeof age, "从未握手");
+        o += snprintf(buf + o, sizeof buf - (size_t)o,
+                      "<div class='peer-row'>"
+                      "<div class='peer-head'><span class='peer-key'>%s</span><span class='peer-state %s'>%s</span></div>"
+                      "<div class='peer-detail'>%s · %s</div>"
+                      "<div class='peer-meta'>%s · RX %s · TX %s</div>"
+                      "</div>", key, cls, state, endpoint, allowed, age, rx, tx);
+    }
+    if (g_wg_peer_total > g_wg_peer_n)
+        snprintf(buf + o, sizeof buf - (size_t)o,
+                 "<div class='compact-more'>另有 %d 个 Peer，请在网页端查看</div>",
+                 g_wg_peer_total - g_wg_peer_n);
+    return buf;
+}
+
+static const char *operator_list_html(void)
+{
+    static char buf[15000];
+    int o = 0;
+    if (!g_op_candidate_n) {
+        snprintf(buf, sizeof buf, "<div class='compact-empty'>暂无扫描结果</div>");
+        return buf;
+    }
+    if (!g_op_selected[0]) {
+        for (int i = 0; i < g_op_candidate_n; i++)
+            if (g_op_scan[i].status == 2) {
+                snprintf(g_op_selected, sizeof g_op_selected, "%s", g_op_scan[i].plmn);
+                break;
+            }
+    }
+    for (int i = 0; i < g_op_candidate_n && o < (int)sizeof(buf) - 500; i++) {
+        struct operator_candidate_state *item = &g_op_scan[i];
+        char name[200];
+        const char *state = item->status == 2 ? "当前" : item->status == 1 ? "可用" : item->status == 3 ? "禁止" : "未知";
+        const char *state_cls = item->status == 2 ? "ok" : item->status == 1 ? "ready" : item->status == 3 ? "bad" : "muted";
+        int selected = !strcmp(g_op_selected, item->plmn);
+        html_esc(name, sizeof name, item->name);
+        if (item->status == 3) {
+            o += snprintf(buf + o, sizeof buf - (size_t)o,
+                          "<div class='operator-row disabled%s'><span class='operator-main'>%s<small>%s</small></span><span class='operator-state %s'>%s</span></div>",
+                          selected ? " selected" : "", name, item->plmn, state_cls, state);
+        } else {
+            o += snprintf(buf + o, sizeof buf - (size_t)o,
+                          "<a href='act:opselect:%s' class='operator-row%s'><span class='operator-main'>%s<small>%s</small></span><span class='operator-state %s'>%s</span></a>",
+                          item->plmn, selected ? " selected" : "", name, item->plmn, state_cls, state);
+        }
+    }
+    if (g_op_candidate_total > g_op_candidate_n)
+        snprintf(buf + o, sizeof buf - (size_t)o,
+                 "<div class='compact-more'>另有 %d 项，请在网页端查看</div>",
+                 g_op_candidate_total - g_op_candidate_n);
     return buf;
 }
 
@@ -2119,12 +2888,21 @@ static int signal_level(int rsrp)
     return lvl;
 }
 
-/* ---- rolling history for the charts page (sampled once per second) ---- */
-#define HIST 48
-static int    h_n;
-static int    h_cpu[HIST], h_mem[HIST], h_ct[HIST], h_bt[HIST], h_pwr[HIST];
-static long   h_rx[HIST], h_tx[HIST];
-static time_t h_last;
+/* ---- rolling chart history, independent from page rendering ---- */
+#define CHART_HIST 301
+struct chart_sample {
+    uint32_t monotonic_sec;
+    int32_t cpu_usage;
+    int32_t cpu_temp;
+    int32_t mem_used_pct;
+    int32_t rx_speed;
+    int32_t tx_speed;
+    int32_t battery_temp;
+    int32_t battery_power_mw;
+};
+static struct chart_sample g_chart_hist[CHART_HIST];
+static int g_chart_head, g_chart_count;
+static uint32_t g_chart_last_attempt_sec;
 
 /* charge (charger input) or discharge (battery) power, in milliwatts. */
 /* Battery power in milliwatts (use battery_voltage * |battery_current|). */
@@ -2134,26 +2912,74 @@ static int power_mw(const devui_data_t *d)
     return (int)(w * 1000);
 }
 
-static void hist_push(const devui_data_t *d)
+static int32_t chart_i32(long v)
 {
-    if (h_n < HIST) h_n++;
-    else {
-        memmove(h_cpu, h_cpu + 1, (HIST - 1) * sizeof h_cpu[0]);
-        memmove(h_mem, h_mem + 1, (HIST - 1) * sizeof h_mem[0]);
-        memmove(h_ct,  h_ct + 1,  (HIST - 1) * sizeof h_ct[0]);
-        memmove(h_bt,  h_bt + 1,  (HIST - 1) * sizeof h_bt[0]);
-        memmove(h_pwr, h_pwr + 1, (HIST - 1) * sizeof h_pwr[0]);
-        memmove(h_rx,  h_rx + 1,  (HIST - 1) * sizeof h_rx[0]);
-        memmove(h_tx,  h_tx + 1,  (HIST - 1) * sizeof h_tx[0]);
+    if (v > INT32_MAX) return INT32_MAX;
+    if (v < INT32_MIN) return INT32_MIN;
+    return (int32_t)v;
+}
+
+static void chart_hist_push(uint32_t sec, const devui_data_t *d)
+{
+    int i;
+    if (!d || d->cpu_usage < 0 || d->mem_used_pct < 0 ||
+        d->rx_speed < 0 || d->tx_speed < 0)
+        return;
+    if (g_chart_count < CHART_HIST) {
+        i = (g_chart_head + g_chart_count) % CHART_HIST;
+        g_chart_count++;
+    } else {
+        i = g_chart_head;
+        g_chart_head = (g_chart_head + 1) % CHART_HIST;
     }
-    int i = h_n - 1;
-    h_cpu[i] = d->cpu_usage < 0 ? 0 : (int)d->cpu_usage;
-    h_mem[i] = d->mem_used_pct < 0 ? 0 : (int)d->mem_used_pct;
-    h_ct[i]  = (int)d->cpu_temp;
-    h_bt[i]  = d->bat_temp;
-    h_pwr[i] = power_mw(d);
-    h_rx[i]  = d->rx_speed;
-    h_tx[i]  = d->tx_speed;
+    g_chart_hist[i].monotonic_sec = sec;
+    g_chart_hist[i].cpu_usage = chart_i32(d->cpu_usage);
+    g_chart_hist[i].cpu_temp = chart_i32(d->cpu_temp);
+    g_chart_hist[i].mem_used_pct = chart_i32(d->mem_used_pct);
+    g_chart_hist[i].rx_speed = chart_i32(d->rx_speed);
+    g_chart_hist[i].tx_speed = chart_i32(d->tx_speed);
+    g_chart_hist[i].battery_temp = chart_i32(d->bat_temp);
+    g_chart_hist[i].battery_power_mw = chart_i32(power_mw(d));
+}
+
+static void chart_sample_tick(int awake)
+{
+    uint32_t sec = monotonic_seconds();
+    devui_data_t d;
+    if (sec == g_chart_last_attempt_sec) return;
+    g_chart_last_attempt_sec = sec;
+    if ((awake ? data_refresh_live(&d) : data_chart_metrics(&d)))
+        chart_hist_push(sec, &d);
+}
+
+enum chart_field {
+    CHART_CPU, CHART_CPU_TEMP, CHART_MEM, CHART_RX, CHART_TX,
+    CHART_BATT_TEMP, CHART_BATT_POWER
+};
+
+static int chart_history_values(enum chart_field field, uint32_t *times, int *vals,
+                                int window_sec, uint32_t now_sec)
+{
+    int n = 0;
+    uint32_t left = now_sec > (uint32_t)window_sec ? now_sec - (uint32_t)window_sec : 0;
+    for (int k = 0; k < g_chart_count; k++) {
+        const struct chart_sample *s = &g_chart_hist[(g_chart_head + k) % CHART_HIST];
+        int32_t v;
+        if (s->monotonic_sec < left || s->monotonic_sec > now_sec) continue;
+        switch (field) {
+        case CHART_CPU:        v = s->cpu_usage; break;
+        case CHART_CPU_TEMP:   v = s->cpu_temp; break;
+        case CHART_MEM:        v = s->mem_used_pct; break;
+        case CHART_RX:         v = s->rx_speed; break;
+        case CHART_TX:         v = s->tx_speed; break;
+        case CHART_BATT_TEMP:  v = s->battery_temp; break;
+        default:               v = s->battery_power_mw; break;
+        }
+        times[n] = s->monotonic_sec;
+        vals[n] = (int)v;
+        n++;
+    }
+    return n;
 }
 
 /* Draw the chart placeholders (#chart-cpu/#chart-mem/#chart-net) natively as
@@ -2161,28 +2987,46 @@ static void hist_push(const devui_data_t *d)
  * no-op on pages without those elements. */
 static void draw_charts(void)
 {
+    static uint32_t times[CHART_HIST];
+    static int a[CHART_HIST], bvals[CHART_HIST];
+    uint32_t now_sec = monotonic_seconds();
+    int n, nb;
     int x, y, w, h;
     if (html_view_rect("#chart-cpu", &x, &y, &w, &h)) {
-        html_view_polyline(x, y, w, h, h_cpu, h_n, 0, 100, 0x4f, 0x8b, 0xff, 2, 26); /* CPU usage, blue */
-        html_view_polyline(x, y, w, h, h_ct,  h_n, 20, 70, 0xff, 0x8c, 0x42, 2, 0);  /* temperature, orange */
+        n = chart_history_values(CHART_CPU, times, a, g_chart_cpu_sec, now_sec);
+        html_view_timed_polyline(x, y, w, h, times, a, n, now_sec, g_chart_cpu_sec,
+                                 0, 100, 0x4f, 0x8f, 0xe8, 2, 26);
+        n = chart_history_values(CHART_CPU_TEMP, times, a, g_chart_cpu_sec, now_sec);
+        html_view_timed_polyline(x, y, w, h, times, a, n, now_sec, g_chart_cpu_sec,
+                                 20, 70, 0xd5, 0xa6, 0x3d, 2, 0);
     }
-    if (html_view_rect("#chart-mem", &x, &y, &w, &h))
-        html_view_polyline(x, y, w, h, h_mem, h_n, 0, 100, 0x46, 0xc4, 0x6f, 2, 34); /* memory, green */
+    if (html_view_rect("#chart-mem", &x, &y, &w, &h)) {
+        n = chart_history_values(CHART_MEM, times, a, g_chart_mem_sec, now_sec);
+        html_view_timed_polyline(x, y, w, h, times, a, n, now_sec, g_chart_mem_sec,
+                                 0, 100, 0x55, 0xbc, 0x7b, 2, 34);
+    }
     if (html_view_rect("#chart-net", &x, &y, &w, &h)) {
-        static int rxi[HIST], txi[HIST];
-        long mx = 1;
-        for (int i = 0; i < h_n; i++) { if (h_rx[i] > mx) mx = h_rx[i]; if (h_tx[i] > mx) mx = h_tx[i]; }
-        for (int i = 0; i < h_n; i++) { rxi[i] = (int)h_rx[i]; txi[i] = (int)h_tx[i]; }
-        html_view_polyline(x, y, w, h, rxi, h_n, 0, (int)mx, 0x4f, 0x8b, 0xff, 2, 22); /* downlink, blue */
-        html_view_polyline(x, y, w, h, txi, h_n, 0, (int)mx, 0xff, 0x8c, 0x42, 2, 0);  /* uplink, orange */
+        int mx = 1;
+        n = chart_history_values(CHART_RX, times, a, g_chart_net_sec, now_sec);
+        nb = chart_history_values(CHART_TX, times, bvals, g_chart_net_sec, now_sec);
+        for (int i = 0; i < n; i++) if (a[i] > mx) mx = a[i];
+        for (int i = 0; i < nb; i++) if (bvals[i] > mx) mx = bvals[i];
+        html_view_timed_polyline(x, y, w, h, times, a, n, now_sec, g_chart_net_sec,
+                                 0, mx, 0x4f, 0x8f, 0xe8, 2, 22);
+        html_view_timed_polyline(x, y, w, h, times, bvals, nb, now_sec, g_chart_net_sec,
+                                 0, mx, 0xd5, 0xa6, 0x3d, 2, 0);
     }
     if (html_view_rect("#chart-batt", &x, &y, &w, &h)) {
-        static int tn[HIST], pn[HIST];
         int mx = 1;
-        for (int i = 0; i < h_n; i++) if (h_pwr[i] > mx) mx = h_pwr[i];
-        for (int i = 0; i < h_n; i++) { tn[i] = (h_bt[i] - 20) * 2; pn[i] = (int)((long)h_pwr[i] * 100 / mx); }
-        html_view_polyline(x, y, w, h, pn, h_n, 0, 100, 0x4f, 0x8b, 0xff, 2, 22); /* power, blue */
-        html_view_polyline(x, y, w, h, tn, h_n, 0, 100, 0xff, 0x8c, 0x42, 2, 0);  /* temperature, orange */
+        n = chart_history_values(CHART_BATT_POWER, times, a, g_chart_batt_sec, now_sec);
+        nb = chart_history_values(CHART_BATT_TEMP, times, bvals, g_chart_batt_sec, now_sec);
+        for (int i = 0; i < n; i++) if (a[i] > mx) mx = a[i];
+        for (int i = 0; i < n; i++) a[i] = (int)((int64_t)a[i] * 100 / mx);
+        for (int i = 0; i < nb; i++) bvals[i] = (bvals[i] - 20) * 2;
+        html_view_timed_polyline(x, y, w, h, times, a, n, now_sec, g_chart_batt_sec,
+                                 0, 100, 0x4f, 0x8f, 0xe8, 2, 22);
+        html_view_timed_polyline(x, y, w, h, times, bvals, nb, now_sec, g_chart_batt_sec,
+                                 0, 100, 0xd5, 0xa6, 0x3d, 2, 0);
     }
 }
 
@@ -2208,7 +3052,7 @@ static void draw_lock_icon(void)
     /* body + keyhole (keyhole in page bg tone to look punched through) */
     html_view_fill_round_rect(cx - 10, cy + 1, 20, 15, 4, lv, lv, lv, 255);
     html_view_fill_round_rect(cx - 2, cy + 6, 4, 4, 2,
-                              dark ? 0x15 : 0xec, dark ? 0x16 : 0xee, dark ? 0x1a : 0xf1, 255);
+                              dark ? 0x0d : 0xee, dark ? 0x12 : 0xf3, dark ? 0x19 : 0xf8, 255);
 }
 
 /* SMS detail dialog + status-bar envelope state. */
@@ -2217,6 +3061,16 @@ static int  g_sms_unread_now;  /* unread SMS present -> draw the status-bar enve
 static char g_sms_num[40], g_sms_date[16], g_sms_text[DEVUI_SMS_TEXT_MAX];   /* opened message */
 static int  g_sms_scroll, g_sms_scroll_max;
 static int  g_sms_view_x, g_sms_view_y, g_sms_view_w, g_sms_view_h;
+
+/* Discard all latched input when the dialog closes so an old release cannot
+ * be replayed against the message card exposed underneath. */
+static void sms_close(touch_input_t *touch, int *need_render)
+{
+    g_sms_open = -1;
+    g_sms_scroll = g_sms_scroll_max = 0;
+    touch_input_clear_taps(touch);
+    *need_render = 1;
+}
 
 /* Draw a small envelope in the fixed status bar, just right of the clock, when
  * there are unread messages. Native shape; the font has no envelope glyph. */
@@ -2227,7 +3081,7 @@ static void draw_sms_icon(void)
     int ex = 8 + html_view_text_width_px(g_stat_time, 16) + 7;
     int ey = (26 - eh) / 2;
     /* body: blue rounded rectangle */
-    html_view_fill_round_rect(ex, ey, ew, eh, 2, 0x2f, 0x6f, 0xe0, 255);
+    html_view_fill_round_rect(ex, ey, ew, eh, 2, 0x4f, 0x8f, 0xe8, 255);
     /* flap: white inverted-V from the two top corners down to center */
     int xs[3] = { ex + 1, ex + ew - 1, ex + ew / 2 };
     int ys[3] = { ey + 1, ey + 1,      ey + eh / 2 + 1 };
@@ -2238,12 +3092,12 @@ static void draw_sms_icon(void)
 static void draw_native_statusbar(void)
 {
     const int dark = !g_theme;
-    const int bg_r = dark ? 0x1d : 0xd8, bg_g = dark ? 0x27 : 0xe2, bg_b = dark ? 0x33 : 0xf0;
-    const int fg_r = dark ? 0xe9 : 0x1b, fg_g = dark ? 0xeb : 0x1d, fg_b = dark ? 0xee : 0x22;
-    const int dim_r = dark ? 0x5b : 0xa6, dim_g = dark ? 0x66 : 0xae, dim_b = dark ? 0x74 : 0xb8;
+    const int bg_r = dark ? 0x11 : 0xdc, bg_g = dark ? 0x1b : 0xe7, bg_b = dark ? 0x27 : 0xf2;
+    const int fg_r = dark ? 0xee : 0x17, fg_g = dark ? 0xf4 : 0x22, fg_b = dark ? 0xfb : 0x32;
+    const int dim_r = dark ? 0x6f : 0x7a, dim_g = dark ? 0x80 : 0x89, dim_b = dark ? 0x94 : 0x99;
 
     html_view_fill_rect(0, 0, 320, 26, bg_r, bg_g, bg_b, 255);
-    html_view_draw_text_px(8, 4, g_stat_time, 16, 0, fg_r, fg_g, fg_b, 255);
+    html_view_draw_text_px(8, 5, g_stat_time, 15, 0, fg_r, fg_g, fg_b, 255);
 
     const int bat_x = 279, bat_y = 5, bat_w = 35, bat_h = 16;
     const int tip_x = bat_x + bat_w, tip_y = bat_y + 5;
@@ -2255,9 +3109,9 @@ static void draw_native_statusbar(void)
     const int bar_left = sig_left + bx[0];
     const int bar_right = sig_left + bx[4] + bw[4];
     const int group_gap = bat_x - bar_right;
-    int sw = html_view_text_width_px(g_stat_speed, 13);
+    int sw = html_view_text_width_px(g_stat_speed, 12);
     int sx = bar_left - group_gap - sw; if (sx < 84) sx = 84;
-    html_view_draw_text_px(sx, 5, g_stat_speed, 13, 0, fg_r, fg_g, fg_b, 255);
+    html_view_draw_text_px(sx, 6, g_stat_speed, 12, 0, fg_r, fg_g, fg_b, 255);
 
     const int base = sig_y + sig_h + 1;
     for (int i = 0; i < 5; i++) {
@@ -2277,14 +3131,14 @@ static void draw_native_statusbar(void)
     if (dark)
         html_view_fill_round_rect(bat_x + 1, bat_y + 1, bat_w - 2, bat_h - 2, 3, bg_r, bg_g, bg_b, 255);
     else
-        html_view_fill_round_rect(bat_x + 1, bat_y + 1, bat_w - 2, bat_h - 2, 3, 0xd6, 0xdc, 0xe4, 255);
+        html_view_fill_round_rect(bat_x + 1, bat_y + 1, bat_w - 2, bat_h - 2, 3, 0xcb, 0xd7, 0xe4, 255);
     html_view_fill_round_rect(tip_x, tip_y, 2, 7, 1, fg_r, fg_g, fg_b, 255);
 
     int bat_pct = clampi(g_stat_bat, 0, 100);
     int draw_charging = g_charging;
     int fr = fg_r, fgc = fg_g, fb = fg_b;
-    if (draw_charging) { fr = 0x5e; fgc = 0xc8; fb = 0x5e; }
-    else if (g_stat_lowbat) { fr = 0xe8; fgc = 0x53; fb = 0x3a; }
+    if (draw_charging) { fr = 0x55; fgc = 0xbc; fb = 0x7b; }
+    else if (g_stat_lowbat) { fr = 0xd4; fgc = 0x5c; fb = 0x55; }
     int fill_w = (bat_w - 4) * bat_pct / 100;
     if (fill_w > 0)
         html_view_fill_round_rect(bat_x + 2, bat_y + 2, fill_w, bat_h - 4, 2, fr, fgc, fb, 255);
@@ -2439,6 +3293,151 @@ static char g_net_pending[16]; /* optimistic net mode until net_select catches u
 static char g_uni_sa[256], g_uni_nsa[256], g_uni_lte[256];   /* available bands (max seen) */
 static char g_sel_sa[256], g_sel_nsa[256], g_sel_lte[256];   /* selected (to lock) */
 
+/* ---- dual-SIM slot switch (U60 Pro dual-SIM models only) ----
+ * Slot 1 is the removable/self-inserted SIM; slot 2 is the built-in SIM. The
+ * stock modem API may leave the inactive slot's SIM fields empty, so presence
+ * is determined only by support_dual_sim and never by sim2_states. */
+#define SIM_SWITCH_RC  "/tmp/u60-devui-sim-switch.rc"
+#define SIM_SWITCH_LOG "/tmp/u60-devui-sim-switch.log"
+static int g_sim_dual = -1;          /* -1 unknown, 0 single-SIM, 1 dual-SIM */
+static int g_sim_slot = -1;          /* 1 removable, 2 built-in */
+static int g_sim_confirm_slot;
+static int g_sim_switch_target;
+static int g_sim_switching;
+static uint32_t g_sim_refresh_at;
+static uint32_t g_sim_confirm_until;
+static uint32_t g_sim_switch_until;
+
+static const char *sim_slot_label(int slot)
+{
+    return slot == 1 ? "自插卡" : slot == 2 ? "内置卡" : "未知卡槽";
+}
+
+static int sim_switch_rc_read(int *rc)
+{
+    char line[24];
+    char *end = NULL;
+    long value;
+    if (!read_line_path(SIM_SWITCH_RC, line, sizeof line)) return 0;
+    value = strtol(line, &end, 10);
+    if (end == line) return 0;
+    *rc = (int)value;
+    return 1;
+}
+
+static void sim_switch_finish(uint32_t now, int ok, const char *reason)
+{
+    int target = g_sim_switch_target;
+    g_sim_switching = 0;
+    g_sim_switch_target = 0;
+    g_sim_switch_until = 0;
+    unlink(SIM_SWITCH_RC);
+    if (ok)
+        snprintf(g_toast, sizeof g_toast, "已切换到%s", sim_slot_label(target));
+    else
+        snprintf(g_toast, sizeof g_toast, "%s", reason ? reason : "SIM 卡切换失败");
+    g_toast_until = now + 2200;
+}
+
+/* Returns 1 when visible SIM state changed. A failed read preserves the last
+ * known dual-SIM capability and slot so a transient modem restart does not
+ * make the controls disappear or falsely highlight the target slot. */
+static int sim_slot_refresh(uint32_t now, int force)
+{
+    uint32_t interval = g_sim_switching ? 1000U : 5000U;
+    FILE *fp;
+    char line[64];
+    int dual = -1, slot = -1;
+    int old_dual = g_sim_dual, old_slot = g_sim_slot;
+    int old_switching = g_sim_switching;
+    int rc;
+
+    if (!force && g_sim_refresh_at && now - g_sim_refresh_at < interval) return 0;
+    g_sim_refresh_at = now;
+    fp = popen(
+        "j=$(ubus -t 3 call zwrt_zte_mdm.api get_sim_info_before '{}' 2>/dev/null); "
+        "printf 'DUAL=%s\\nSLOT=%s\\n' "
+        "\"$(printf '%s' \"$j\" | jsonfilter -e '@.support_dual_sim' 2>/dev/null)\" "
+        "\"$(printf '%s' \"$j\" | jsonfilter -e '@.current_sim_slot' 2>/dev/null)\"",
+        "r");
+    if (fp) {
+        while (fgets(line, sizeof line, fp)) {
+            if (!strncmp(line, "DUAL=", 5) && (line[5] == '0' || line[5] == '1')) dual = line[5] - '0';
+            else if (!strncmp(line, "SLOT=", 5) && (line[5] == '1' || line[5] == '2')) slot = line[5] - '0';
+        }
+        pclose(fp);
+    }
+    if (dual >= 0) g_sim_dual = dual;
+    if (slot >= 0) g_sim_slot = slot;
+
+    if (g_sim_switching) {
+        if (g_sim_slot == g_sim_switch_target) {
+            sim_switch_finish(now, 1, NULL);
+        } else if (sim_switch_rc_read(&rc) && rc != 0) {
+            sim_switch_finish(now, 0, "SIM 卡切换命令失败");
+        } else if ((int32_t)(now - g_sim_switch_until) >= 0) {
+            sim_switch_finish(now, 0, "SIM 卡切换超时");
+        }
+    }
+    return old_dual != g_sim_dual || old_slot != g_sim_slot || old_switching != g_sim_switching;
+}
+
+static int sim_switch_start(int slot, uint32_t now)
+{
+    char cmd[384];
+    if (slot != 1 && slot != 2) return -1;
+    unlink(SIM_SWITCH_RC);
+    unlink(SIM_SWITCH_LOG);
+    if (snprintf(cmd, sizeof cmd,
+                 "(ubus -t 20 call zwrt_zte_mdm.api zwrt_zte_mdm_activate_sim "
+                 "'{\"sim_card_id\":%d}' >" SIM_SWITCH_LOG " 2>&1; "
+                 "echo $? >" SIM_SWITCH_RC ") &", slot) >= (int)sizeof cmd)
+        return -1;
+    if (system(cmd) != 0) return -1;
+    g_sim_switching = 1;
+    g_sim_switch_target = slot;
+    g_sim_switch_until = now + 60000U;
+    g_sim_confirm_slot = 0;
+    g_sim_confirm_until = 0;
+    g_sim_refresh_at = 0;
+    snprintf(g_toast, sizeof g_toast, "正在切换到%s", sim_slot_label(slot));
+    g_toast_until = now + 2200;
+    return 0;
+}
+
+static void sim_slot_action(int slot, uint32_t now)
+{
+    (void)sim_slot_refresh(now, 1);
+    if (g_sim_dual != 1) {
+        snprintf(g_toast, sizeof g_toast, "当前设备不支持双卡切换");
+        g_toast_until = now + 1800;
+        return;
+    }
+    if (g_sim_switching) {
+        snprintf(g_toast, sizeof g_toast, "SIM 卡正在切换中");
+        g_toast_until = now + 1800;
+        return;
+    }
+    if (slot == g_sim_slot) {
+        g_sim_confirm_slot = 0;
+        g_sim_confirm_until = 0;
+        snprintf(g_toast, sizeof g_toast, "当前正在使用%s", sim_slot_label(slot));
+        g_toast_until = now + 1800;
+        return;
+    }
+    if (g_sim_confirm_slot == slot && (int32_t)(g_sim_confirm_until - now) > 0) {
+        if (sim_switch_start(slot, now) != 0) {
+            snprintf(g_toast, sizeof g_toast, "无法启动 SIM 卡切换");
+            g_toast_until = now + 1800;
+        }
+        return;
+    }
+    g_sim_confirm_slot = slot;
+    g_sim_confirm_until = now + 4000U;
+    snprintf(g_toast, sizeof g_toast, "请再次点击%s确认", sim_slot_label(slot));
+    g_toast_until = now + 1800;
+}
+
 static int band_count(const char *s) { if (!s[0]) return 0; int n = 1; for (; *s; s++) if (*s == ',') n++; return n; }
 
 static int band_in(const char *list, const char *b)
@@ -2513,6 +3512,20 @@ static int normalize_refresh_ms(int ms)
         return ms;
     default:
         return 1000;
+    }
+}
+
+static int normalize_chart_sec(int sec)
+{
+    switch (sec) {
+    case 30:
+    case 48:
+    case 60:
+    case 120:
+    case 300:
+        return sec;
+    default:
+        return 48;
     }
 }
 
@@ -4096,7 +5109,6 @@ static int build_kv(struct kv *t, const char *path)
     snprintf(s_np, sizeof s_np, "%d", g_npages);
 
     time_t now = time(NULL); struct tm tmv; localtime_r(&now, &tmv);
-    if (now != h_last) { hist_push(&d); h_last = now; }   /* sample once per second */
     snprintf(s_time, sizeof s_time, "%02d:%02d", tmv.tm_hour, tmv.tm_min);
     snprintf(s_sigrefresh, sizeof s_sigrefresh, "%02d:%02d:%02d",
              tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
@@ -4671,8 +5683,13 @@ static int build_kv(struct kv *t, const char *path)
 
     /* ---- band lock: universe grows to the largest set seen; selection mirrors
      * the live lock unless the user is editing in the modal ---- */
-    static char s_netseg[640], s_cursa[300], s_curnsa[300], s_curlte[300], s_toast[120];
+    static char s_netseg[640], s_simswitch[1200], s_cursa[300], s_curnsa[300], s_curlte[300], s_toast[120];
     static char s_ts_action_log[2200], s_mh_action_log[2200], s_cpu_action_log[2200];
+    static char s_wg_action_log[2200], s_op_action_log[2200];
+    static char s_wg_peers[24], s_wg_active[24], s_op_selected[16], s_op_job[440];
+    static char s_wg_iface[80], s_wg_address[220], s_wg_port[48], s_wg_mode[64];
+    static char s_op_sim[80], s_op_operator[96], s_op_rat[80], s_op_mode[64];
+    static char s_op_rat_pref[48], s_op_policy[64], s_op_job_raw[220];
     if (band_count(d.sa_bands)  >= band_count(g_uni_sa))  snprintf(g_uni_sa,  sizeof g_uni_sa,  "%s", d.sa_bands);
     if (band_count(d.nsa_bands) >= band_count(g_uni_nsa)) snprintf(g_uni_nsa, sizeof g_uni_nsa, "%s", d.nsa_bands);
     if (band_count(d.lte_bands) >= band_count(g_uni_lte)) snprintf(g_uni_lte, sizeof g_uni_lte, "%s", d.lte_bands);
@@ -4695,6 +5712,36 @@ static int build_kv(struct kv *t, const char *path)
             o += snprintf(s_netseg + o, sizeof s_netseg - o, "<a href='act:net:%s' class='segc%s'>%s</a>",
                           g_netmodes[k].v, k == hl ? " seg-on" : "", g_netmodes[k].lab);
         snprintf(s_netseg + o, sizeof s_netseg - o, "</div>");
+    }
+    s_simswitch[0] = 0;
+    if (g_sim_dual == 1) {
+        const char *hint = "切卡会短暂断网，点击目标卡后需在 4 秒内再次点击确认";
+        char dynamic_hint[160];
+        int o = snprintf(s_simswitch, sizeof s_simswitch,
+                         "<div class='card simcard'><div class='title'>SIM 卡切换</div>"
+                         "<div class='seg seg2 simseg'>");
+        for (int slot = 1; slot <= 2; slot++) {
+            const char *cls = slot == g_sim_slot ? " seg-on" :
+                              g_sim_switching && slot == g_sim_switch_target ? " sim-busy" :
+                              g_sim_confirm_slot == slot ? " sim-armed" : "";
+            const char *sub = g_sim_switching && slot == g_sim_switch_target ? "切换中" :
+                              g_sim_confirm_slot == slot ? "再次按下" : "";
+            o += snprintf(s_simswitch + o, sizeof s_simswitch - o,
+                          "<a href='act:simslot:%d' class='segc%s'><span class='sim-main'>%s</span>%s%s%s</a>",
+                          slot, cls, sim_slot_label(slot), sub[0] ? "<br><span class='sim-sub'>" : "",
+                          sub, sub[0] ? "</span>" : "");
+        }
+        if (g_sim_switching) {
+            snprintf(dynamic_hint, sizeof dynamic_hint, "正在切换到%s，蜂窝网络会短暂中断。",
+                     sim_slot_label(g_sim_switch_target));
+            hint = dynamic_hint;
+        } else if (g_sim_confirm_slot) {
+            snprintf(dynamic_hint, sizeof dynamic_hint, "4 秒内再次点击%s确认切换。",
+                     sim_slot_label(g_sim_confirm_slot));
+            hint = dynamic_hint;
+        }
+        snprintf(s_simswitch + o, sizeof s_simswitch - o,
+                 "</div><div class='simhint'>%s</div></div>", hint);
     }
     s_toast[0] = 0;
     if (g_toast[0]) snprintf(s_toast, sizeof s_toast, "<div class='toast'>%s</div>", g_toast);
@@ -4879,6 +5926,7 @@ static int build_kv(struct kv *t, const char *path)
     t[i++] = (struct kv){ "IMEIBTN", g_show_imei ? "隐藏" : "显示" };
     t[i++] = (struct kv){ "BRIGHT", s_bright };   t[i++] = (struct kv){ "AUTOOFF", s_autooff };
     t[i++] = (struct kv){ "REFRESHSEG", s_refreshseg };
+    t[i++] = (struct kv){ "CHARTINTERVALS", chart_intervals_html() };
     t[i++] = (struct kv){ "STSRCSEG", speedtest_src_html() };
     t[i++] = (struct kv){ "STDIRSEG", speedtest_dir_html() };
     t[i++] = (struct kv){ "STDURSEG", speedtest_dur_html() };
@@ -4906,7 +5954,9 @@ static int build_kv(struct kv *t, const char *path)
         t[i++] = (struct kv){ "BATPWR", "" };
         t[i++] = (struct kv){ "BATPWRLBL", "" };
     }
-    t[i++] = (struct kv){ "NETSEG", s_netseg };   t[i++] = (struct kv){ "TOAST", s_toast };
+    t[i++] = (struct kv){ "NETSEG", s_netseg };
+    t[i++] = (struct kv){ "SIMSWITCH", s_simswitch };
+    t[i++] = (struct kv){ "TOAST", s_toast };
     t[i++] = (struct kv){ "PWROFFLBL",  g_pwr_confirm == 1 ? "再按一次" : "关机" };
     t[i++] = (struct kv){ "PWROFFCLS",  g_pwr_confirm == 1 ? "armed" : "" };
     t[i++] = (struct kv){ "PWRREBLBL",  g_pwr_confirm == 2 ? "再按一次" : "重启" };
@@ -4924,7 +5974,7 @@ static int build_kv(struct kv *t, const char *path)
     t[i++] = (struct kv){ "DPSCLASS", g_dps == 1 ? "on" : "off" };
     t[i++] = (struct kv){ "DPSSTATE", g_dps < 0 ? "—" : g_dps ? "已开启" : "已关闭" };
     t[i++] = (struct kv){ "PSMCLASS", g_wpsm == 1 ? "on" : "off" };
-    t[i++] = (struct kv){ "PSMSTATE", g_wpsm < 0 ? "—" : g_wpsm ? "已开启（省电）" : "已关闭（高性能）" };
+    t[i++] = (struct kv){ "PSMSTATE", g_wpsm == -2 ? "状态不一致" : g_wpsm < 0 ? "—" : g_wpsm ? "已开启（省电）" : "已关闭（高性能）" };
     t[i++] = (struct kv){ "CLIENTLIST", s_clist }; t[i++] = (struct kv){ "DHCP_IP", d.dhcp_ip[0] ? d.dhcp_ip : "-" };
     t[i++] = (struct kv){ "SMSLIST", s_smslist };
     t[i++] = (struct kv){ "DHCP_POOL", g_dhcp_pool[0] ? g_dhcp_pool : s_pool };
@@ -4988,6 +6038,125 @@ static int build_kv(struct kv *t, const char *path)
     t[i++] = (struct kv){ "CPUMAX", g_cpu_max };
     plugin_action_log_html(s_cpu_action_log, sizeof s_cpu_action_log, CPU_ACTION_LOG);
     t[i++] = (struct kv){ "CPUACTIONLOG", s_cpu_action_log };
+    snprintf(s_wg_peers, sizeof s_wg_peers, "%d", g_wg_peer_total);
+    snprintf(s_wg_active, sizeof s_wg_active, "%d", g_wg_peer_active);
+    html_esc(s_wg_iface, sizeof s_wg_iface, g_wg_iface);
+    html_esc(s_wg_address, sizeof s_wg_address, g_wg_address);
+    html_esc(s_wg_port, sizeof s_wg_port, g_wg_port);
+    html_esc(s_wg_mode, sizeof s_wg_mode, g_wg_mode);
+    t[i++] = (struct kv){ "WGSTATE", !g_wg_installed ? "未安装" : g_wg_running ? "运行中" : g_wg_deps ? "已停止" : "依赖未就绪" };
+    t[i++] = (struct kv){ "WGSTATECLASS", g_wg_running ? "ok" : g_wg_deps ? "muted" : "warn" };
+    t[i++] = (struct kv){ "WGRUNCLASS", g_wg_running ? "seg-on" : "" };
+    t[i++] = (struct kv){ "WGSTOPCLASS", g_wg_installed && !g_wg_running ? "seg-on" : "" };
+    t[i++] = (struct kv){ "WGIFACE", s_wg_iface };
+    t[i++] = (struct kv){ "WGADDRESS", s_wg_address };
+    t[i++] = (struct kv){ "WGPORT", s_wg_port };
+    t[i++] = (struct kv){ "WGMODE", s_wg_mode };
+    t[i++] = (struct kv){ "WGUPTIME", g_wg_uptime };
+    t[i++] = (struct kv){ "WGBOOT", g_wg_boot ? "已开启" : "已关闭" };
+    t[i++] = (struct kv){ "WGPEERS", s_wg_peers };
+    t[i++] = (struct kv){ "WGACTIVE", s_wg_active };
+    t[i++] = (struct kv){ "WGPEERLIST", wireguard_peer_html() };
+    plugin_action_log_html(s_wg_action_log, sizeof s_wg_action_log, WIREGUARD_ACTION_LOG);
+    t[i++] = (struct kv){ "WGACTIONLOG", s_wg_action_log };
+    snprintf(s_op_selected, sizeof s_op_selected, "%s", g_op_selected[0] ? g_op_selected : "未选择");
+    snprintf(s_op_job_raw, sizeof s_op_job_raw, "%s%s%s",
+             g_op_job_status, strcmp(g_op_job_message, "-") ? " · " : "",
+             strcmp(g_op_job_message, "-") ? g_op_job_message : "");
+    html_esc(s_op_job, sizeof s_op_job, s_op_job_raw);
+    html_esc(s_op_sim, sizeof s_op_sim, g_op_sim);
+    html_esc(s_op_operator, sizeof s_op_operator, g_op_operator);
+    html_esc(s_op_rat, sizeof s_op_rat, g_op_rat);
+    html_esc(s_op_mode, sizeof s_op_mode,
+             !strcmp(g_op_mode, "1") ? "手动选网" : !strcmp(g_op_mode, "0") ? "自动选网" : g_op_mode);
+    html_esc(s_op_rat_pref, sizeof s_op_rat_pref, g_op_rat_pref);
+    html_esc(s_op_policy, sizeof s_op_policy, g_op_failure_policy);
+    t[i++] = (struct kv){ "OPSTATE", !g_op_installed ? "未安装" : g_op_job_running ? "任务运行中" : g_op_registered ? "已注册" : "未注册" };
+    t[i++] = (struct kv){ "OPSTATECLASS", g_op_registered ? "ok" : g_op_job_running ? "warn" : "muted" };
+    t[i++] = (struct kv){ "OPSIM", s_op_sim };
+    t[i++] = (struct kv){ "OPOPERATOR", s_op_operator };
+    t[i++] = (struct kv){ "OPRAT", s_op_rat };
+    t[i++] = (struct kv){ "OPMODE", s_op_mode };
+    t[i++] = (struct kv){ "OPJOB", s_op_job };
+    t[i++] = (struct kv){ "OPSELECTED", s_op_selected };
+    t[i++] = (struct kv){ "OPRATPREF", s_op_rat_pref };
+    t[i++] = (struct kv){ "OPPOLICY", s_op_policy };
+    t[i++] = (struct kv){ "OPLIST", operator_list_html() };
+    t[i++] = (struct kv){ "OPLOCKLABEL", g_op_confirm_until && (int32_t)(g_op_confirm_until - millis()) > 0 ? "再次确认锁定" : "锁定选中" };
+    t[i++] = (struct kv){ "OPLOCKCLASS", g_op_confirm_until && (int32_t)(g_op_confirm_until - millis()) > 0 ? "armed" : "" };
+    t[i++] = (struct kv){ "OPCANCELCLASS", g_op_job_running ? "" : "disabled" };
+    plugin_action_log_html(s_op_action_log, sizeof s_op_action_log, OPERATOR_ACTION_LOG);
+    t[i++] = (struct kv){ "OPACTIONLOG", s_op_action_log };
+	    /* ========== 新增：读取切卡结果 Toast ========== */
+    char s_fm_toast[1024] = "";
+    char toast_type[16] = "";
+    char toast_title[64] = "";
+    char toast_msg[128] = "";
+    
+    FILE *fp = fopen("/tmp/fmswitch_result", "r");
+    if (fp) {
+        char line[256];
+        while (fgets(line, sizeof(line), fp)) {
+            size_t len = strlen(line);
+            if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
+            
+            if (strncmp(line, "FMTOAST_TYPE=", 13) == 0) {
+                strncpy(toast_type, line + 13, sizeof(toast_type) - 1);
+            } else if (strncmp(line, "FMTOAST_TITLE=", 14) == 0) {
+                strncpy(toast_title, line + 14, sizeof(toast_title) - 1);
+            } else if (strncmp(line, "FMTOAST_MSG=", 12) == 0) {
+                strncpy(toast_msg, line + 12, sizeof(toast_msg) - 1);
+            }
+        }
+        fclose(fp);
+        unlink("/tmp/fmswitch_result");  /* 读取后删除，避免重复显示 */
+    }
+    
+    if (toast_type[0]) {
+        const char *icon = !strcmp(toast_type, "success") ? "✓" :
+                           !strcmp(toast_type, "error") ? "✗" :
+                           !strcmp(toast_type, "warn") ? "⚠" : "ℹ";
+        
+        snprintf(s_fm_toast, sizeof s_fm_toast,
+            "<div class=\"toast-mask\">"
+            "<div class=\"toast-box toast %s\">"
+            "<div class=\"toast-icon\">%s</div>"
+            "<div class=\"toast-title\">%s</div>"
+            "<div class=\"toast-desc\">%s</div>"
+            "</div></div>",
+            toast_type, icon, toast_title, toast_msg);
+    }
+    /* ---- 飞猫分身切卡状态 ---- */
+    static char s_fm_progress[512], s_fm_log[2200], s_fm_state[32], s_fm_state_cls[16];
+    if (g_fm_switching) {
+        snprintf(s_fm_state, sizeof s_fm_state, "切换中");
+        snprintf(s_fm_state_cls, sizeof s_fm_state_cls, "warn");
+        snprintf(s_fm_progress, sizeof s_fm_progress,
+                 "<div class='card progress-card'><div class='title'>切卡进度 <span class='r muted'>请稍候</span></div>"
+                 "<div class='progress-bar'><div class='progress-fill'></div></div></div>");
+    } else {
+        snprintf(s_fm_state, sizeof s_fm_state, "%s", g_fm_installed ? "已就绪" : "未安装");
+        snprintf(s_fm_state_cls, sizeof s_fm_state_cls, "%s", g_fm_installed ? "ok" : "muted");
+        s_fm_progress[0] = 0;
+    }
+    plugin_action_log_html(s_fm_log, sizeof s_fm_log, FMSWITCH_ACTION_LOG);
+    t[i++] = (struct kv){ "FMSTATE", s_fm_state };
+    t[i++] = (struct kv){ "FMSTATECLASS", s_fm_state_cls };
+    t[i++] = (struct kv){ "FMOPERATOR", g_fm_provider };
+    t[i++] = (struct kv){ "FMNETTYPE", g_fm_nettype };
+    t[i++] = (struct kv){ "FMBAND", g_fm_band };
+    t[i++] = (struct kv){ "FMSIGNAL", g_fm_signal };
+    t[i++] = (struct kv){ "FMMCC", g_fm_mcc };
+    t[i++] = (struct kv){ "FMMNC", g_fm_mnc };
+    t[i++] = (struct kv){ "FMSLOT0100CLS", !strcmp(g_fm_pin, "0100") ? "active" : "" };
+    t[i++] = (struct kv){ "FMSLOT0200CLS", !strcmp(g_fm_pin, "0200") ? "active" : "" };
+    t[i++] = (struct kv){ "FMSLOT0300CLS", !strcmp(g_fm_pin, "0300") ? "active" : "" };
+    t[i++] = (struct kv){ "FMCURRNETCLS", g_fm_pin[0] ? "net-current" : "" };
+    t[i++] = (struct kv){ "FMPROGRESS", s_fm_progress };
+    t[i++] = (struct kv){ "FMLOG", s_fm_log };
+    t[i++] = (struct kv){ "FMCURPIN", g_fm_pin };
+    t[i++] = (struct kv){ "FMCURRNETCLS", g_fm_pin[0] ? "net-current" : "" };
+	t[i++] = (struct kv){ "FMTOAST", s_fm_toast };
     return i;
 }
 
@@ -5164,9 +6333,9 @@ static void pm_glyph(const char *sel, int kind, int cr, int cg, int cb)
 
 static void draw_power_menu(void)
 {
-    pm_glyph("#pmc-off",    0, 0xd2, 0x48, 0x3c);   /* red */
-    pm_glyph("#pmc-reboot", 1, 0xe0, 0x89, 0x2a);   /* orange */
-    pm_glyph("#pmc-cancel", 2, 0x4a, 0x51, 0x5c);   /* gray */
+    pm_glyph("#pmc-off",    0, 0xd4, 0x5c, 0x55);   /* red */
+    pm_glyph("#pmc-reboot", 1, 0xd5, 0xa6, 0x3d);   /* amber */
+    pm_glyph("#pmc-cancel", 2, 0x3a, 0x48, 0x59);   /* cool gray */
 }
 
 static int st_hist_max(const int *hist, int n)
@@ -5179,9 +6348,9 @@ static int st_hist_max(const int *hist, int n)
 static void st_chart_grid(int x, int y, int w, int h)
 {
     const int dark = !g_theme;
-    const int r = dark ? 0x2d : 0xb8;
-    const int g = dark ? 0x3c : 0xcc;
-    const int b = dark ? 0x4a : 0xd8;
+    const int r = dark ? 0x26 : 0xc8;
+    const int g = dark ? 0x34 : 0xd4;
+    const int b = dark ? 0x45 : 0xe2;
     const int a = dark ? 150 : 180;
 
     html_view_fill_rect(x + 1, y + h / 3, w - 2, 1, r, g, b, a);
@@ -5229,36 +6398,36 @@ static void draw_speedtest_widgets(void)
             (int)(basey - py * half + 0.5)
         };
         char num[32];
-        const int outer_r = dark ? 0x0b : 0xd9;
-        const int outer_g = dark ? 0x12 : 0xf0;
-        const int outer_b = dark ? 0x1b : 0xf6;
-        const int inner_r = dark ? 0x12 : 0xf7;
-        const int inner_g = dark ? 0x20 : 0xfc;
-        const int inner_b = dark ? 0x2e : 0xfe;
-        const int track_r = dark ? 0x34 : 0xc0;
-        const int track_g = dark ? 0x43 : 0xd8;
-        const int track_b = dark ? 0x51 : 0xe2;
-        const int tick_r = dark ? 0xd8 : 0x3d;
-        const int tick_g = dark ? 0xe5 : 0x58;
-        const int tick_b = dark ? 0xee : 0x65;
-        const int num_r = dark ? 0xff : 0x18;
-        const int num_g = dark ? 0xff : 0x33;
-        const int num_b = dark ? 0xff : 0x42;
-        const int unit_r = dark ? 0x9f : 0x68;
-        const int unit_g = dark ? 0xb4 : 0x7f;
-        const int unit_b = dark ? 0xc5 : 0x8b;
-        const int hub_outer_r = dark ? 0xf4 : 0x18;
-        const int hub_outer_g = dark ? 0xf7 : 0x33;
-        const int hub_outer_b = dark ? 0xfb : 0x42;
-        const int hub_inner_r = dark ? 0x12 : 0xf7;
-        const int hub_inner_g = dark ? 0x20 : 0xfc;
-        const int hub_inner_b = dark ? 0x2e : 0xfe;
+        const int outer_r = dark ? 0x0f : 0xe3;
+        const int outer_g = dark ? 0x17 : 0xeb;
+        const int outer_b = dark ? 0x20 : 0xf4;
+        const int inner_r = dark ? 0x15 : 0xfb;
+        const int inner_g = dark ? 0x1d : 0xfd;
+        const int inner_b = dark ? 0x28 : 0xff;
+        const int track_r = dark ? 0x2d : 0xbd;
+        const int track_g = dark ? 0x3a : 0xc9;
+        const int track_b = dark ? 0x4a : 0xd6;
+        const int tick_r = dark ? 0xb8 : 0x52;
+        const int tick_g = dark ? 0xc7 : 0x62;
+        const int tick_b = dark ? 0xd7 : 0x77;
+        const int num_r = dark ? 0xee : 0x17;
+        const int num_g = dark ? 0xf4 : 0x22;
+        const int num_b = dark ? 0xfb : 0x32;
+        const int unit_r = dark ? 0x71 : 0x65;
+        const int unit_g = dark ? 0x81 : 0x75;
+        const int unit_b = dark ? 0x96 : 0x8a;
+        const int hub_outer_r = dark ? 0xee : 0x17;
+        const int hub_outer_g = dark ? 0xf4 : 0x22;
+        const int hub_outer_b = dark ? 0xfb : 0x32;
+        const int hub_inner_r = dark ? 0x15 : 0xfb;
+        const int hub_inner_g = dark ? 0x1d : 0xfd;
+        const int hub_inner_b = dark ? 0x28 : 0xff;
 
         pm_disc(cx, cy, rad, outer_r, outer_g, outer_b, 255);
         pm_disc(cx, cy, rad - 5, inner_r, inner_g, inner_b, 255);
         pm_arc(cx, cy, rad - 12, rad - 20, -30, 210, track_r, track_g, track_b);
         if (pct > 0)
-            pm_arc(cx, cy, rad - 12, rad - 20, (int)(210.0 - 240.0 * pct / 100.0), 210, 0x2f, 0xb8, 0xc9);
+            pm_arc(cx, cy, rad - 12, rad - 20, (int)(210.0 - 240.0 * pct / 100.0), 210, 0x4f, 0x8f, 0xe8);
         for (int i = 0; i <= 10; i++) {
             double a = (210.0 - 240.0 * i / 10.0) * PM_PI / 180.0;
             double tx = cos(a), ty = -sin(a);
@@ -5266,15 +6435,15 @@ static void draw_speedtest_widgets(void)
                     cx + tx * (rad - 22), cy + ty * (rad - 22),
                     i % 5 == 0 ? 3.0 : 2.0, tick_r, tick_g, tick_b);
         }
-        html_view_fill_poly(nx, ny, 3, 0xf0, 0xb2, 0x47, 255);
+        html_view_fill_poly(nx, ny, 3, 0xd5, 0xa6, 0x3d, 255);
         pm_disc(cx, cy, 8, hub_outer_r, hub_outer_g, hub_outer_b, 255);
         pm_disc(cx, cy, 4, hub_inner_r, hub_inner_g, hub_inner_b, 255);
         snprintf(num, sizeof num, "%.1f", cur);
         draw_center_text_px(cx, cy + 38, num, 28, 1, num_r, num_g, num_b, 255);
         draw_center_text_px(cx, cy + 62, "Mbps", 12, 0, unit_r, unit_g, unit_b, 255);
     }
-    st_draw_one_chart("#st-chart-dl", g_st_dl_hist, g_st_dl_n, 0x2f, 0xb8, 0xc9);
-    st_draw_one_chart("#st-chart-ul", g_st_ul_hist, g_st_ul_n, 0xe7, 0xa3, 0x3b);
+    st_draw_one_chart("#st-chart-dl", g_st_dl_hist, g_st_dl_n, 0x4f, 0x8f, 0xe8);
+    st_draw_one_chart("#st-chart-ul", g_st_ul_hist, g_st_ul_n, 0xd5, 0xa6, 0x3d);
     html_view_set_clip_top(0);
 }
 
@@ -5681,7 +6850,7 @@ static void render_sms_overlay(drm_disp_t *d, int restore_background)
         travel = g_sms_view_h - thumb_h;
         thumb_y = g_sms_view_y + g_sms_scroll * travel / g_sms_scroll_max;
         html_view_fill_round_rect(g_sms_view_x + g_sms_view_w - 3, thumb_y,
-                                  3, thumb_h, 2, 0x8a, 0x92, 0x9d, 190);
+                                  3, thumb_h, 2, 0x71, 0x81, 0x96, 190);
     }
     drm_disp_dirty(d, 0, 0, d->width - 1, d->height - 1);
 }
@@ -5783,7 +6952,7 @@ static void seg_box(drm_disp_t *d, int sx, int sy, int sw, int sh, int n, int fx
     restore_fb(d);
     int cw = sw / n, bx = fx - cw / 2;
     if (bx < sx) bx = sx; if (bx > sx + sw - cw) bx = sx + sw - cw;
-    html_view_fill_rect(bx, sy, cw, sh, 0x2f, 0x6f, 0xe0, 150);
+    html_view_fill_rect(bx, sy, cw, sh, 0x4f, 0x8f, 0xe8, 150);
     drm_disp_dirty(d, 0, 0, d->width - 1, d->height - 1);
 }
 
@@ -5916,6 +7085,7 @@ int main(void)
     if (g_saved_bright >= 0) backlight_set(g_saved_bright);   /* restore brightness */
     if (!g_charge_boot) {
         load_pin();
+        wifi_psm_prepare();                     /* migrate old plugin rules and restore PSM */
         wifi_aux_refresh();                   /* prime page-2 switch states */
         if (usb_pid_is("9057") || usb_pid_is("90b1") || usb_pid_is("90B1"))
             usb_net_watchdog_start();
@@ -5932,6 +7102,7 @@ int main(void)
         int need_render = 0, animating = 0;
         int live_changed = data_backend_poll(now);
         if (live_changed) state_pending = 1;
+        chart_sample_tick(backlight_is_on());
 
         if (backlight_is_on() && ext_ok && g_lock_state && devui_ext_active(&ext)) {
             devui_ext_deactivate(&ext);
@@ -6148,12 +7319,11 @@ int main(void)
                 } else if (release_was_tap) {
                     const char *act = html_view_click((float)down_x, (float)down_y);
                     if (!strcmp(act, "act:smsclose")) {
-                        g_sms_open = -1;
-                        g_sms_scroll = g_sms_scroll_max = 0;
-                        need_render = 1;
+                        sms_close(&touch, &need_render);
                     }
                 }
-                touch_input_drop_replayed_release(&touch, release_was_tap);
+                if (g_sms_open >= 0)
+                    touch_input_drop_replayed_release(&touch, release_was_tap);
                 sms_dragging = 0;
             } else if (!pressed) {
                 /* A complete gesture can land while layout is busy. Collapse queued
@@ -6168,9 +7338,7 @@ int main(void)
                         const char *act = html_view_click((float)(have_tap ? tx : sx),
                                                           (float)(have_tap ? ty : sy));
                         if (!strcmp(act, "act:smsclose")) {
-                            g_sms_open = -1;
-                            g_sms_scroll = g_sms_scroll_max = 0;
-                            need_render = 1;
+                            sms_close(&touch, &need_render);
                         }
                     } else if (sms_point_in_view(sx, sy) && g_sms_scroll_max > 0) {
                         int next = clampi(g_sms_scroll - dy, 0, g_sms_scroll_max);
@@ -6185,9 +7353,7 @@ int main(void)
                     if (touch_input_take_latest_tap(&touch, &tx, &ty)) {
                         const char *act = html_view_click((float)tx, (float)ty);
                         if (!strcmp(act, "act:smsclose")) {
-                            g_sms_open = -1;
-                            g_sms_scroll = g_sms_scroll_max = 0;
-                            need_render = 1;
+                            sms_close(&touch, &need_render);
                         }
                     }
                 }
@@ -6530,6 +7696,7 @@ queued_done:
                         else if (!strcmp(a, "menu"))      { backlight_on(); menu = 1; g_pwr_confirm = 0; need_render = 1; }
                         else if (!strncmp(a, "sub:", 4)) {
                             if (subpage_open(a + 4)) {
+                                if (!strcmp(a + 4, "lock.html")) (void)sim_slot_refresh(now, 1);
                                 menu = 0;
                                 g_modal = 0;
                                 g_sms_open = -1;
@@ -6553,8 +7720,42 @@ queued_done:
                             }
                             last_act = now;
                             need_render = 1;
+                    }
+                    else if (strncmp(act, "act:fmswitch:", 13) == 0) {
+                        const char *pin = act + 13;
+                        char verb[64];
+                        const struct plugin_candidate *pc = plugin_script_select(g_fm_candidates, ARRAY_LEN(g_fm_candidates), 1);
+                        
+                        /* 已经是当前网络，直接提示 */
+                        if (g_fm_pin[0] && !strcmp(g_fm_pin, pin)) {
+                            snprintf(g_toast, sizeof g_toast, "当前已是%s",
+                                     !strcmp(pin, "0200") ? "中国移动" :
+                                     !strcmp(pin, "0300") ? "中国电信" :
+                                     !strcmp(pin, "0100") ? "中国联通" : "该网络");
+                            g_toast_until = now + 1800;
+                            need_render = 1;
+                        } else if (pc) {
+                            /* === 新增：切卡前即时提示 === */
+                            const char *target_name = 
+                                !strcmp(pin, "0200") ? "中国移动" :
+                                !strcmp(pin, "0300") ? "中国电信" :
+                                !strcmp(pin, "0100") ? "中国联通" : "目标网络";
+                            snprintf(g_toast, sizeof g_toast, "正在切换至%s...", target_name);
+                            g_toast_until = now + 3000;  /* 3秒，等待异步任务完成 */
+                            /* ============================ */
+                            
+                            plugin_action_note(FMSWITCH_ACTION_LOG, "开始切卡");
+                            snprintf(verb, sizeof verb, "switch %s", pin);
+                            plugin_action_submit(FMSWITCH_ACTION_LOG, "sh ", pc->ctl, verb, "切卡操作");
+                            need_render = 1;
+                        } else {
+                            snprintf(g_toast, sizeof g_toast, "飞猫分身插件未安装");
+                            g_toast_until = now + 1800;
+                            need_render = 1;
                         }
-                        else if (!strcmp(a, "backfunc")) {
+                        last_act = now;
+                    }
+                    else if (!strcmp(a, "backfunc")) {
                             subpage_close();
                             menu = 0;
                             g_modal = 0;
@@ -6621,27 +7822,11 @@ queued_done:
                         }
                         else if (!strcmp(a, "psm")) {
                             int turn_on = g_wpsm == 1 ? 0 : 1;   /* power_save on = battery saving */
-                            const char *m = turn_on ? "on" : "off";
-                            /* The switch owns /etc/hotplug.d/iface/99-disable-powersave: it writes
-                             * the script itself (re-applying the chosen mode on every ifup) and
-                             * applies it now, so the feature is self-contained; nothing needs to be
-                             * pre-installed. (Also drop the legacy "psm" file from older builds, which
-                             * sorts later and would otherwise override this one.) */
-                            char cmd[700];
-                            snprintf(cmd, sizeof cmd,
-                                "(mkdir -p /etc/hotplug.d/iface; rm -f /etc/hotplug.d/iface/psm; "
-                                "{ echo '#!/bin/sh'; echo '[ \"$ACTION\" = ifup ] && {'; "
-                                "echo '  iw dev wlan0 set power_save %s 2>/dev/null'; "
-                                "echo '  iw dev wlan1 set power_save %s 2>/dev/null'; "
-                                "echo '  iw dev wlan2 set power_save %s 2>/dev/null'; "
-                                "echo '  iw dev wlan3 set power_save %s 2>/dev/null'; echo '}'; } "
-                                "> /etc/hotplug.d/iface/99-disable-powersave; "
-                                "chmod +x /etc/hotplug.d/iface/99-disable-powersave; "
-                                "for w in wlan0 wlan1 wlan2 wlan3; do iw dev $w set power_save %s 2>/dev/null; done) "
-                                ">/dev/null 2>&1 &",
-                                m, m, m, m, m);
-                            system(cmd);
-                            g_wpsm = turn_on;
+                            if (wifi_psm_set_target(turn_on) == 0)
+                                snprintf(g_toast, sizeof g_toast, "WiFi %s已开启", turn_on ? "节能模式" : "高性能模式");
+                            else
+                                snprintf(g_toast, sizeof g_toast, "WiFi 模式设置失败");
+                            g_toast_until = now + 1800;
                             need_render = 1;
                         }
                         else if (!strcmp(a, "adb")) {
@@ -6745,6 +7930,21 @@ queued_done:
                             save_conf();
                             need_render = 1;
                         }
+                        else if (!strncmp(a, "chartsec:", 9)) {
+                            char which[8];
+                            int sec;
+                            if (sscanf(a + 9, "%7[^:]:%d", which, &sec) == 2) {
+                                sec = normalize_chart_sec(sec);
+                                if (!strcmp(which, "cpu")) g_chart_cpu_sec = sec;
+                                else if (!strcmp(which, "mem")) g_chart_mem_sec = sec;
+                                else if (!strcmp(which, "net")) g_chart_net_sec = sec;
+                                else if (!strcmp(which, "batt")) g_chart_batt_sec = sec;
+                                else goto action_done;
+                                save_conf();
+                                invalidate_render_html_cache();
+                                need_render = 1;
+                            }
+                        }
                         else if (!strcmp(a, "stpage")) {
                             if (subpage_open("speedtest.html")) {
                                 menu = 0;
@@ -6796,6 +7996,7 @@ queued_done:
                         }
                         else if (!strcmp(a, "tsstart") || !strcmp(a, "tsstop") ||
                                  !strcmp(a, "tsrestart") || !strcmp(a, "tsrefresh")) {
+                            const struct plugin_candidate *pc = plugin_script_select(g_ts_candidates, ARRAY_LEN(g_ts_candidates), 1);
                             const char *verb = !strcmp(a, "tsstart") ? "start" :
                                                !strcmp(a, "tsstop") ? "stop" : "restart";
                             if (!strcmp(a, "tsrefresh")) {
@@ -6804,10 +8005,12 @@ queued_done:
                                 snprintf(g_toast, sizeof g_toast, "Tailscale 状态已刷新");
                             } else if (!g_ts_installed) {
                                 snprintf(g_toast, sizeof g_toast, "Tailscale 尚未安装");
+                            } else if (!pc) {
+                                snprintf(g_toast, sizeof g_toast, "Tailscale 控制接口未初始化");
                             } else {
                                 const char *label = !strcmp(verb, "start") ? "启动" :
                                                     !strcmp(verb, "stop") ? "停止" : "重启";
-                                plugin_action_submit(TAILSCALE_ACTION_LOG, "", TAILSCALE_CTL, verb, label);
+                                plugin_action_submit(TAILSCALE_ACTION_LOG, "sh ", pc->ctl, verb, label);
                                 snprintf(g_toast, sizeof g_toast, "Tailscale %s已提交", label);
                                 g_plugin_status_at = 0;
                             }
@@ -6817,6 +8020,7 @@ queued_done:
                         }
                         else if (!strcmp(a, "mhstart") || !strcmp(a, "mhstop") ||
                                  !strcmp(a, "mhrestart") || !strcmp(a, "mhrefresh")) {
+                            const struct plugin_candidate *pc = plugin_script_select(g_mh_candidates, ARRAY_LEN(g_mh_candidates), 1);
                             const char *verb = !strcmp(a, "mhstart") ? "start" :
                                                !strcmp(a, "mhstop") ? "stop" : "restart";
                             if (!strcmp(a, "mhrefresh")) {
@@ -6825,11 +8029,91 @@ queued_done:
                                 snprintf(g_toast, sizeof g_toast, "Mihomo 状态已刷新");
                             } else if (!g_mh_installed) {
                                 snprintf(g_toast, sizeof g_toast, "Mihomo 尚未安装");
+                            } else if (!pc) {
+                                snprintf(g_toast, sizeof g_toast, "Mihomo 控制接口未初始化");
                             } else {
                                 const char *label = !strcmp(verb, "start") ? "启动" :
                                                     !strcmp(verb, "stop") ? "停止" : "重启";
-                                plugin_action_submit(MIHOMO_ACTION_LOG, "sh ", MIHOMO_CTL, verb, label);
+                                plugin_action_submit(MIHOMO_ACTION_LOG, "sh ", pc->ctl, verb, label);
                                 snprintf(g_toast, sizeof g_toast, "Mihomo %s已提交", label);
+                                g_plugin_status_at = 0;
+                            }
+                            g_toast_until = now + 1800;
+                            last_act = now;
+                            need_render = 1;
+                        }
+                        else if (!strcmp(a, "wgstart") || !strcmp(a, "wgstop") ||
+                                 !strcmp(a, "wgrestart") || !strcmp(a, "wgrefresh")) {
+                            const struct plugin_candidate *pc = plugin_complete_select(g_wg_candidates, ARRAY_LEN(g_wg_candidates));
+                            const char *verb = !strcmp(a, "wgstart") ? "start" :
+                                               !strcmp(a, "wgstop") ? "stop" : "restart";
+                            if (!strcmp(a, "wgrefresh")) {
+                                plugin_status_refresh(CUR_PATH, 1);
+                                plugin_action_note(WIREGUARD_ACTION_LOG, "手动刷新状态");
+                                snprintf(g_toast, sizeof g_toast, "WireGuard 状态已刷新");
+                            } else if (!g_wg_installed || !pc) {
+                                snprintf(g_toast, sizeof g_toast, "WireGuard 尚未安装");
+                            } else {
+                                const char *label = !strcmp(verb, "start") ? "启动" :
+                                                    !strcmp(verb, "stop") ? "停止" : "重启";
+                                plugin_action_submit(WIREGUARD_ACTION_LOG, "sh ", pc->ctl, verb, label);
+                                snprintf(g_toast, sizeof g_toast, "WireGuard %s已提交", label);
+                                g_plugin_status_at = 0;
+                            }
+                            g_toast_until = now + 1800;
+                            last_act = now;
+                            need_render = 1;
+                        }
+                        else if (!strncmp(a, "opselect:", 9)) {
+                            const char *plmn = a + 9;
+                            size_t len = strlen(plmn);
+                            if ((len == 5 || len == 6) && strspn(plmn, "0123456789") == len) {
+                                snprintf(g_op_selected, sizeof g_op_selected, "%s", plmn);
+                                g_op_confirm_until = 0;
+                                snprintf(g_toast, sizeof g_toast, "已选择运营商 %s", plmn);
+                            } else snprintf(g_toast, sizeof g_toast, "运营商编号无效");
+                            g_toast_until = now + 1800;
+                            last_act = now;
+                            need_render = 1;
+                        }
+                        else if (!strcmp(a, "oprefresh") || !strcmp(a, "opscan") ||
+                                 !strcmp(a, "opapply") || !strcmp(a, "opauto") ||
+                                 !strcmp(a, "opcancel")) {
+                            const struct plugin_candidate *pc = operator_complete_select();
+                            if (!pc) {
+                                snprintf(g_toast, sizeof g_toast, "漫游锁卡插件尚未安装");
+                            } else if (!strcmp(a, "oprefresh")) {
+                                plugin_action_submit(OPERATOR_ACTION_LOG, "sh ", pc->ctl, "status", "刷新运营商状态");
+                                snprintf(g_toast, sizeof g_toast, "状态刷新已提交");
+                                g_plugin_status_at = 0;
+                            } else if (!strcmp(a, "opscan")) {
+                                plugin_action_submit(OPERATOR_ACTION_LOG, "sh ", pc->ctl, "scan-start", "扫描运营商");
+                                snprintf(g_toast, sizeof g_toast, "运营商扫描已提交");
+                                g_plugin_status_at = 0;
+                            } else if (!strcmp(a, "opauto")) {
+                                plugin_action_submit(OPERATOR_ACTION_LOG, "sh ", pc->ctl, "auto-start", "恢复自动选网");
+                                snprintf(g_toast, sizeof g_toast, "恢复自动选网已提交");
+                                g_op_confirm_until = 0;
+                                g_plugin_status_at = 0;
+                            } else if (!strcmp(a, "opcancel")) {
+                                if (!g_op_job_running) snprintf(g_toast, sizeof g_toast, "当前没有运行中的任务");
+                                else {
+                                    plugin_action_submit(OPERATOR_ACTION_LOG, "sh ", pc->ctl, "cancel", "取消当前任务");
+                                    snprintf(g_toast, sizeof g_toast, "取消任务已提交");
+                                    g_plugin_status_at = 0;
+                                }
+                            } else if (!g_op_selected[0]) {
+                                snprintf(g_toast, sizeof g_toast, "请先选择运营商");
+                            } else if (!g_op_confirm_until || (int32_t)(g_op_confirm_until - now) <= 0) {
+                                g_op_confirm_until = now + 4000;
+                                snprintf(g_toast, sizeof g_toast, "请再次点击确认锁定 %s", g_op_selected);
+                            } else {
+                                char verb[128];
+                                snprintf(verb, sizeof verb, "apply-start %s %s %s",
+                                         g_op_selected, g_op_rat_pref, g_op_failure_policy);
+                                plugin_action_submit(OPERATOR_ACTION_LOG, "sh ", pc->ctl, verb, "锁定运营商");
+                                snprintf(g_toast, sizeof g_toast, "运营商锁定已提交");
+                                g_op_confirm_until = 0;
                                 g_plugin_status_at = 0;
                             }
                             g_toast_until = now + 1800;
@@ -6852,7 +8136,7 @@ queued_done:
                                 const char *label = !strcmp(mode, "powersave") ? "省电模式" :
                                                     !strcmp(mode, "balance") ? "均衡模式" :
                                                     !strcmp(mode, "performance") ? "性能模式" : "极致模式";
-                                plugin_action_submit(CPU_ACTION_LOG, "", CPU_CTL, mode, label);
+                                plugin_action_submit(CPU_ACTION_LOG, "sh ", cpu_ctl_path(), mode, label);
                                 snprintf(g_toast, sizeof g_toast, "CPU %s已提交", label);
                                 g_plugin_status_at = 0;
                             }
@@ -6890,6 +8174,10 @@ queued_done:
                             system(cmd);
                             snprintf(g_net_pending, sizeof g_net_pending, "%s", a + 4);
                             snprintf(g_toast, sizeof g_toast, "网络模式已切换"); g_toast_until = now + 1600;
+                        }
+                        else if (!strncmp(a, "simslot:", 8)) {
+                            sim_slot_action(atoi(a + 8), now);
+                            need_render = 1;
                         }
                         else if (!strncmp(a, "openmodal:", 10)) {   /* open band-lock dialog */
                             const char *r = a + 10;
@@ -6956,6 +8244,13 @@ action_done:
         /* power-menu armed state auto-reverts if the second tap doesn't come */
         if (g_pwr_confirm && now >= g_pwr_until) { g_pwr_confirm = 0; if (menu) need_render = 1; }
 
+        /* SIM target confirmation uses the same four-second safety window. */
+        if (g_sim_confirm_slot && (int32_t)(now - g_sim_confirm_until) >= 0) {
+            g_sim_confirm_slot = 0;
+            g_sim_confirm_until = 0;
+            if (path_is_lock_page(CUR_PATH)) need_render = 1;
+        }
+
         /* auto screen-off after the configured idle timeout (locks if enabled) */
         if (g_autooff_ms > 0 && backlight_is_on() && now - last_act >= (uint32_t)g_autooff_ms) {
             screen_off(&disp);
@@ -6971,7 +8266,9 @@ action_done:
             uint32_t poll_ms = g_refresh_ms > 0 ? (uint32_t)g_refresh_ms : 1000;
             int keep_fast = (g_npages > 0 && !strcmp(CUR_PATH, g_pages[0])) ||
                             path_is_speedtest(CUR_PATH) || g_st_home_open;
-            if (!keep_fast && g_refresh_ms > 0 && g_refresh_ms < 2000 && now - last_act >= 10000)
+            if (plugin_status_page(CUR_PATH))
+                poll_ms = plugin_page_named(CUR_PATH, "operator-lock.html") && !g_op_job_running ? 10000 : 2000;
+            if (!plugin_status_page(CUR_PATH) && !keep_fast && g_refresh_ms > 0 && g_refresh_ms < 2000 && now - last_act >= 10000)
                 poll_ms = 2000;
             if (!dragging && !scroll_inertia && now - last_data >= poll_ms) {
                 time_t now_t = time(NULL);
@@ -7003,6 +8300,11 @@ action_done:
 
         /* reconcile page-2 WiFi switch states from uci/iw on a slow throttle */
         if (!dragging && !scroll_inertia && now - g_wifi_aux_at >= 4000) { g_wifi_aux_at = now; wifi_aux_refresh(); }
+
+        /* SIM polling is page-local and pauses during gestures and while dark. */
+        if (backlight_is_on() && path_is_lock_page(CUR_PATH) && !dragging && !scroll_inertia) {
+            if (sim_slot_refresh(now, 0)) need_render = 1;
+        }
 
         if (!g_charge_boot && now - g_pages_scan_at >= 1000) {
             g_pages_scan_at = now;
