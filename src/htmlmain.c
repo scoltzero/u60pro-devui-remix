@@ -96,11 +96,63 @@ static uint32_t monotonic_seconds(void)
     return (uint32_t)ts.tv_sec;
 }
 
-static int g_display_offset_minutes = 480;
+static int g_display_offset_minutes = INT_MIN;
+static int g_system_clock_offset_minutes;
+static int g_system_clock_offset_known;
+
+static int parse_system_clock_offset(const char *value, int *out)
+{
+    char *end;
+    double hours;
+    int minutes;
+
+    if (!value || !*value || !out) return 0;
+    hours = strtod(value, &end);
+    while (end && *end == ' ') end++;
+    if (end == value || (end && *end) || hours < -12.0 || hours > 14.0) return 0;
+    minutes = (int)(hours * 60.0 + (hours < 0 ? -0.5 : 0.5));
+    if (minutes < -720 || minutes > 840) return 0;
+    *out = minutes;
+    return 1;
+}
+
+static int system_clock_offset_minutes(void)
+{
+    FILE *fp;
+    char line[256], value[64];
+    int fallback = INT_MIN;
+
+    if (g_system_clock_offset_known) return g_system_clock_offset_minutes;
+    g_system_clock_offset_known = 1;
+    g_system_clock_offset_minutes = 0;
+    fp = fopen("/etc/config/zwrt_zte_sntp", "r");
+    if (!fp) return 0;
+    while (fgets(line, sizeof line, fp)) {
+        if (sscanf(line, " option time_from_utc '%63[^']'", value) == 1 &&
+            parse_system_clock_offset(value, &g_system_clock_offset_minutes)) {
+            fclose(fp);
+            return g_system_clock_offset_minutes;
+        }
+        if (fallback == INT_MIN &&
+            sscanf(line, " option timezone '%63[^']'", value) == 1 &&
+            parse_system_clock_offset(value, &fallback))
+            continue;
+    }
+    fclose(fp);
+    if (fallback != INT_MIN) g_system_clock_offset_minutes = fallback;
+    return g_system_clock_offset_minutes;
+}
+
+static int display_clock_adjust_minutes(void)
+{
+    if (g_display_offset_minutes == INT_MIN)
+        g_display_offset_minutes = 480 - system_clock_offset_minutes();
+    return g_display_offset_minutes;
+}
 
 static void devui_localtime(time_t when, struct tm *out)
 {
-    time_t adjusted = when + (time_t)g_display_offset_minutes * 60;
+    time_t adjusted = when + (time_t)display_clock_adjust_minutes() * 60;
     gmtime_r(&adjusted, out);
 }
 
@@ -113,7 +165,7 @@ static void devui_time_stamp(char *out, size_t outlen, time_t when)
 
 static void devui_posix_tz(char *out, size_t outlen)
 {
-    int posix_minutes = -g_display_offset_minutes;
+    int posix_minutes = -display_clock_adjust_minutes();
     char sign = posix_minutes < 0 ? '-' : '+';
     int abs_minutes = posix_minutes < 0 ? -posix_minutes : posix_minutes;
     snprintf(out, outlen, "UTC%c%d:%02d", sign, abs_minutes / 60, abs_minutes % 60);
@@ -5385,7 +5437,8 @@ static void timezone_apply_action(uint32_t now)
              "/settings/timezone?offset_minutes=%d&dst_minutes=%d", offset, dst);
     status = data_backend_request("POST", path, response, sizeof response);
     if (status == 200) {
-        g_display_offset_minutes = effective;
+        g_display_offset_minutes = (int)json_get_int(
+            response, "clock_adjust_minutes", effective - system_clock_offset_minutes());
         g_last_clock_min = -1;
         snprintf(g_toast, sizeof g_toast, "时区已保存");
     } else {
@@ -5449,8 +5502,16 @@ static int build_kv(struct kv *t, const char *path)
     static struct signal_bundle sig;
     int ta = -1;
     if (!data_refresh(&d)) memset(&d, 0, sizeof d);
-    if (d.timezone_available)
-        g_display_offset_minutes = d.timezone_effective_minutes;
+    if (d.timezone_available) {
+        if (d.timezone_clock_basis_available) {
+            g_system_clock_offset_minutes = d.timezone_system_offset_minutes;
+            g_system_clock_offset_known = 1;
+            g_display_offset_minutes = d.timezone_clock_adjust_minutes;
+        } else {
+            g_display_offset_minutes =
+                d.timezone_effective_minutes - system_clock_offset_minutes();
+        }
+    }
     plugin_status_refresh(path, 0);
     timezone_sync_draft(&d);
     traffic_plan_sync_draft(&d);

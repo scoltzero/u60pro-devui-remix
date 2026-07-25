@@ -367,13 +367,26 @@ static int parse_snapshot(devui_data_t *d, const char *buf)
     }
 
     if (json_get(buf, "timezone", sec, DEVUI_STATE_BUF_MAX)) {
+        char value[32];
         d->timezone_available = 1;
         d->timezone_offset_minutes = (int)json_get_int(sec, "offset_minutes", 480);
         d->timezone_dst_minutes = (int)json_get_int(sec, "dst_minutes", 0);
         d->timezone_effective_minutes = (int)json_get_int(sec, "effective_offset_minutes", 480);
+        if (json_get(sec, "system_offset_minutes", value, sizeof value)) {
+            d->timezone_clock_basis_available = 1;
+            d->timezone_system_offset_minutes =
+                (int)json_get_int(sec, "system_offset_minutes", 0);
+            d->timezone_clock_adjust_minutes =
+                (int)json_get_int(sec, "clock_adjust_minutes",
+                                  d->timezone_effective_minutes -
+                                  d->timezone_system_offset_minutes);
+        } else {
+            d->timezone_clock_adjust_minutes = d->timezone_effective_minutes;
+        }
         getstr(sec, "label", d->timezone_label, sizeof d->timezone_label);
     } else {
         d->timezone_effective_minutes = 480;
+        d->timezone_clock_adjust_minutes = 480;
         snprintf(d->timezone_label, sizeof d->timezone_label, "UTC+08:00");
     }
 

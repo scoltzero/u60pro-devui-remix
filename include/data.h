@@ -86,6 +86,8 @@ typedef struct {
     /* Shared fixed-offset timezone and persistent per-SIM traffic. */
     int timezone_available;
     int timezone_offset_minutes, timezone_dst_minutes, timezone_effective_minutes;
+    int timezone_clock_basis_available;
+    int timezone_system_offset_minutes, timezone_clock_adjust_minutes;
     char timezone_label[24];
     int sim_traffic_available;
     char sim_traffic_active_id[24];
