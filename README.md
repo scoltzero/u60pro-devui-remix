@@ -136,6 +136,9 @@ bash scripts/package-release.sh \
 感谢 [Aawuxing](https://github.com/Aawuxing) 提交双卡管理和双卡流量页面的初始实现，
 本 Remix 在此基础上接入二次确认状态机、按 ICCID 的 datad 持久统计与套餐周期。
 
+感谢 [Zhengjian12345](https://github.com/Zhengjian12345) 提交飞猫三网分身卡切换页面的初始实现，
+本 Remix 在此基础上补充严格卡型识别、二次确认和当前架构适配。
+
 ## 文档
 
 - [docs/UI-GUIDE.md](docs/UI-GUIDE.md) — **自定义界面教程**（令牌、动作、限制、示例）

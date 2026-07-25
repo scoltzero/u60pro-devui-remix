@@ -24,6 +24,7 @@ done
 [ -f "$DEVUI_BIN" ] || { echo "missing DevUI binary: $DEVUI_BIN" >&2; exit 1; }
 [ -f "$DATAD_BIN" ] || { echo "missing datad binary: $DATAD_BIN" >&2; exit 1; }
 [ -x "$ROOT/scripts/cpuctl.sh" ] || { echo "cpuctl.sh must be executable" >&2; exit 1; }
+[ -x "$ROOT/ui/functions/fmsimpin.sh" ] || { echo "fmsimpin.sh must be executable" >&2; exit 1; }
 
 case "$OUT" in
     /*) ;;
@@ -48,6 +49,7 @@ cp -R "$ROOT/ui/subpages" "$OUT/.ui-stage/subpages"
 cp -R "$ROOT/ui/functions"/. "$OUT/.ui-stage/functions/"
 cp "$ROOT/scripts/cpuctl.sh" "$OUT/.ui-stage/functions/cpuctl.sh"
 chmod 755 "$OUT/.ui-stage/functions/cpuctl.sh"
+chmod 755 "$OUT/.ui-stage/functions/fmsimpin.sh"
 
 (
     cd "$OUT/.ui-stage"
@@ -59,7 +61,7 @@ grep -qx '01-signal.html' "$OUT/.tar-list"
 grep -qx '02-functions.html' "$OUT/.tar-list"
 grep -qx 'style.css' "$OUT/.tar-list"
 grep -qx 'functions/cpuctl.sh' "$OUT/.tar-list"
-for page in tailscale clash cpu-performance wireguard operator-lock sim-switch sim-traffic timezone; do
+for page in tailscale clash cpu-performance wireguard operator-lock sim-switch sim-traffic fmswitch timezone; do
     grep -qx "functions/$page.html" "$OUT/.tar-list"
 done
 grep -q '^subpages/.*\.html$' "$OUT/.tar-list"
@@ -68,6 +70,7 @@ if grep -Eq '^(\./|ui/)|(^|/)\._' "$OUT/.tar-list"; then
     exit 1
 fi
 tar -tvzf "$OUT/ui.tar.gz" | grep -Eq '^-rwx[^ ]* .* functions/cpuctl\.sh$'
+tar -tvzf "$OUT/ui.tar.gz" | grep -Eq '^-rwx[^ ]* .* functions/fmsimpin\.sh$'
 
 cp "$ROOT/version.json" "$OUT/version.json"
 python3 - "$OUT/version.json" <<'PY'

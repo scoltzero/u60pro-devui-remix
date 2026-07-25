@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>飞猫三网分身卡</title>
+</head>
+<body>
+  <div class="card">
+    <div class="title">飞猫分身卡 <span class="r {{FMSTATECLASS}}">{{FMSTATE}}</span></div>
+    <table>
+      <tr><td class="kv-l">当前运营商</td><td class="val">{{FMPROVIDER}}</td></tr>
+      <tr><td class="kv-l">网络制式</td><td class="val">{{FMNETTYPE}}</td></tr>
+      <tr><td class="kv-l">频段 / 信号</td><td class="val">{{FMBAND}} · {{FMSIGNAL}}</td></tr>
+      <tr><td class="kv-l">PLMN</td><td class="val">{{FMPLMN}}</td></tr>
+    </table>
+  </div>
+
+  <div class="card">
+    <div class="title">三网切换</div>
+    <div class="seg simseg">
+      <a href="act:fmswitch:0200" class="segc {{FMYDCLASS}}"><span class="sim-main">{{FMYDLABEL}}</span></a>
+      <a href="act:fmswitch:0300" class="segc {{FMDXCLASS}}"><span class="sim-main">{{FMDXLABEL}}</span></a>
+      <a href="act:fmswitch:0100" class="segc {{FMLTCLASS}}"><span class="sim-main">{{FMLTLABEL}}</span></a>
+    </div>
+    <p class="func-note">切换会短暂断网，点击目标运营商后需在 4 秒内再次点击确认</p>
+  </div>
+
+  <div class="card">
+    <div class="svc-grid svc-secondary">
+      <a href="act:fmrefresh" class="svc-btn svc-wide">刷新状态</a>
+    </div>
+    <div class="svc-log">{{FMACTIONLOG}}</div>
+  </div>
+</body>
+</html>

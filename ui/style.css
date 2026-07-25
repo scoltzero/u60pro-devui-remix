@@ -211,6 +211,7 @@ body.light .segc { color: #2a2f38; }
 .simseg .sim-sub { font-size: 10px; line-height: 11px; }
 .simseg .segc.sim-armed { background: #ad711c; color: #fff; border-radius: 7px; }
 .simseg .segc.sim-busy { background: #ad711c; color: #fff; font-weight: 700; border-radius: 7px; }
+.simseg .segc.disabled { opacity: .48; }
 .simhint { margin-top: 7px; color: #718196; font-size: 11px; line-height: 15px; }
 
 /* lock summary cards (whole card tappable) */
