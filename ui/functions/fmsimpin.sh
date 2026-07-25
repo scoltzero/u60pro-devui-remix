@@ -22,6 +22,10 @@ json_value() {
     printf '%s' "$1" | jsonfilter -e "@.$2" 2>/dev/null | head -n 1
 }
 
+json_type() {
+    printf '%s' "$1" | jsonfilter -t "@.$2" 2>/dev/null | head -n 1
+}
+
 one_line() {
     printf '%s' "$1" | tr '\r\n=' '   ' | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//'
 }
@@ -76,6 +80,7 @@ print_status() {
     sim_json=$(get_sim_info)
     net_json=$(get_net_info)
     flag=$(json_value "$sim_json" seecom_card_flag)
+    flag_type=$(json_type "$sim_json" seecom_card_flag)
     carrier=$(json_value "$sim_json" seecom_card_carrier_type | tr '[:lower:]' '[:upper:]')
     net_type=$(json_value "$net_json" network_type)
     band=$(json_value "$net_json" wan_active_band)
@@ -84,7 +89,11 @@ print_status() {
     mnc=$(normalize_mnc "$(json_value "$net_json" rmnc)")
     provider=$(carrier_name "$carrier")
 
-    [ "$flag" = "1" ] && available=1 || available=0
+    if [ "$flag_type" = "string" ] && [ "$flag" = "1" ]; then
+        available=1
+    else
+        available=0
+    fi
     [ -n "$carrier" ] || carrier="-"
     [ -n "$net_type" ] || net_type="-"
     [ -n "$band" ] || band="-"
@@ -134,8 +143,9 @@ switch_carrier() {
 
     sim_json=$(get_sim_info)
     flag=$(json_value "$sim_json" seecom_card_flag)
+    flag_type=$(json_type "$sim_json" seecom_card_flag)
     current=$(json_value "$sim_json" seecom_card_carrier_type | tr '[:lower:]' '[:upper:]')
-    if [ "$flag" != "1" ]; then
+    if [ "$flag_type" != "string" ] || [ "$flag" != "1" ]; then
         log "拒绝切换：未检测到飞猫分身卡"
         trim_log
         return 3
@@ -176,9 +186,11 @@ switch_carrier() {
         sim_json=$(get_sim_info)
         net_json=$(get_net_info)
         flag=$(json_value "$sim_json" seecom_card_flag)
+        flag_type=$(json_type "$sim_json" seecom_card_flag)
         current=$(json_value "$sim_json" seecom_card_carrier_type | tr '[:lower:]' '[:upper:]')
         net_type=$(json_value "$net_json" network_type)
-        if [ "$flag" = "1" ] && [ "$current" = "$target_carrier" ] && network_registered "$net_type"; then
+        if [ "$flag_type" = "string" ] && [ "$flag" = "1" ] &&
+           [ "$current" = "$target_carrier" ] && network_registered "$net_type"; then
             log "切换成功：$target_name，网络已恢复为$net_type"
             return 0
         fi

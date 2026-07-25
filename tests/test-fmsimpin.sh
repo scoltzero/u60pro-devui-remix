@@ -16,24 +16,36 @@ LOG_FILE="$TMP/action.log"
 cat >"$TMP/bin/jsonfilter" <<'EOF'
 #!/bin/sh
 expr=
+mode=value
 while [ $# -gt 0 ]; do
     case "$1" in
-        -e) expr=$2; shift 2 ;;
+        -e) expr=$2; mode=value; shift 2 ;;
+        -t) expr=$2; mode=type; shift 2 ;;
         *) shift ;;
     esac
 done
 key=${expr#@.}
 python3 -c 'import json, sys
 key = sys.argv[1]
+mode = sys.argv[2]
 try:
     value = json.load(sys.stdin).get(key, "")
 except Exception:
     raise SystemExit(1)
+if mode == "type":
+    if isinstance(value, str): print("string")
+    elif isinstance(value, bool): print("boolean")
+    elif isinstance(value, int): print("int")
+    elif isinstance(value, float): print("double")
+    elif isinstance(value, list): print("array")
+    elif isinstance(value, dict): print("object")
+    elif value is None: print("null")
+    raise SystemExit(0)
 if isinstance(value, bool):
     print("true" if value else "false")
 elif value is not None:
     print(value)
-' "$key"
+' "$key" "$mode"
 EOF
 
 cat >"$TMP/bin/uci" <<'EOF'
@@ -150,6 +162,10 @@ assert_contains "$out" 'FM_AVAILABLE=1'
 assert_contains "$out" 'FM_CARRIER=LT'
 assert_contains "$out" 'FM_PLMN=46001'
 
+printf '%s\n' '{"seecom_card_flag":1,"seecom_card_carrier_type":"LT"}' >"$SIM_FILE"
+out=$("$CTL" status)
+assert_contains "$out" 'FM_AVAILABLE=0'
+
 printf '%s\n' '{}' >"$SIM_FILE"
 out=$("$CTL" status)
 assert_contains "$out" 'FM_AVAILABLE=0'
@@ -184,6 +200,10 @@ run_switch 6 no-update 0200
 [ ! -e "$PIN_FILE" ]
 
 printf '%s\n' '{"seecom_card_flag":"0","seecom_card_carrier_type":"YD"}' >"$SIM_FILE"
+run_switch 3 success 0200
+[ "$(wc -l <"$CALLS_FILE" | tr -d ' ')" = "0" ]
+
+printf '%s\n' '{"seecom_card_flag":1,"seecom_card_carrier_type":"LT"}' >"$SIM_FILE"
 run_switch 3 success 0200
 [ "$(wc -l <"$CALLS_FILE" | tr -d ' ')" = "0" ]
 
