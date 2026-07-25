@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
-  <title>双卡流量</title>
+  <title>流量管理</title>
 </head>
 <body>
   <div class="card">
@@ -14,10 +14,7 @@
 
   <div class="card traffic-plan-card">
     <div class="title">套餐设置</div>
-    <div class="seg seg2">
-      <a href="act:trafficselect:1" class="segc {{PLAN1CLASS}}">自插卡</a>
-      <a href="act:trafficselect:2" class="segc {{PLAN2CLASS}}">内置卡</a>
-    </div>
+    {{PLANSLOTSELECTOR}}
     <div class="traffic-plan-title">{{PLANTITLE}}</div>
 
     <div class="seg seg2 traffic-plan-toggle">

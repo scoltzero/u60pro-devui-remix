@@ -389,7 +389,8 @@ static int normalize_chart_sec(int sec);
 
 static void invalidate_render_html_cache(void);
 static int sim_slot_refresh(uint32_t now, int force);
-static int dual_sim_page_available(int require_traffic);
+static int dual_sim_management_available(void);
+static int sim_traffic_page_available(void);
 
 /* ---- page-2 aux state, cached (-1 = unknown). Like the reference plugin,
  * bands are controlled purely with `ifconfig wlanN up/down` and read back from
@@ -2092,9 +2093,9 @@ static int function_control_api_available(const char *name)
     if (!strcmp(name, "operator-lock.html"))
         return operator_complete_select() != NULL;
     if (!strcmp(name, "sim-switch.html"))
-        return dual_sim_page_available(0);
+        return dual_sim_management_available();
     if (!strcmp(name, "sim-traffic.html"))
-        return dual_sim_page_available(1);
+        return sim_traffic_page_available();
     if (!strcmp(name, "timezone.html"))
         return 1;
     return 1;
@@ -2213,6 +2214,56 @@ static const char *speedtest_function_tile_html(void)
            "</a>";
 }
 
+static const char *function_tile_desc(const char *name)
+{
+    if (!strcmp(name, "tailscale.html")) return "组网状态与子网路由";
+    if (!strcmp(name, "clash.html") || !strcmp(name, "mihomo.html"))
+        return "代理状态与服务控制";
+    if (!strcmp(name, "cpu-performance.html")) return "频率策略与温控状态";
+    if (!strcmp(name, "wireguard.html")) return "隧道状态与 Peer";
+    if (!strcmp(name, "operator-lock.html")) return "扫描并锁定运营商";
+    if (!strcmp(name, "sim-switch.html")) return "驻网模式与数据卡";
+    if (!strcmp(name, "sim-traffic.html")) return "按卡流量与套餐";
+    if (!strcmp(name, "timezone.html")) return "显示时区与周期";
+    return "自定义工具";
+}
+
+static int append_function_tile(char *buf, size_t cap, int o, const char *name)
+{
+    char path[300], raw[96], title[160], href[160];
+    if (!name || o < 0 || (size_t)o >= cap) return o;
+    if (!subpage_name_ok(name) || !function_control_api_available(name)) return o;
+    snprintf(path, sizeof path, "%s/%s", FUNCTIONS_DIR, name);
+    if (access(path, R_OK) != 0) return o;
+    function_title_for_file(raw, sizeof raw, path, name);
+    html_esc(title, sizeof title, raw);
+    html_esc(href, sizeof href, name);
+    return o + snprintf(buf + o, cap - (size_t)o,
+                        "<a href=\"act:func:%s\" class=\"func-tile func-custom\">"
+                        "<span class=\"func-name\">%s</span>"
+                        "<span class=\"func-desc\">%s</span>"
+                        "</a>",
+                        href, title, function_tile_desc(name));
+}
+
+static const char *system_function_tiles_html(void)
+{
+    static char buf[2048];
+    int o = 0;
+    buf[0] = 0;
+    o = append_function_tile(buf, sizeof buf, o, "sim-switch.html");
+    (void)append_function_tile(buf, sizeof buf, o, "sim-traffic.html");
+    return buf;
+}
+
+static const char *timezone_function_tile_html(void)
+{
+    static char buf[1024];
+    buf[0] = 0;
+    (void)append_function_tile(buf, sizeof buf, 0, "timezone.html");
+    return buf;
+}
+
 static const char *custom_function_tiles_html(void)
 {
     static char buf[8192];
@@ -2229,6 +2280,9 @@ static const char *custom_function_tiles_html(void)
     while ((de = readdir(dp)) && n < 32) {
         if (de->d_name[0] == '.') continue;
         if (!subpage_name_ok(de->d_name)) continue;
+        if (!strcmp(de->d_name, "sim-switch.html") ||
+            !strcmp(de->d_name, "sim-traffic.html") ||
+            !strcmp(de->d_name, "timezone.html")) continue;
         if (!function_control_api_available(de->d_name)) continue;
         snprintf(names[n], sizeof names[n], "%s", de->d_name);
         n++;
@@ -2238,29 +2292,10 @@ static const char *custom_function_tiles_html(void)
         for (int j = i + 1; j < n; j++)
             if (strcmp(names[i], names[j]) > 0) {
                 char t[64]; strcpy(t, names[i]); strcpy(names[i], names[j]); strcpy(names[j], t);
-            }
+    }
 
     for (int i = 0; i < n; i++) {
-        char path[300], raw[96], title[160], href[160];
-        const char *desc = "自定义工具";
-        snprintf(path, sizeof path, "%s/%s", FUNCTIONS_DIR, names[i]);
-        function_title_for_file(raw, sizeof raw, path, names[i]);
-        html_esc(title, sizeof title, raw);
-        html_esc(href, sizeof href, names[i]);
-        if (!strcmp(names[i], "tailscale.html")) desc = "组网状态与子网路由";
-        else if (!strcmp(names[i], "clash.html") || !strcmp(names[i], "mihomo.html")) desc = "代理状态与服务控制";
-        else if (!strcmp(names[i], "cpu-performance.html")) desc = "频率策略与温控状态";
-        else if (!strcmp(names[i], "wireguard.html")) desc = "隧道状态与 Peer";
-        else if (!strcmp(names[i], "operator-lock.html")) desc = "扫描并锁定运营商";
-        else if (!strcmp(names[i], "sim-switch.html")) desc = "驻网模式与数据卡";
-        else if (!strcmp(names[i], "sim-traffic.html")) desc = "按卡流量与套餐";
-        else if (!strcmp(names[i], "timezone.html")) desc = "显示时区与周期";
-        o += snprintf(buf + o, sizeof buf - o,
-                      "<a href=\"act:func:%s\" class=\"func-tile func-custom\">"
-                      "<span class=\"func-name\">%s</span>"
-                      "<span class=\"func-desc\">%s</span>"
-                      "</a>",
-                      href, title, desc);
+        o = append_function_tile(buf, sizeof buf, o, names[i]);
         if (o >= (int)sizeof(buf) - 256) break;
     }
     return buf;
@@ -3636,12 +3671,15 @@ static void sim_auto_action(int enabled, uint32_t now)
     g_toast_until = now + 1800;
 }
 
-static int dual_sim_page_available(int require_traffic)
+static int dual_sim_management_available(void)
+{
+    (void)sim_slot_refresh(millis(), 0);
+    return g_sim_dual == 1;
+}
+
+static int sim_traffic_page_available(void)
 {
     devui_data_t data;
-    (void)sim_slot_refresh(millis(), 0);
-    if (g_sim_dual != 1) return 0;
-    if (!require_traffic) return 1;
     return data_refresh_live(&data) && data.sim_traffic_available;
 }
 
@@ -5343,6 +5381,16 @@ static const devui_sim_traffic_t *sim_traffic_for_slot(const devui_data_t *data,
     return best;
 }
 
+static int sim_traffic_slot_visible(const devui_data_t *data, int slot)
+{
+    const devui_sim_traffic_t *sim;
+    if (slot == 1) return 1;
+    if (slot != 2 || g_sim_dual != 1) return 0;
+    if (g_sim_p2 == 1 || g_sim_slot == 2) return 1;
+    sim = sim_traffic_for_slot(data, 2);
+    return sim && sim->active;
+}
+
 static const char *sim_operator_display(const char *raw)
 {
     if (!raw || !raw[0] || !strcmp(raw, "-")) return "未识别";
@@ -5363,6 +5411,7 @@ static const char *sim_traffic_cards_html(const devui_data_t *data)
         char operator_esc[128], tail_esc[32], state_esc[96];
         const char *operator_name = slot == 1 ? g_sim_operator1 : g_sim_operator2;
         const char *state = slot == 1 ? g_sim_state1 : g_sim_state2;
+        if (!sim_traffic_slot_visible(data, slot)) continue;
         if (sim) {
             if (sim->operator_name[0]) operator_name = sim->operator_name;
             fmt_bytes_u64(today, sizeof today, sim->today_bytes);
@@ -5391,6 +5440,23 @@ static const char *sim_traffic_cards_html(const devui_data_t *data)
                       state_esc, sim ? "" : " · 使用该卡后开始统计");
         if (o >= (int)sizeof html - 800) break;
     }
+    return html;
+}
+
+static const char *sim_traffic_plan_selector_html(const devui_data_t *data)
+{
+    static char html[512];
+    if (!sim_traffic_slot_visible(data, 2)) {
+        snprintf(html, sizeof html,
+                 "<div class='seg'><span class='segc seg-on'>自插卡</span></div>");
+        return html;
+    }
+    snprintf(html, sizeof html,
+             "<div class='seg seg2'>"
+             "<a href='act:trafficselect:1' class='segc%s'>自插卡</a>"
+             "<a href='act:trafficselect:2' class='segc%s'>内置卡</a></div>",
+             g_plan_edit_slot == 1 ? " seg-on" : "",
+             g_plan_edit_slot == 2 ? " seg-on" : "");
     return html;
 }
 
@@ -6420,7 +6486,9 @@ static int build_kv(struct kv *t, const char *path)
     t[i++] = (struct kv){ "STHOMEBTN", speedtest_home_button_html() };
     t[i++] = (struct kv){ "STHOMEINLINE", speedtest_home_inline_html() };
     t[i++] = (struct kv){ "STFUNCTIONTILE", speedtest_function_tile_html() };
+    t[i++] = (struct kv){ "SYSTEMFUNCTIONTILES", system_function_tiles_html() };
     t[i++] = (struct kv){ "CUSTOMFUNCTIONTILES", custom_function_tiles_html() };
+    t[i++] = (struct kv){ "TIMEZONEFUNCTIONTILE", timezone_function_tile_html() };
     t[i++] = (struct kv){ "SIGADVSTATE", s_sigadvstate };
     t[i++] = (struct kv){ "MEMDETAIL", s_memdet }; t[i++] = (struct kv){ "UPSHORT", s_upshort };
     t[i++] = (struct kv){ "CHGV", s_chgv };       t[i++] = (struct kv){ "CHGI", s_chgi };
@@ -6461,8 +6529,7 @@ static int build_kv(struct kv *t, const char *path)
     t[i++] = (struct kv){ "SIMTRAFFICSTATE", d.sim_traffic_available ? "持久统计正常" : "等待后端" };
     t[i++] = (struct kv){ "SIMTRAFFICSTATECLASS", d.sim_traffic_available ? "ok" : "muted" };
     t[i++] = (struct kv){ "SIMTRAFFICCARDS", sim_traffic_cards_html(&d) };
-    t[i++] = (struct kv){ "PLAN1CLASS", g_plan_edit_slot == 1 ? "seg-on" : "" };
-    t[i++] = (struct kv){ "PLAN2CLASS", g_plan_edit_slot == 2 ? "seg-on" : "" };
+    t[i++] = (struct kv){ "PLANSLOTSELECTOR", sim_traffic_plan_selector_html(&d) };
     t[i++] = (struct kv){ "PLANENABLECLASS", g_plan_draft_enabled ? "seg-on" : "" };
     t[i++] = (struct kv){ "PLANDISABLECLASS", g_plan_draft_enabled ? "" : "seg-on" };
     t[i++] = (struct kv){ "PLANGIB", s_plan_gib };
@@ -8634,7 +8701,9 @@ queued_done:
                         }
                         else if (!strncmp(a, "trafficselect:", 14)) {
                             int slot = atoi(a + 14);
-                            if (slot == 1 || slot == 2) {
+                            if (slot == 1 ||
+                                (slot == 2 && g_sim_dual == 1 &&
+                                 (g_sim_p2 == 1 || g_sim_slot == 2))) {
                                 g_plan_edit_slot = slot;
                                 g_plan_draft_dirty = 0;
                                 g_plan_draft_sim_id[0] = 0;
