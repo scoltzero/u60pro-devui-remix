@@ -46,6 +46,7 @@
 - `lockscreen.html` 是特殊页：开启锁屏后，超时/电源键锁屏时全屏显示 PIN 键盘（解锁正确才回到界面）；系统页锁屏开关从关→开时也用它设置新密码。
 - `subpages/*.html` 是内置二级页面，通过 `act:sub:<文件名>` 打开，`act:backfunc` 返回顶层页。
 - `functions/*.html` 是用户自定义二级页面，通过更多功能页自动扫描，示例见 `examples/custom-functions/`；示例不放进默认 `ui/`，避免安装后默认出现测试页面。
+- Remix 额外内置双卡子分页 `functions/sim-switch.html` 与 `functions/sim-traffic.html`，详见 [DUAL-SIM.md](DUAL-SIM.md)。
 - 特殊页按全屏覆盖层处理，不继承普通页面的竖向滚动位置。
 - 所有页面用 `<link rel="stylesheet" href="style.css">` 共享同一份样式。
 - 旧版若还残留 `/data/ui`，新版安装脚本会自动把它迁移到这里。

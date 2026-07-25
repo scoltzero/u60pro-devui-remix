@@ -135,6 +135,16 @@ static void getstr(const char *obj, const char *key, char *dst, size_t n)
     if (!json_get(obj, key, dst, n)) dst[0] = 0;
 }
 
+static uint64_t getu64(const char *obj, const char *key, uint64_t def)
+{
+    char value[48];
+    char *end;
+    unsigned long long n;
+    if (!json_get(obj, key, value, sizeof value)) return def;
+    n = strtoull(value, &end, 10);
+    return end == value ? def : (uint64_t)n;
+}
+
 static const char *mainland_operator_cn(int mcc, int mnc, const char *raw)
 {
     if (mcc == 460) {
@@ -354,6 +364,67 @@ static int parse_snapshot(devui_data_t *d, const char *buf)
         d->tx_speed = json_get_int(sec, "tx_speed", 0);
         d->rx_bytes = json_get_int(sec, "rx_bytes", 0);
         d->tx_bytes = json_get_int(sec, "tx_bytes", 0);
+    }
+
+    if (json_get(buf, "timezone", sec, DEVUI_STATE_BUF_MAX)) {
+        d->timezone_available = 1;
+        d->timezone_offset_minutes = (int)json_get_int(sec, "offset_minutes", 480);
+        d->timezone_dst_minutes = (int)json_get_int(sec, "dst_minutes", 0);
+        d->timezone_effective_minutes = (int)json_get_int(sec, "effective_offset_minutes", 480);
+        getstr(sec, "label", d->timezone_label, sizeof d->timezone_label);
+    } else {
+        d->timezone_effective_minutes = 480;
+        snprintf(d->timezone_label, sizeof d->timezone_label, "UTC+08:00");
+    }
+
+    if (json_get(buf, "sim_traffic", sec, DEVUI_STATE_BUF_MAX)) {
+        char list[32768];
+        char available[16];
+        d->sim_traffic_available = json_get(sec, "available", available, sizeof available) ?
+                                   truthy_value(available) : 0;
+        getstr(sec, "active_id", d->sim_traffic_active_id, sizeof d->sim_traffic_active_id);
+        d->sim_traffic_n = 0;
+        if (json_get(sec, "sims", list, sizeof list)) {
+            char *p = list;
+            while (p && d->sim_traffic_n < DEVUI_SIM_TRAFFIC_MAX) {
+                char *start = find_next_object(p);
+                char *end;
+                devui_sim_traffic_t *sim;
+                char obj[2048], flag[16], remaining[48];
+                size_t len;
+                if (!start || !(end = obj_end(start))) break;
+                len = (size_t)(end - start) + 1;
+                if (len >= sizeof obj) {
+                    p = end + 1;
+                    continue;
+                }
+                memcpy(obj, start, len);
+                obj[len] = 0;
+                sim = &d->sim_traffic[d->sim_traffic_n++];
+                getstr(obj, "id", sim->id, sizeof sim->id);
+                sim->slot = (int)json_get_int(obj, "slot", 0);
+                getstr(obj, "iccid_tail", sim->iccid_tail, sizeof sim->iccid_tail);
+                getstr(obj, "operator", sim->operator_name, sizeof sim->operator_name);
+                sim->active = json_get(obj, "active", flag, sizeof flag) ? truthy_value(flag) : 0;
+                sim->today_rx_bytes = getu64(obj, "today_rx_bytes", 0);
+                sim->today_tx_bytes = getu64(obj, "today_tx_bytes", 0);
+                sim->today_bytes = getu64(obj, "today_bytes", 0);
+                sim->cycle_rx_bytes = getu64(obj, "cycle_rx_bytes", 0);
+                sim->cycle_tx_bytes = getu64(obj, "cycle_tx_bytes", 0);
+                sim->cycle_bytes = getu64(obj, "cycle_bytes", 0);
+                sim->lifetime_bytes = getu64(obj, "lifetime_bytes", 0);
+                sim->package_enabled = json_get(obj, "package_enabled", flag, sizeof flag) ? truthy_value(flag) : 0;
+                sim->allowance_bytes = getu64(obj, "allowance_bytes", 0);
+                sim->remaining_valid = json_get(obj, "remaining_bytes", remaining, sizeof remaining) &&
+                                       strcmp(remaining, "null") != 0;
+                if (sim->remaining_valid) sim->remaining_bytes = strtoull(remaining, NULL, 10);
+                sim->reset_day = (int)json_get_int(obj, "reset_day", 1);
+                sim->cycle_start = (int64_t)json_get_int(obj, "cycle_start", 0);
+                sim->cycle_end = (int64_t)json_get_int(obj, "cycle_end", 0);
+                sim->last_seen = (int64_t)json_get_int(obj, "last_seen", 0);
+                p = end + 1;
+            }
+        }
     }
 
     if (json_get(buf, "qos", sec, DEVUI_STATE_BUF_MAX)) {
@@ -917,4 +988,55 @@ int data_chart_metrics(devui_data_t *d)
         return 0;
     d->valid = 1;
     return 1;
+}
+
+int data_backend_request(const char *method, const char *path, char *body, size_t body_cap)
+{
+    char req[768];
+    char resp[8192];
+    char *payload;
+    size_t n = 0, payload_len;
+    int fd, status = 0;
+
+    if (!method || !path || !body || body_cap == 0) return 0;
+    body[0] = 0;
+    fd = connect_tcp(DEVUI_BACKEND_HOST, DEVUI_BACKEND_PORT, DEVUI_BACKEND_IO_TIMEOUT_MS);
+    if (fd < 0) return 0;
+    snprintf(req, sizeof req,
+             "%s %s HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+             method, path, DEVUI_BACKEND_HOST, DEVUI_BACKEND_PORT);
+    if (!send_all(fd, req, strlen(req), DEVUI_BACKEND_IO_TIMEOUT_MS)) {
+        close(fd);
+        return 0;
+    }
+    for (;;) {
+        ssize_t rd;
+        if (n + 1 >= sizeof resp || wait_fd_ready(fd, 0, DEVUI_BACKEND_IO_TIMEOUT_MS) <= 0) {
+            close(fd);
+            return 0;
+        }
+        rd = read(fd, resp + n, sizeof resp - 1 - n);
+        if (rd == 0) break;
+        if (rd < 0) {
+            if (errno == EINTR) continue;
+            close(fd);
+            return 0;
+        }
+        n += (size_t)rd;
+    }
+    close(fd);
+    resp[n] = 0;
+    if (sscanf(resp, "HTTP/%*s %d", &status) != 1) return 0;
+    payload = strstr(resp, "\r\n\r\n");
+    if (payload) payload += 4;
+    else {
+        payload = strstr(resp, "\n\n");
+        if (payload) payload += 2;
+    }
+    if (!payload) return status;
+    payload_len = n - (size_t)(payload - resp);
+    if (payload_len >= body_cap) payload_len = body_cap - 1;
+    memcpy(body, payload, payload_len);
+    body[payload_len] = 0;
+    return status;
 }

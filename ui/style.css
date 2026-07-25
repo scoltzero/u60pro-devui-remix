@@ -355,6 +355,38 @@ body.light .svc-log { background: #e4e8ee; color: #555e6b; }
 .svc-btn.armed { background: #b64b45; color: #fff; }
 .svc-btn.disabled { opacity: .48; }
 
+/* bundled dual-SIM traffic and timezone pages */
+.sim-manage-grid .svc-btn { min-height: 52px; }
+.sim-traffic-card table { margin-top: 3px; }
+.sim-traffic-card .func-note { font-size: 11px; }
+.traffic-plan-title, .traffic-plan-state { box-sizing: border-box; margin-top: 7px;
+                                          padding: 7px 8px; border-radius: 5px;
+                                          font-size: 11px; line-height: 16px; color: #718196; }
+body.dark .traffic-plan-title, body.dark .traffic-plan-state { background: #111821; }
+body.light .traffic-plan-title, body.light .traffic-plan-state { background: #edf2f7; }
+.traffic-plan-toggle { margin-top: 7px; }
+.step-row { margin-top: 8px; text-align: center; font-size: 0; }
+.step-label { height: 18px; line-height: 18px; text-align: left; font-size: 12px;
+              font-weight: 700; color: #718196; }
+.step-btn, .step-value { display: inline-block; box-sizing: border-box; height: 34px;
+                         line-height: 34px; margin: 2px; border-radius: 5px;
+                         text-align: center; vertical-align: middle; text-decoration: none; }
+.step-btn { width: 38px; font-size: 12px; font-weight: 700; }
+.step-value { width: 102px; font-size: 13px; font-weight: 800; }
+.step-day .step-btn { width: 64px; }
+.step-day .step-value { width: 120px; }
+body.dark .step-btn { background: #202b38; color: #d8dde5; }
+body.light .step-btn { background: #d9dee6; color: #252a32; }
+body.dark .step-value { background: #111821; color: #eef3f8; }
+body.light .step-value { background: #edf2f7; color: #172232; }
+.tz-hour-grid { margin: 3px -2px 0; font-size: 0; text-align: left; }
+.tz-hour { display: inline-block; box-sizing: border-box; width: 18%; height: 34px;
+           line-height: 34px; margin: 3px 1%; border-radius: 5px; text-align: center;
+           text-decoration: none; font-size: 12px; font-weight: 700; }
+body.dark .tz-hour { background: #202b38; color: #d8dde5; }
+body.light .tz-hour { background: #d9dee6; color: #252a32; }
+.tz-hour.on { background: #3f7fce; color: #fff; }
+
 /* compact long lists for optional service pages */
 .compact-card { padding-left: 8px; padding-right: 8px; }
 .compact-list { margin-top: 5px; }

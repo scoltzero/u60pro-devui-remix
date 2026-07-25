@@ -9,6 +9,8 @@
 - 提供启动、停止、重启和手动刷新操作，启动/停止按真实状态高亮。
 - 页面内显示最近三条带时间戳的操作记录，并保留即时 toast 反馈。
 - 提供基于 Linux cpufreq 的 CPU 省电、均衡、性能和极致模式控制页面。
+- 提供双卡管理、按 ICCID 持久流量和套餐设置；重启后继续累计，并以 DevUI 时区划分每日和套餐周期。
+- 提供独立固定偏移时区页面，只调整 DevUI 时钟、日志和流量周期，不修改系统 UTC。
 - 只允许调用固定控制脚本，不向自定义 HTML 暴露任意 Shell 执行能力。
 
 对应设备路径为：
@@ -18,6 +20,9 @@
 /data/plugins/mihomo/mm.sh
 /data/plugins/wireguard/wgctl.sh
 /data/plugins/operator-lock/operatorctl.sh
+/data/plugins/u60pro-devui/ui/functions/sim-switch.html
+/data/plugins/u60pro-devui/ui/functions/sim-traffic.html
+/data/plugins/u60pro-devui/ui/functions/timezone.html
 ```
 
 这是 ZTE U60Pro 以及类似 SDX 系列 5G MiFi 设备前面板屏幕 UI 的一个 clean-room 开源替代实现。运行在标准 Linux 的 **DRM/KMS** 和 **evdev** 接口之上，目标是：
@@ -102,18 +107,18 @@ adb shell '/etc/init.d/zte_topsw_devui stop; sleep 1;
 ```jsonc
 // Remix 聚合 version.json
 { "schema": 1,
-  "datad": { "version": "0.6.7-remix.3", "asset": "zwrt-datad-aarch64" },
-  "devui": { "version": "1.2.12-remix.5", "asset": "u60pro-devui-aarch64" },
-  "ui":    { "version": "0.4.10-remix.3", "asset": "ui.tar.gz" } }
+  "datad": { "version": "0.6.7-remix.4", "asset": "zwrt-datad-aarch64" },
+  "devui": { "version": "1.2.12-remix.7", "asset": "u60pro-devui-aarch64" },
+  "ui":    { "version": "0.4.10-remix.5", "asset": "ui.tar.gz" } }
 ```
 
-在原版管理器中选择“自定义源链接”，本版本推荐填写经过完整哈希校验的不可变 CDN 资产模板：
+在原版管理器中选择“自定义源链接”，正式发布后推荐填写对应版本的不可变 CDN 资产模板：
 
 ```text
-https://fastly.jsdelivr.net/gh/scoltzero/u60pro-devui-remix@assets-v1.2.12-remix.5/{file}
+https://fastly.jsdelivr.net/gh/scoltzero/u60pro-devui-remix@assets-v1.2.12-remix.7/{file}
 ```
 
-该地址固定指向 `v1.2.12-remix.5` 的五个发布文件，不会因 CDN 分支缓存而出现清单与二进制版本不一致。正式归档仍位于 `https://github.com/scoltzero/u60pro-devui-remix/releases/latest/download`。部分设备网络访问 GitHub Release 重定向超过管理器的命令请求时限时，应使用上面的 jsDelivr 模板；后续版本需要改用对应的新资产标签。
+该地址固定到同一批发布资产，避免清单和二进制因 CDN 分支缓存而不一致。正式归档仍位于 `https://github.com/scoltzero/u60pro-devui-remix/releases/latest/download`。
 
 **发版**：分别构建 DevUI 和 datad，再使用 `scripts/package-release.sh` 生成顶层平铺的 UI 包、合并版清单和 SHA-256 文件。
 
@@ -123,8 +128,13 @@ https://fastly.jsdelivr.net/gh/scoltzero/u60pro-devui-remix@assets-v1.2.12-remix
 bash scripts/build.sh
 bash scripts/package-release.sh \
   --datad ../zwrt-datad/zwrt-datad.stripped \
-  --out dist/v1.2.12-remix.5
+  --out dist/v1.2.12-remix.7
 ```
+
+## 致谢
+
+感谢 [Aawuxing](https://github.com/Aawuxing) 提交双卡管理和双卡流量页面的初始实现，
+本 Remix 在此基础上接入二次确认状态机、按 ICCID 的 datad 持久统计与套餐周期。
 
 ## 文档
 

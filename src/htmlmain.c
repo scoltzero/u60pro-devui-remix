@@ -96,6 +96,29 @@ static uint32_t monotonic_seconds(void)
     return (uint32_t)ts.tv_sec;
 }
 
+static int g_display_offset_minutes = 480;
+
+static void devui_localtime(time_t when, struct tm *out)
+{
+    time_t adjusted = when + (time_t)g_display_offset_minutes * 60;
+    gmtime_r(&adjusted, out);
+}
+
+static void devui_time_stamp(char *out, size_t outlen, time_t when)
+{
+    struct tm tmv;
+    devui_localtime(when, &tmv);
+    strftime(out, outlen, "%F %T", &tmv);
+}
+
+static void devui_posix_tz(char *out, size_t outlen)
+{
+    int posix_minutes = -g_display_offset_minutes;
+    char sign = posix_minutes < 0 ? '-' : '+';
+    int abs_minutes = posix_minutes < 0 ? -posix_minutes : posix_minutes;
+    snprintf(out, outlen, "UTC%c%d:%02d", sign, abs_minutes / 60, abs_minutes % 60);
+}
+
 /* Optional service pages under ui/functions/.  These fixed paths intentionally
  * avoid a generic "run shell from HTML" action: custom pages remain data-only,
  * while known local services get a small, auditable control surface. */
@@ -107,6 +130,7 @@ static uint32_t monotonic_seconds(void)
 #define CPU_CTL_LEGACY  UI_DIR "/../cpuctl.sh"
 #define CPU_CTL_OLD     "/data/ufi-tools/u60pro-devui/cpuctl.sh"
 #define CPU_ACTION_LOG "/tmp/devui-cpu-action.log"
+#define SIM_ACTION_LOG "/tmp/devui-sim-action.log"
 
 struct plugin_candidate {
     const char *dir;
@@ -264,6 +288,16 @@ static int  g_chart_cpu_sec = 48;
 static int  g_chart_mem_sec = 48;
 static int  g_chart_net_sec = 48;
 static int  g_chart_batt_sec = 48;
+static int  g_tz_draft_hour = 8;
+static int  g_tz_draft_minute;
+static int  g_tz_draft_dst;
+static int  g_tz_draft_dirty;
+static int  g_plan_edit_slot = 1;
+static int  g_plan_draft_enabled;
+static unsigned long long g_plan_draft_gib;
+static int  g_plan_draft_reset_day = 1;
+static int  g_plan_draft_dirty;
+static char g_plan_draft_sim_id[24];
 static int  g_sig_read;   /* ML1/raw signaling read switch */
 static int  g_sig_parse;  /* decoded LTE/NR signaling parse switch + page visibility */
 static int  g_neighbor_open; /* expand neighbor-cell list on the first signal page */
@@ -302,6 +336,8 @@ static int normalize_refresh_ms(int ms);
 static int normalize_chart_sec(int sec);
 
 static void invalidate_render_html_cache(void);
+static int sim_slot_refresh(uint32_t now, int force);
+static int dual_sim_page_available(int require_traffic);
 
 /* ---- page-2 aux state, cached (-1 = unknown). Like the reference plugin,
  * bands are controlled purely with `ifconfig wlanN up/down` and read back from
@@ -499,6 +535,12 @@ static void fmt_bytes(char *o, size_t n, long b) {
     if (b >= 1024L * 1024 * 1024) snprintf(o, n, "%.2f GB", b / 1073741824.0);
     else                          snprintf(o, n, "%.1f MB", b / 1048576.0);
 }
+static void fmt_bytes_u64(char *o, size_t n, unsigned long long b) {
+    if (b >= 1024ULL * 1024 * 1024) snprintf(o, n, "%.2f GB", b / 1073741824.0);
+    else if (b >= 1024ULL * 1024)   snprintf(o, n, "%.1f MB", b / 1048576.0);
+    else if (b >= 1024ULL)          snprintf(o, n, "%.1f KB", b / 1024.0);
+    else                            snprintf(o, n, "%llu B", b);
+}
 static void fmt_uptime(char *o, size_t n, long s) {
     long d = s / 86400; s %= 86400;
     snprintf(o, n, "%ldd %02ld:%02ld:%02ld", d, s / 3600, (s / 60) % 60, s % 60);
@@ -547,6 +589,7 @@ static void fmt_speed_pair(char *buf, size_t cap, long up, long down, int bits) 
 
 /* ---- {{key}} template substitution ---- */
 struct kv { const char *k; const char *v; };
+#define KV_MAX 320
 static void html_esc(char *dst, size_t cap, const char *src);
 static int signal_value_present(const char *s);
 
@@ -1117,15 +1160,8 @@ static void plugin_action_note(const char *path, const char *text)
 {
     FILE *fp = fopen(path, "a");
     char stamp[32];
-    FILE *date_fp;
     if (!fp) return;
-    snprintf(stamp, sizeof stamp, "-");
-    date_fp = popen("TZ=CST-8 date '+%F %T'", "r");
-    if (date_fp) {
-        if (fgets(stamp, sizeof stamp, date_fp))
-            stamp[strcspn(stamp, "\r\n")] = 0;
-        pclose(date_fp);
-    }
+    devui_time_stamp(stamp, sizeof stamp, time(NULL));
     fprintf(fp, "[%s] %s\n", stamp, text);
     fclose(fp);
 }
@@ -1134,8 +1170,10 @@ static void plugin_action_submit(const char *log_path, const char *runner,
                                  const char *ctl, const char *verb, const char *label)
 {
     char cmd[1536];
+    char tz[32];
+    devui_posix_tz(tz, sizeof tz);
     snprintf(cmd, sizeof cmd,
-             "nohup sh -c 'export TZ=CST-8; log=\"%s\"; tmp=\"${log}.out.$$\"; "
+             "nohup sh -c 'export TZ=%s; log=\"%s\"; tmp=\"${log}.out.$$\"; "
              "printf \"[%%s] 开始执行：%s\\n\" \"$(date \"+%%F %%T\")\" >>\"$log\"; "
              "%s%s %s >\"$tmp\" 2>&1; rc=$?; "
              "while IFS= read -r line || [ -n \"$line\" ]; do "
@@ -1144,7 +1182,7 @@ static void plugin_action_submit(const char *log_path, const char *runner,
              "\"$(date \"+%%F %%T\")\" \"$rc\" >>\"$log\"; "
              "tail -n 30 \"$log\" >\"$log.trim\" && mv \"$log.trim\" \"$log\"; exit \"$rc\"' "
              ">/dev/null 2>&1 &",
-             log_path, label, runner, ctl, verb, label);
+             tz, log_path, label, runner, ctl, verb, label);
     system(cmd);
 }
 
@@ -1155,7 +1193,10 @@ static int plugin_status_page(const char *path)
                     strstr(path, "/functions/mihomo.html") ||
                     strstr(path, "/functions/cpu-performance.html") ||
                     strstr(path, "/functions/wireguard.html") ||
-                    strstr(path, "/functions/operator-lock.html"));
+                    strstr(path, "/functions/operator-lock.html") ||
+                    strstr(path, "/functions/sim-switch.html") ||
+                    strstr(path, "/functions/sim-traffic.html") ||
+                    strstr(path, "/functions/timezone.html"));
 }
 
 static int plugin_page_named(const char *path, const char *name)
@@ -1521,6 +1562,9 @@ static void plugin_status_refresh(const char *path, int force)
     else if (plugin_page_named(path, "cpu-performance.html")) refresh_cpu_status();
     else if (plugin_page_named(path, "wireguard.html")) refresh_wireguard_status();
     else if (plugin_page_named(path, "operator-lock.html")) refresh_operator_status();
+    else if (plugin_page_named(path, "sim-switch.html") ||
+             plugin_page_named(path, "sim-traffic.html"))
+        (void)sim_slot_refresh(now, force);
 }
 
 /* ---- screen lock (PIN) persistence. The PIN lives in a dotfile under the UI
@@ -1995,6 +2039,12 @@ static int function_control_api_available(const char *name)
         return plugin_complete_select(g_wg_candidates, ARRAY_LEN(g_wg_candidates)) != NULL;
     if (!strcmp(name, "operator-lock.html"))
         return operator_complete_select() != NULL;
+    if (!strcmp(name, "sim-switch.html"))
+        return dual_sim_page_available(0);
+    if (!strcmp(name, "sim-traffic.html"))
+        return dual_sim_page_available(1);
+    if (!strcmp(name, "timezone.html"))
+        return 1;
     return 1;
 }
 
@@ -2150,6 +2200,9 @@ static const char *custom_function_tiles_html(void)
         else if (!strcmp(names[i], "cpu-performance.html")) desc = "频率策略与温控状态";
         else if (!strcmp(names[i], "wireguard.html")) desc = "隧道状态与 Peer";
         else if (!strcmp(names[i], "operator-lock.html")) desc = "扫描并锁定运营商";
+        else if (!strcmp(names[i], "sim-switch.html")) desc = "驻网模式与数据卡";
+        else if (!strcmp(names[i], "sim-traffic.html")) desc = "按卡流量与套餐";
+        else if (!strcmp(names[i], "timezone.html")) desc = "显示时区与周期";
         o += snprintf(buf + o, sizeof buf - o,
                       "<a href=\"act:func:%s\" class=\"func-tile func-custom\">"
                       "<span class=\"func-name\">%s</span>"
@@ -3254,6 +3307,20 @@ static int g_sim_switching;
 static uint32_t g_sim_refresh_at;
 static uint32_t g_sim_confirm_until;
 static uint32_t g_sim_switch_until;
+enum sim_operation_kind {
+    SIM_OPERATION_NONE = 0,
+    SIM_OPERATION_SLOT,
+    SIM_OPERATION_SINGLE,
+    SIM_OPERATION_DUAL,
+    SIM_OPERATION_AUTO
+};
+static enum sim_operation_kind g_sim_operation;
+static int g_sim_operation_value;
+static int g_sim_p1 = -1, g_sim_p2 = -1, g_sim_auto = -1;
+static char g_sim_state1[32] = "-", g_sim_state2[32] = "-";
+static char g_sim_operator1[48] = "-", g_sim_operator2[48] = "-";
+static int g_sim_mode_confirm;
+static uint32_t g_sim_mode_confirm_until;
 
 static const char *sim_slot_label(int slot)
 {
@@ -3275,14 +3342,31 @@ static int sim_switch_rc_read(int *rc)
 static void sim_switch_finish(uint32_t now, int ok, const char *reason)
 {
     int target = g_sim_switch_target;
+    enum sim_operation_kind operation = g_sim_operation;
+    char note[96];
     g_sim_switching = 0;
     g_sim_switch_target = 0;
+    g_sim_operation = SIM_OPERATION_NONE;
+    g_sim_operation_value = 0;
     g_sim_switch_until = 0;
     unlink(SIM_SWITCH_RC);
-    if (ok)
-        snprintf(g_toast, sizeof g_toast, "已切换到%s", sim_slot_label(target));
-    else
+    if (ok) {
+        if (operation == SIM_OPERATION_SLOT)
+            snprintf(g_toast, sizeof g_toast, "已切换到%s", sim_slot_label(target));
+        else if (operation == SIM_OPERATION_SINGLE)
+            snprintf(g_toast, sizeof g_toast, "已切换为单卡模式");
+        else if (operation == SIM_OPERATION_DUAL)
+            snprintf(g_toast, sizeof g_toast, "已切换为双卡双待");
+        else if (operation == SIM_OPERATION_AUTO)
+            snprintf(g_toast, sizeof g_toast, g_sim_auto == 1 ? "智能切换已开启" : "智能切换已关闭");
+        else
+            snprintf(g_toast, sizeof g_toast, "双卡操作已完成");
+        snprintf(note, sizeof note, "操作成功：%s", g_toast);
+    } else {
         snprintf(g_toast, sizeof g_toast, "%s", reason ? reason : "SIM 卡切换失败");
+        snprintf(note, sizeof note, "操作失败：%s", g_toast);
+    }
+    plugin_action_note(SIM_ACTION_LOG, note);
     g_toast_until = now + 2200;
 }
 
@@ -3293,32 +3377,65 @@ static int sim_slot_refresh(uint32_t now, int force)
 {
     uint32_t interval = g_sim_switching ? 1000U : 5000U;
     FILE *fp;
-    char line[64];
-    int dual = -1, slot = -1;
+    char line[128];
+    char state1[32] = "", state2[32] = "", operator1[48] = "", operator2[48] = "";
+    int dual = -1, slot = -1, p1 = -1, p2 = -1, auto_switch = -1;
     int old_dual = g_sim_dual, old_slot = g_sim_slot;
     int old_switching = g_sim_switching;
+    int old_p1 = g_sim_p1, old_p2 = g_sim_p2, old_auto = g_sim_auto;
     int rc;
 
     if (!force && g_sim_refresh_at && now - g_sim_refresh_at < interval) return 0;
     g_sim_refresh_at = now;
     fp = popen(
         "j=$(ubus -t 3 call zwrt_zte_mdm.api get_sim_info_before '{}' 2>/dev/null); "
-        "printf 'DUAL=%s\\nSLOT=%s\\n' "
+        "printf 'DUAL=%s\\nSLOT=%s\\nP1=%s\\nP2=%s\\nSTATE1=%s\\nSTATE2=%s\\nOP1=%s\\nOP2=%s\\nAUTO=%s\\n' "
         "\"$(printf '%s' \"$j\" | jsonfilter -e '@.support_dual_sim' 2>/dev/null)\" "
-        "\"$(printf '%s' \"$j\" | jsonfilter -e '@.current_sim_slot' 2>/dev/null)\"",
+        "\"$(printf '%s' \"$j\" | jsonfilter -e '@.current_sim_slot' 2>/dev/null)\" "
+        "\"$(printf '%s' \"$j\" | jsonfilter -e '@.sim1_provision_state' 2>/dev/null)\" "
+        "\"$(printf '%s' \"$j\" | jsonfilter -e '@.sim2_provision_state' 2>/dev/null)\" "
+        "\"$(printf '%s' \"$j\" | jsonfilter -e '@.sim_states' 2>/dev/null)\" "
+        "\"$(printf '%s' \"$j\" | jsonfilter -e '@.sim2_states' 2>/dev/null)\" "
+        "\"$(printf '%s' \"$j\" | jsonfilter -e '@.Operator' 2>/dev/null)\" "
+        "\"$(printf '%s' \"$j\" | jsonfilter -e '@.Operator2' 2>/dev/null)\" "
+        "\"$(uci -q get zwrt_zte_mdm.sim_info.st_auto_switch_card_flag 2>/dev/null)\"",
         "r");
     if (fp) {
         while (fgets(line, sizeof line, fp)) {
             if (!strncmp(line, "DUAL=", 5) && (line[5] == '0' || line[5] == '1')) dual = line[5] - '0';
             else if (!strncmp(line, "SLOT=", 5) && (line[5] == '1' || line[5] == '2')) slot = line[5] - '0';
+            else if (!strncmp(line, "P1=", 3) && (line[3] == '0' || line[3] == '1')) p1 = line[3] - '0';
+            else if (!strncmp(line, "P2=", 3) && (line[3] == '0' || line[3] == '1')) p2 = line[3] - '0';
+            else if (!strncmp(line, "STATE1=", 7)) line_value(state1, sizeof state1, line, 7);
+            else if (!strncmp(line, "STATE2=", 7)) line_value(state2, sizeof state2, line, 7);
+            else if (!strncmp(line, "OP1=", 4)) line_value(operator1, sizeof operator1, line, 4);
+            else if (!strncmp(line, "OP2=", 4)) line_value(operator2, sizeof operator2, line, 4);
+            else if (!strncmp(line, "AUTO=", 5) && (line[5] == '0' || line[5] == '1')) auto_switch = line[5] - '0';
         }
         pclose(fp);
     }
     if (dual >= 0) g_sim_dual = dual;
     if (slot >= 0) g_sim_slot = slot;
+    if (p1 >= 0) g_sim_p1 = p1;
+    if (p2 >= 0) g_sim_p2 = p2;
+    if (auto_switch >= 0) g_sim_auto = auto_switch;
+    if (state1[0] && strcmp(state1, "-")) snprintf(g_sim_state1, sizeof g_sim_state1, "%s", state1);
+    if (state2[0] && strcmp(state2, "-")) snprintf(g_sim_state2, sizeof g_sim_state2, "%s", state2);
+    if (operator1[0] && strcmp(operator1, "-")) snprintf(g_sim_operator1, sizeof g_sim_operator1, "%s", operator1);
+    if (operator2[0] && strcmp(operator2, "-")) snprintf(g_sim_operator2, sizeof g_sim_operator2, "%s", operator2);
 
     if (g_sim_switching) {
-        if (g_sim_slot == g_sim_switch_target) {
+        int complete = 0;
+        if (g_sim_operation == SIM_OPERATION_SLOT)
+            complete = g_sim_slot == g_sim_switch_target;
+        else if (g_sim_operation == SIM_OPERATION_SINGLE)
+            complete = (g_sim_p1 + g_sim_p2) == 1 &&
+                       ((g_sim_slot == 1 && g_sim_p1 == 1) || (g_sim_slot == 2 && g_sim_p2 == 1));
+        else if (g_sim_operation == SIM_OPERATION_DUAL)
+            complete = g_sim_p1 == 1 && g_sim_p2 == 1;
+        else if (g_sim_operation == SIM_OPERATION_AUTO)
+            complete = g_sim_auto == g_sim_operation_value;
+        if (complete) {
             sim_switch_finish(now, 1, NULL);
         } else if (sim_switch_rc_read(&rc) && rc != 0) {
             sim_switch_finish(now, 0, "SIM 卡切换命令失败");
@@ -3326,30 +3443,72 @@ static int sim_slot_refresh(uint32_t now, int force)
             sim_switch_finish(now, 0, "SIM 卡切换超时");
         }
     }
-    return old_dual != g_sim_dual || old_slot != g_sim_slot || old_switching != g_sim_switching;
+    return old_dual != g_sim_dual || old_slot != g_sim_slot || old_switching != g_sim_switching ||
+           old_p1 != g_sim_p1 || old_p2 != g_sim_p2 || old_auto != g_sim_auto;
+}
+
+static int sim_operation_start(enum sim_operation_kind operation, int value, uint32_t now)
+{
+    char cmd[1024], action[768];
+    int current = g_sim_slot == 2 ? 2 : 1;
+    int other = current == 1 ? 2 : 1;
+    const char *label;
+
+    action[0] = 0;
+    if (operation == SIM_OPERATION_SLOT && (value == 1 || value == 2)) {
+        snprintf(action, sizeof action,
+                 "ubus -t 20 call zwrt_zte_mdm.api zwrt_zte_mdm_activate_sim "
+                 "'{\"sim_card_id\":%d}'", value);
+        label = value == 1 ? "切换到自插卡" : "切换到内置卡";
+    } else if (operation == SIM_OPERATION_SINGLE) {
+        snprintf(action, sizeof action,
+                 "ubus -t 20 call zwrt_zte_mdm.api zwrt_mdm_change_provision_session "
+                 "'{\"active_slot\":%d,\"active_flag\":1}' && "
+                 "ubus -t 20 call zwrt_zte_mdm.api zwrt_mdm_change_provision_session "
+                 "'{\"active_slot\":%d,\"active_flag\":0}'",
+                 current, other);
+        label = "切换为单卡模式";
+    } else if (operation == SIM_OPERATION_DUAL) {
+        snprintf(action, sizeof action,
+                 "ubus -t 20 call zwrt_zte_mdm.api zwrt_mdm_change_provision_session "
+                 "'{\"active_slot\":1,\"active_flag\":1}' && "
+                 "ubus -t 20 call zwrt_zte_mdm.api zwrt_mdm_change_provision_session "
+                 "'{\"active_slot\":2,\"active_flag\":1}'");
+        label = "切换为双卡双待";
+    } else if (operation == SIM_OPERATION_AUTO && (value == 0 || value == 1)) {
+        snprintf(action, sizeof action,
+                 "ubus -t 15 call zwrt_zte_mdm.api st_set_auto_switch_slot "
+                 "'{\"auto_switch_slot_flag\":%d}'", value);
+        label = value ? "开启智能切换" : "关闭智能切换";
+    } else {
+        return -1;
+    }
+    unlink(SIM_SWITCH_RC);
+    unlink(SIM_SWITCH_LOG);
+    if (snprintf(cmd, sizeof cmd,
+                 "(%s >" SIM_SWITCH_LOG " 2>&1; echo $? >" SIM_SWITCH_RC ") &",
+                 action) >= (int)sizeof cmd)
+        return -1;
+    if (system(cmd) != 0) return -1;
+    g_sim_switching = 1;
+    g_sim_operation = operation;
+    g_sim_operation_value = value;
+    g_sim_switch_target = operation == SIM_OPERATION_SLOT ? value : 0;
+    g_sim_switch_until = now + 60000U;
+    g_sim_confirm_slot = 0;
+    g_sim_confirm_until = 0;
+    g_sim_mode_confirm = 0;
+    g_sim_mode_confirm_until = 0;
+    g_sim_refresh_at = 0;
+    snprintf(g_toast, sizeof g_toast, "%s中", label);
+    plugin_action_note(SIM_ACTION_LOG, label);
+    g_toast_until = now + 2200;
+    return 0;
 }
 
 static int sim_switch_start(int slot, uint32_t now)
 {
-    char cmd[384];
-    if (slot != 1 && slot != 2) return -1;
-    unlink(SIM_SWITCH_RC);
-    unlink(SIM_SWITCH_LOG);
-    if (snprintf(cmd, sizeof cmd,
-                 "(ubus -t 20 call zwrt_zte_mdm.api zwrt_zte_mdm_activate_sim "
-                 "'{\"sim_card_id\":%d}' >" SIM_SWITCH_LOG " 2>&1; "
-                 "echo $? >" SIM_SWITCH_RC ") &", slot) >= (int)sizeof cmd)
-        return -1;
-    if (system(cmd) != 0) return -1;
-    g_sim_switching = 1;
-    g_sim_switch_target = slot;
-    g_sim_switch_until = now + 60000U;
-    g_sim_confirm_slot = 0;
-    g_sim_confirm_until = 0;
-    g_sim_refresh_at = 0;
-    snprintf(g_toast, sizeof g_toast, "正在切换到%s", sim_slot_label(slot));
-    g_toast_until = now + 2200;
-    return 0;
+    return sim_operation_start(SIM_OPERATION_SLOT, slot, now);
 }
 
 static void sim_slot_action(int slot, uint32_t now)
@@ -3380,9 +3539,58 @@ static void sim_slot_action(int slot, uint32_t now)
         return;
     }
     g_sim_confirm_slot = slot;
+    g_sim_mode_confirm = 0;
     g_sim_confirm_until = now + 4000U;
     snprintf(g_toast, sizeof g_toast, "请再次点击%s确认", sim_slot_label(slot));
     g_toast_until = now + 1800;
+}
+
+static void sim_mode_action(int dual_mode, uint32_t now)
+{
+    int target = dual_mode ? 2 : 1;
+    (void)sim_slot_refresh(now, 1);
+    if (g_sim_dual != 1) {
+        snprintf(g_toast, sizeof g_toast, "当前设备不支持双卡管理");
+    } else if (g_sim_switching) {
+        snprintf(g_toast, sizeof g_toast, "已有双卡操作正在执行");
+    } else if ((!dual_mode && (g_sim_p1 + g_sim_p2) == 1) ||
+               (dual_mode && g_sim_p1 == 1 && g_sim_p2 == 1)) {
+        snprintf(g_toast, sizeof g_toast, dual_mode ? "当前已是双卡双待" : "当前已是单卡模式");
+        g_sim_mode_confirm = 0;
+    } else if (g_sim_mode_confirm == target && (int32_t)(g_sim_mode_confirm_until - now) > 0) {
+        if (sim_operation_start(dual_mode ? SIM_OPERATION_DUAL : SIM_OPERATION_SINGLE, target, now) != 0)
+            snprintf(g_toast, sizeof g_toast, "无法启动双卡模式切换");
+    } else {
+        g_sim_mode_confirm = target;
+        g_sim_mode_confirm_until = now + 4000U;
+        g_sim_confirm_slot = 0;
+        snprintf(g_toast, sizeof g_toast,
+                 dual_mode ? "请再次点击确认双卡双待" : "请再次点击确认单卡模式");
+    }
+    g_toast_until = now + 1800;
+}
+
+static void sim_auto_action(int enabled, uint32_t now)
+{
+    (void)sim_slot_refresh(now, 1);
+    if (g_sim_dual != 1)
+        snprintf(g_toast, sizeof g_toast, "当前设备不支持双卡管理");
+    else if (g_sim_switching)
+        snprintf(g_toast, sizeof g_toast, "已有双卡操作正在执行");
+    else if (g_sim_auto == enabled)
+        snprintf(g_toast, sizeof g_toast, enabled ? "智能切换已经开启" : "智能切换已经关闭");
+    else if (sim_operation_start(SIM_OPERATION_AUTO, enabled, now) != 0)
+        snprintf(g_toast, sizeof g_toast, "无法修改智能切换状态");
+    g_toast_until = now + 1800;
+}
+
+static int dual_sim_page_available(int require_traffic)
+{
+    devui_data_t data;
+    (void)sim_slot_refresh(millis(), 0);
+    if (g_sim_dual != 1) return 0;
+    if (!require_traffic) return 1;
+    return data_refresh_live(&data) && data.sim_traffic_available;
 }
 
 static int band_count(const char *s) { if (!s[0]) return 0; int n = 1; for (; *s; s++) if (*s == ',') n++; return n; }
@@ -5025,6 +5233,197 @@ static const char *signal_neighbors_html(const struct signal_bundle *sig)
     return buf;
 }
 
+static int timezone_draft_offset(void)
+{
+    int offset = g_tz_draft_hour * 60;
+    if (g_tz_draft_hour < 0) offset -= g_tz_draft_minute;
+    else offset += g_tz_draft_minute;
+    return offset;
+}
+
+static void timezone_offset_label(char *out, size_t outlen, int offset)
+{
+    char sign = offset < 0 ? '-' : '+';
+    int abs_offset = offset < 0 ? -offset : offset;
+    snprintf(out, outlen, "UTC%c%02d:%02d", sign, abs_offset / 60, abs_offset % 60);
+}
+
+static void timezone_sync_draft(const devui_data_t *data)
+{
+    int offset;
+    if (!data) return;
+    offset = data->timezone_available ? data->timezone_offset_minutes : 480;
+    if (g_tz_draft_dirty) {
+        if (data->timezone_available && offset == timezone_draft_offset() &&
+            data->timezone_dst_minutes == (g_tz_draft_dst ? 60 : 0))
+            g_tz_draft_dirty = 0;
+        else
+            return;
+    }
+    g_tz_draft_hour = offset / 60;
+    g_tz_draft_minute = abs(offset % 60);
+    g_tz_draft_dst = data->timezone_available ? data->timezone_dst_minutes == 60 : 0;
+}
+
+static const char *timezone_hours_html(void)
+{
+    static char html[4096];
+    int o = 0;
+    for (int hour = -12; hour <= 14; hour++) {
+        o += snprintf(html + o, sizeof html - (size_t)o,
+                      "<a href='act:tzhour:%d' class='tz-hour%s'>%+d</a>",
+                      hour, hour == g_tz_draft_hour ? " on" : "", hour);
+        if (o >= (int)sizeof html - 80) break;
+    }
+    return html;
+}
+
+static const devui_sim_traffic_t *sim_traffic_for_slot(const devui_data_t *data, int slot)
+{
+    const devui_sim_traffic_t *best = NULL;
+    if (!data) return NULL;
+    for (int i = 0; i < data->sim_traffic_n; i++) {
+        const devui_sim_traffic_t *sim = &data->sim_traffic[i];
+        if (sim->slot != slot) continue;
+        if (sim->active) return sim;
+        if (!best || sim->last_seen > best->last_seen) best = sim;
+    }
+    return best;
+}
+
+static const char *sim_operator_display(const char *raw)
+{
+    if (!raw || !raw[0] || !strcmp(raw, "-")) return "未识别";
+    if (!strcmp(raw, "CMCC") || !strcmp(raw, "China Mobile")) return "中国移动";
+    if (!strcmp(raw, "CUCC") || !strcmp(raw, "China Unicom")) return "中国联通";
+    if (!strcmp(raw, "CTCC") || !strcmp(raw, "China Telecom")) return "中国电信";
+    if (!strcmp(raw, "CBN") || !strcmp(raw, "China Broadnet")) return "中国广电";
+    return raw;
+}
+
+static const char *sim_traffic_cards_html(const devui_data_t *data)
+{
+    static char html[8192];
+    int o = 0;
+    for (int slot = 1; slot <= 2; slot++) {
+        const devui_sim_traffic_t *sim = sim_traffic_for_slot(data, slot);
+        char today[32] = "尚无统计", cycle[32] = "尚无统计", remaining[32] = "未设置", lifetime[32] = "尚无统计";
+        char operator_esc[128], tail_esc[32], state_esc[96];
+        const char *operator_name = slot == 1 ? g_sim_operator1 : g_sim_operator2;
+        const char *state = slot == 1 ? g_sim_state1 : g_sim_state2;
+        if (sim) {
+            if (sim->operator_name[0]) operator_name = sim->operator_name;
+            fmt_bytes_u64(today, sizeof today, sim->today_bytes);
+            fmt_bytes_u64(cycle, sizeof cycle, sim->cycle_bytes);
+            fmt_bytes_u64(lifetime, sizeof lifetime, sim->lifetime_bytes);
+            if (sim->remaining_valid) fmt_bytes_u64(remaining, sizeof remaining, sim->remaining_bytes);
+            else snprintf(remaining, sizeof remaining, "未启用套餐");
+        }
+        html_esc(operator_esc, sizeof operator_esc, sim_operator_display(operator_name));
+        html_esc(tail_esc, sizeof tail_esc, sim && sim->iccid_tail[0] ? sim->iccid_tail : "-");
+        html_esc(state_esc, sizeof state_esc, state && state[0] ? state : "-");
+        o += snprintf(html + o, sizeof html - (size_t)o,
+                      "<div class='card sim-traffic-card'>"
+                      "<div class='title'>%s <span class='r %s'>%s</span></div>"
+                      "<table><tr><td class='kv-l'>运营商</td><td class='val'>%s</td></tr>"
+                      "<tr><td class='kv-l'>卡号尾号</td><td class='val'>%s</td></tr>"
+                      "<tr><td class='kv-l'>今日用量</td><td class='val'>%s</td></tr>"
+                      "<tr><td class='kv-l'>本周期</td><td class='val'>%s</td></tr>"
+                      "<tr><td class='kv-l'>套餐剩余</td><td class='val'>%s</td></tr>"
+                      "<tr><td class='kv-l'>长期累计</td><td class='val'>%s</td></tr></table>"
+                      "<div class='func-note'>状态 %s%s</div></div>",
+                      slot == 1 ? "自插卡" : "内置卡",
+                      g_sim_slot == slot ? "ok" : "muted",
+                      g_sim_slot == slot ? "使用中" : "待机",
+                      operator_esc, tail_esc, today, cycle, remaining, lifetime,
+                      state_esc, sim ? "" : " · 使用该卡后开始统计");
+        if (o >= (int)sizeof html - 800) break;
+    }
+    return html;
+}
+
+static void traffic_plan_sync_draft(const devui_data_t *data)
+{
+    const devui_sim_traffic_t *sim = sim_traffic_for_slot(data, g_plan_edit_slot);
+    if (g_plan_draft_dirty) {
+        uint64_t allowance = g_plan_draft_gib << 30;
+        if (sim && !strcmp(sim->id, g_plan_draft_sim_id) &&
+            sim->package_enabled == g_plan_draft_enabled &&
+            sim->allowance_bytes == allowance &&
+            sim->reset_day == g_plan_draft_reset_day)
+            g_plan_draft_dirty = 0;
+        else
+            return;
+    }
+    g_plan_draft_sim_id[0] = 0;
+    g_plan_draft_enabled = 0;
+    g_plan_draft_gib = 0;
+    g_plan_draft_reset_day = 1;
+    if (!sim) return;
+    snprintf(g_plan_draft_sim_id, sizeof g_plan_draft_sim_id, "%s", sim->id);
+    g_plan_draft_enabled = sim->package_enabled;
+    g_plan_draft_gib = sim->allowance_bytes ?
+                       (sim->allowance_bytes + ((1ULL << 30) - 1)) >> 30 : 0;
+    g_plan_draft_reset_day = sim->reset_day > 0 ? sim->reset_day : 1;
+}
+
+static void timezone_apply_action(uint32_t now)
+{
+    char path[160], response[512];
+    int offset = timezone_draft_offset();
+    int dst = g_tz_draft_dst ? 60 : 0;
+    int effective = offset + dst;
+    int status;
+
+    if (offset < -720 || offset > 840 || offset % 15 ||
+        effective < -720 || effective > 840) {
+        snprintf(g_toast, sizeof g_toast, "时区超出 UTC-12 至 +14");
+        g_toast_until = now + 2000;
+        return;
+    }
+    snprintf(path, sizeof path,
+             "/settings/timezone?offset_minutes=%d&dst_minutes=%d", offset, dst);
+    status = data_backend_request("POST", path, response, sizeof response);
+    if (status == 200) {
+        g_display_offset_minutes = effective;
+        g_last_clock_min = -1;
+        snprintf(g_toast, sizeof g_toast, "时区已保存");
+    } else {
+        snprintf(g_toast, sizeof g_toast, "时区保存失败");
+    }
+    g_toast_until = now + 2000;
+}
+
+static void traffic_plan_apply_action(uint32_t now)
+{
+    char path[320], response[512];
+    unsigned long long allowance;
+    int status;
+
+    if (!g_plan_draft_sim_id[0]) {
+        snprintf(g_toast, sizeof g_toast, "该卡尚无流量记录");
+        g_toast_until = now + 2000;
+        return;
+    }
+    if (g_plan_draft_enabled && g_plan_draft_gib == 0) {
+        snprintf(g_toast, sizeof g_toast, "套餐流量不能为 0");
+        g_toast_until = now + 2000;
+        return;
+    }
+    if (g_plan_draft_gib > 16384ULL) {
+        snprintf(g_toast, sizeof g_toast, "套餐流量设置过大");
+        g_toast_until = now + 2000;
+        return;
+    }
+    allowance = g_plan_draft_gib << 30;
+    snprintf(path, sizeof path,
+             "/sim-traffic/config?sim_id=%s&enabled=%d&allowance_bytes=%llu&reset_day=%d",
+             g_plan_draft_sim_id, g_plan_draft_enabled, allowance, g_plan_draft_reset_day);
+    status = data_backend_request("POST", path, response, sizeof response);
+    snprintf(g_toast, sizeof g_toast, "%s", status == 200 ? "套餐设置已保存" : "套餐设置保存失败");
+    g_toast_until = now + 2000;
+}
+
 /* Fill a kv table from the current device state. Buffers are static. */
 static int build_kv(struct kv *t, const char *path)
 {
@@ -5050,12 +5449,16 @@ static int build_kv(struct kv *t, const char *path)
     static struct signal_bundle sig;
     int ta = -1;
     if (!data_refresh(&d)) memset(&d, 0, sizeof d);
+    if (d.timezone_available)
+        g_display_offset_minutes = d.timezone_effective_minutes;
     plugin_status_refresh(path, 0);
+    timezone_sync_draft(&d);
+    traffic_plan_sync_draft(&d);
     g_charging = d.charger_connect;
     snprintf(s_page, sizeof s_page, "%d", g_cur + 1);
     snprintf(s_np, sizeof s_np, "%d", g_npages);
 
-    time_t now = time(NULL); struct tm tmv; localtime_r(&now, &tmv);
+    time_t now = time(NULL); struct tm tmv; devui_localtime(now, &tmv);
     snprintf(s_time, sizeof s_time, "%02d:%02d", tmv.tm_hour, tmv.tm_min);
     snprintf(s_sigrefresh, sizeof s_sigrefresh, "%02d:%02d:%02d",
              tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
@@ -5633,6 +6036,7 @@ static int build_kv(struct kv *t, const char *path)
     static char s_netseg[640], s_simswitch[1200], s_cursa[300], s_curnsa[300], s_curlte[300], s_toast[120];
     static char s_ts_action_log[2200], s_mh_action_log[2200], s_cpu_action_log[2200];
     static char s_wg_action_log[2200], s_op_action_log[2200];
+    static char s_sim_action_log[2200];
     static char s_wg_peers[24], s_wg_active[24], s_op_selected[16], s_op_job[440];
     static char s_wg_iface[80], s_wg_address[220], s_wg_port[48], s_wg_mode[64];
     static char s_op_sim[80], s_op_operator[96], s_op_rat[80], s_op_mode[64];
@@ -5822,6 +6226,73 @@ static int build_kv(struct kv *t, const char *path)
     const char *usb_pwr_state = g_typec_pending >= 0 ? "切换中" : (usb_reverse ? "反向供电" : "给U60充电");
     const char *usb_net_state = g_usb_net_pending >= 0 ? "切换中" : (usb_net_on ? "共享中" : "仅充电");
 
+    /* ---- bundled timezone, dual-SIM management and persistent traffic ---- */
+    static char s_sim_mode[32], s_sim_current[128], s_sim_auto[24];
+    static char s_sim1op[128], s_sim2op[128], s_sim1state[96], s_sim2state[96];
+    static char s_tz_current[32], s_tz_draft[32], s_tz_effective[32];
+    static char s_tz_minutes[560], s_tz_dst[320];
+    static char s_plan_gib[24], s_plan_day[8], s_plan_title[128], s_plan_state[160];
+    const devui_sim_traffic_t *plan_sim = sim_traffic_for_slot(&d, g_plan_edit_slot);
+    int sim_mode_single = (g_sim_p1 + g_sim_p2) == 1 &&
+                          (g_sim_p1 == 1 || g_sim_p2 == 1);
+    int sim_mode_dual = g_sim_p1 == 1 && g_sim_p2 == 1;
+    int sim_mode_armed = g_sim_mode_confirm &&
+                         (int32_t)(g_sim_mode_confirm_until - now_ms) > 0;
+    int sim_slot_armed = g_sim_confirm_slot &&
+                         (int32_t)(g_sim_confirm_until - now_ms) > 0;
+
+    snprintf(s_sim_mode, sizeof s_sim_mode, "%s",
+             sim_mode_dual ? "双卡双待" : sim_mode_single ? "单卡模式" : "状态未知");
+    {
+        char raw[96];
+        snprintf(raw, sizeof raw, "%s · %s", sim_slot_label(g_sim_slot),
+                 sim_operator_display(g_sim_slot == 2 ? g_sim_operator2 : g_sim_operator1));
+        html_esc(s_sim_current, sizeof s_sim_current, raw);
+    }
+    snprintf(s_sim_auto, sizeof s_sim_auto, "%s",
+             g_sim_auto == 1 ? "已开启" : g_sim_auto == 0 ? "已关闭" : "状态未知");
+    html_esc(s_sim1op, sizeof s_sim1op, sim_operator_display(g_sim_operator1));
+    html_esc(s_sim2op, sizeof s_sim2op, sim_operator_display(g_sim_operator2));
+    html_esc(s_sim1state, sizeof s_sim1state, g_sim_state1);
+    html_esc(s_sim2state, sizeof s_sim2state, g_sim_state2);
+
+    snprintf(s_tz_current, sizeof s_tz_current, "%s",
+             d.timezone_available && d.timezone_label[0] ? d.timezone_label : "UTC+08:00");
+    timezone_offset_label(s_tz_draft, sizeof s_tz_draft, timezone_draft_offset());
+    timezone_offset_label(s_tz_effective, sizeof s_tz_effective,
+                          timezone_draft_offset() + (g_tz_draft_dst ? 60 : 0));
+    {
+        static const int minutes[] = { 0, 15, 30, 45 };
+        int o = snprintf(s_tz_minutes, sizeof s_tz_minutes, "<div class='seg seg4'>");
+        for (size_t k = 0; k < ARRAY_LEN(minutes); k++)
+            o += snprintf(s_tz_minutes + o, sizeof s_tz_minutes - (size_t)o,
+                          "<a href='act:tzminute:%d' class='segc%s'>:%02d</a>",
+                          minutes[k], minutes[k] == g_tz_draft_minute ? " seg-on" : "", minutes[k]);
+        snprintf(s_tz_minutes + o, sizeof s_tz_minutes - (size_t)o, "</div>");
+    }
+    snprintf(s_tz_dst, sizeof s_tz_dst,
+             "<div class='seg seg2'>"
+             "<a href='act:tzdst:0' class='segc%s'>标准时间</a>"
+             "<a href='act:tzdst:1' class='segc%s'>夏令时 +1h</a></div>",
+             g_tz_draft_dst ? "" : " seg-on", g_tz_draft_dst ? " seg-on" : "");
+
+    snprintf(s_plan_gib, sizeof s_plan_gib, "%llu GiB", g_plan_draft_gib);
+    snprintf(s_plan_day, sizeof s_plan_day, "%d", g_plan_draft_reset_day);
+    if (plan_sim) {
+        char raw[128];
+        snprintf(raw, sizeof raw, "%s · %s · 尾号 %s",
+                 sim_slot_label(g_plan_edit_slot), sim_operator_display(plan_sim->operator_name),
+                 plan_sim->iccid_tail[0] ? plan_sim->iccid_tail : "-");
+        html_esc(s_plan_title, sizeof s_plan_title, raw);
+        snprintf(s_plan_state, sizeof s_plan_state, "%s · 每月 %d 日重置",
+                 g_plan_draft_enabled ? "套餐统计已开启" : "套餐统计已关闭",
+                 g_plan_draft_reset_day);
+    } else {
+        snprintf(s_plan_title, sizeof s_plan_title, "%s · 尚无 ICCID 记录",
+                 sim_slot_label(g_plan_edit_slot));
+        snprintf(s_plan_state, sizeof s_plan_state, "请先使用该卡联网，后端识别 ICCID 后即可设置套餐");
+    }
+
     int connected = strstr(d.wan_status, "connect") != NULL;
     int wifi_master = (g_w24 == 1 || g_w5 == 1);
     int i = 0;
@@ -5903,6 +6374,49 @@ static int build_kv(struct kv *t, const char *path)
     }
     t[i++] = (struct kv){ "NETSEG", s_netseg };
     t[i++] = (struct kv){ "SIMSWITCH", s_simswitch };
+    t[i++] = (struct kv){ "SIMREADY", g_sim_dual == 1 ? (g_sim_switching ? "操作中" : "已就绪") : g_sim_dual == 0 ? "单卡设备" : "读取中" };
+    t[i++] = (struct kv){ "SIMREADYCLASS", g_sim_dual == 1 ? (g_sim_switching ? "warn" : "ok") : "muted" };
+    t[i++] = (struct kv){ "SIMMODE", s_sim_mode };
+    t[i++] = (struct kv){ "SIMCURRENT", s_sim_current };
+    t[i++] = (struct kv){ "SIMAUTO", s_sim_auto };
+    t[i++] = (struct kv){ "SIMSINGLECLASS", g_sim_switching ? "disabled" : sim_mode_armed && g_sim_mode_confirm == 1 ? "armed" : sim_mode_single ? "seg-on" : "" };
+    t[i++] = (struct kv){ "SIMDUALCLASS", g_sim_switching ? "disabled" : sim_mode_armed && g_sim_mode_confirm == 2 ? "armed" : sim_mode_dual ? "seg-on" : "" };
+    t[i++] = (struct kv){ "SIMSINGLELABEL", g_sim_switching && g_sim_operation == SIM_OPERATION_SINGLE ? "切换中" : sim_mode_armed && g_sim_mode_confirm == 1 ? "再次确认单卡" : "单卡模式" };
+    t[i++] = (struct kv){ "SIMDUALLABEL", g_sim_switching && g_sim_operation == SIM_OPERATION_DUAL ? "切换中" : sim_mode_armed && g_sim_mode_confirm == 2 ? "再次确认双卡" : "双卡双待" };
+    t[i++] = (struct kv){ "SIMAUTOONCLASS", !g_sim_switching && g_sim_auto == 1 ? "seg-on" : g_sim_switching ? "disabled" : "" };
+    t[i++] = (struct kv){ "SIMAUTOOFFCLASS", !g_sim_switching && g_sim_auto == 0 ? "seg-on" : g_sim_switching ? "disabled" : "" };
+    t[i++] = (struct kv){ "SIM1CLASS", g_sim_switching ? (g_sim_switch_target == 1 ? "armed" : "disabled") : sim_slot_armed && g_sim_confirm_slot == 1 ? "armed" : g_sim_slot == 1 ? "seg-on" : "" };
+    t[i++] = (struct kv){ "SIM2CLASS", g_sim_switching ? (g_sim_switch_target == 2 ? "armed" : "disabled") : sim_slot_armed && g_sim_confirm_slot == 2 ? "armed" : g_sim_slot == 2 ? "seg-on" : "" };
+    t[i++] = (struct kv){ "SIM1LABEL", g_sim_switching && g_sim_switch_target == 1 ? "切换中" : sim_slot_armed && g_sim_confirm_slot == 1 ? "再次确认自插卡" : "自插卡" };
+    t[i++] = (struct kv){ "SIM2LABEL", g_sim_switching && g_sim_switch_target == 2 ? "切换中" : sim_slot_armed && g_sim_confirm_slot == 2 ? "再次确认内置卡" : "内置卡" };
+    t[i++] = (struct kv){ "SIM1OP", s_sim1op };
+    t[i++] = (struct kv){ "SIM2OP", s_sim2op };
+    t[i++] = (struct kv){ "SIM1STATE", s_sim1state };
+    t[i++] = (struct kv){ "SIM2STATE", s_sim2state };
+    t[i++] = (struct kv){ "SIM1PROVISION", g_sim_p1 == 1 ? "已启用" : g_sim_p1 == 0 ? "未启用" : "未知" };
+    t[i++] = (struct kv){ "SIM2PROVISION", g_sim_p2 == 1 ? "已启用" : g_sim_p2 == 0 ? "未启用" : "未知" };
+    plugin_action_log_html(s_sim_action_log, sizeof s_sim_action_log, SIM_ACTION_LOG);
+    t[i++] = (struct kv){ "SIMACTIONLOG", s_sim_action_log };
+    t[i++] = (struct kv){ "SIMTRAFFICSTATE", d.sim_traffic_available ? "持久统计正常" : "等待后端" };
+    t[i++] = (struct kv){ "SIMTRAFFICSTATECLASS", d.sim_traffic_available ? "ok" : "muted" };
+    t[i++] = (struct kv){ "SIMTRAFFICCARDS", sim_traffic_cards_html(&d) };
+    t[i++] = (struct kv){ "PLAN1CLASS", g_plan_edit_slot == 1 ? "seg-on" : "" };
+    t[i++] = (struct kv){ "PLAN2CLASS", g_plan_edit_slot == 2 ? "seg-on" : "" };
+    t[i++] = (struct kv){ "PLANENABLECLASS", g_plan_draft_enabled ? "seg-on" : "" };
+    t[i++] = (struct kv){ "PLANDISABLECLASS", g_plan_draft_enabled ? "" : "seg-on" };
+    t[i++] = (struct kv){ "PLANGIB", s_plan_gib };
+    t[i++] = (struct kv){ "PLANRESETDAY", s_plan_day };
+    t[i++] = (struct kv){ "PLANTITLE", s_plan_title };
+    t[i++] = (struct kv){ "PLANSTATE", s_plan_state };
+    t[i++] = (struct kv){ "PLANAPPLYCLASS", plan_sim ? "" : "disabled" };
+    t[i++] = (struct kv){ "TZSTATE", d.timezone_available ? "设置已持久化" : "等待后端" };
+    t[i++] = (struct kv){ "TZSTATECLASS", d.timezone_available ? "ok" : "muted" };
+    t[i++] = (struct kv){ "TZCURRENT", s_tz_current };
+    t[i++] = (struct kv){ "TZDRAFT", s_tz_draft };
+    t[i++] = (struct kv){ "TZEFFECTIVE", s_tz_effective };
+    t[i++] = (struct kv){ "TZHOURS", timezone_hours_html() };
+    t[i++] = (struct kv){ "TZMINUTES", s_tz_minutes };
+    t[i++] = (struct kv){ "TZDST", s_tz_dst };
     t[i++] = (struct kv){ "TOAST", s_toast };
     t[i++] = (struct kv){ "PWROFFLBL",  g_pwr_confirm == 1 ? "再按一次" : "关机" };
     t[i++] = (struct kv){ "PWROFFCLS",  g_pwr_confirm == 1 ? "armed" : "" };
@@ -6039,7 +6553,7 @@ static int build_kv(struct kv *t, const char *path)
 
 static void refresh_status_cache(void)
 {
-    struct kv t[256];
+    struct kv t[KV_MAX];
     (void)build_kv(t, NULL);
 }
 
@@ -6057,7 +6571,7 @@ static const char *custom_page_html(const char *path)
     const char *start, *end, *body, *gt;
     char *body_src;
     size_t len;
-    struct kv t[256];
+    struct kv t[KV_MAX];
     int n;
     char raw_title[96], title[160];
     const char *base;
@@ -6123,7 +6637,7 @@ static const char *page_html(const char *path)
     if (path_is_function_page(path)) return custom_page_html(path);
     const char *tmpl = read_template_cached(path);   /* cache templates with mtime invalidation */
     if (!tmpl) return NULL;
-    struct kv t[256];
+    struct kv t[KV_MAX];
     int n = build_kv(t, path);
     char *html = apply_template(tmpl, t, n);
     return html;
@@ -7587,6 +8101,16 @@ queued_done:
                         }
                         else if (!strncmp(a, "func:", 5)) {
                             if (function_page_open(a + 5)) {
+                                if (!strcmp(a + 5, "sim-switch.html") ||
+                                    !strcmp(a + 5, "sim-traffic.html"))
+                                    (void)sim_slot_refresh(now, 1);
+                                if (!strcmp(a + 5, "sim-traffic.html")) {
+                                    g_plan_edit_slot = g_sim_slot == 2 ? 2 : 1;
+                                    g_plan_draft_dirty = 0;
+                                    g_plan_draft_sim_id[0] = 0;
+                                }
+                                if (!strcmp(a + 5, "timezone.html"))
+                                    g_tz_draft_dirty = 0;
                                 menu = 0;
                                 g_modal = 0;
                                 g_sms_open = -1;
@@ -7987,6 +8511,109 @@ queued_done:
                             last_act = now;
                             need_render = 1;
                         }
+                        else if (!strcmp(a, "simmoderefresh") ||
+                                 !strcmp(a, "simmanage:single") || !strcmp(a, "simmanage:dual") ||
+                                 !strcmp(a, "simsmart:0") || !strcmp(a, "simsmart:1")) {
+                            if (!strcmp(a, "simmoderefresh")) {
+                                (void)sim_slot_refresh(now, 1);
+                                plugin_action_note(SIM_ACTION_LOG, "手动刷新双卡状态");
+                                snprintf(g_toast, sizeof g_toast, "双卡状态已刷新");
+                            } else if (!strcmp(a, "simmanage:single")) {
+                                sim_mode_action(0, now);
+                            } else if (!strcmp(a, "simmanage:dual")) {
+                                sim_mode_action(1, now);
+                            } else {
+                                sim_auto_action(a[strlen(a) - 1] == '1', now);
+                            }
+                            g_toast_until = now + 1800;
+                            last_act = now;
+                            need_render = 1;
+                        }
+                        else if (!strncmp(a, "tzhour:", 7)) {
+                            char *end = NULL;
+                            long hour = strtol(a + 7, &end, 10);
+                            if (end != a + 7 && !*end && hour >= -12 && hour <= 14) {
+                                g_tz_draft_hour = (int)hour;
+                                if (hour == -12 || hour == 14) g_tz_draft_minute = 0;
+                                if (hour == 14) g_tz_draft_dst = 0;
+                                g_tz_draft_dirty = 1;
+                            }
+                            last_act = now;
+                            need_render = 1;
+                        }
+                        else if (!strncmp(a, "tzminute:", 9)) {
+                            int minute = atoi(a + 9);
+                            if ((minute == 0 || minute == 15 || minute == 30 || minute == 45) &&
+                                !((g_tz_draft_hour == -12 || g_tz_draft_hour == 14) && minute != 0)) {
+                                g_tz_draft_minute = minute;
+                                g_tz_draft_dirty = 1;
+                            } else {
+                                snprintf(g_toast, sizeof g_toast, "边界时区只能选择整点");
+                                g_toast_until = now + 1800;
+                            }
+                            last_act = now;
+                            need_render = 1;
+                        }
+                        else if (!strncmp(a, "tzdst:", 6)) {
+                            int enabled = a[6] == '1';
+                            if (enabled && timezone_draft_offset() > 780) {
+                                snprintf(g_toast, sizeof g_toast, "当前时区无法再加夏令时");
+                                g_toast_until = now + 1800;
+                            } else {
+                                g_tz_draft_dst = enabled;
+                                g_tz_draft_dirty = 1;
+                            }
+                            last_act = now;
+                            need_render = 1;
+                        }
+                        else if (!strcmp(a, "tzapply")) {
+                            timezone_apply_action(now);
+                            last_act = now;
+                            need_render = 1;
+                        }
+                        else if (!strncmp(a, "trafficselect:", 14)) {
+                            int slot = atoi(a + 14);
+                            if (slot == 1 || slot == 2) {
+                                g_plan_edit_slot = slot;
+                                g_plan_draft_dirty = 0;
+                                g_plan_draft_sim_id[0] = 0;
+                            }
+                            last_act = now;
+                            need_render = 1;
+                        }
+                        else if (!strncmp(a, "trafficenabled:", 15)) {
+                            g_plan_draft_enabled = a[15] == '1';
+                            if (g_plan_draft_enabled && g_plan_draft_gib == 0)
+                                g_plan_draft_gib = 100;
+                            g_plan_draft_dirty = 1;
+                            last_act = now;
+                            need_render = 1;
+                        }
+                        else if (!strncmp(a, "trafficgib:", 11)) {
+                            long delta = strtol(a + 11, NULL, 10);
+                            long long next = (long long)g_plan_draft_gib + delta;
+                            if (next < 0) next = 0;
+                            if (next > 16384) next = 16384;
+                            g_plan_draft_gib = (unsigned long long)next;
+                            g_plan_draft_dirty = 1;
+                            last_act = now;
+                            need_render = 1;
+                        }
+                        else if (!strncmp(a, "trafficday:", 11)) {
+                            int delta = atoi(a + 11);
+                            int next = g_plan_draft_reset_day + delta;
+                            if (next < 1) next = 31;
+                            if (next > 31) next = 1;
+                            g_plan_draft_reset_day = next;
+                            g_plan_draft_dirty = 1;
+                            last_act = now;
+                            need_render = 1;
+                        }
+                        else if (!strcmp(a, "trafficapply")) {
+                            traffic_plan_apply_action(now);
+                            last_act = now;
+                            need_render = 1;
+                        }
                         else if (!strncmp(a, "stsrc:", 6)) {
                             snprintf(g_st_src, sizeof g_st_src, "%s", speedtest_norm_src(a + 6));
                             save_conf();
@@ -8145,7 +8772,10 @@ action_done:
         if (!dragging && !scroll_inertia && now - g_wifi_aux_at >= 4000) { g_wifi_aux_at = now; wifi_aux_refresh(); }
 
         /* SIM polling is page-local and pauses during gestures and while dark. */
-        if (backlight_is_on() && path_is_lock_page(CUR_PATH) && !dragging && !scroll_inertia) {
+        if (backlight_is_on() &&
+            (path_is_lock_page(CUR_PATH) || plugin_page_named(CUR_PATH, "sim-switch.html") ||
+             plugin_page_named(CUR_PATH, "sim-traffic.html")) &&
+            !dragging && !scroll_inertia) {
             if (sim_slot_refresh(now, 0)) need_render = 1;
         }
 

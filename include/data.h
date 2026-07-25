@@ -10,10 +10,29 @@
 #ifndef U60PRO_DATA_H
 #define U60PRO_DATA_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define DEVUI_SMS_MAX 32
 #define DEVUI_SMS_TEXT_MAX 16384
+#define DEVUI_SIM_TRAFFIC_MAX 16
+
+typedef struct {
+    char id[24];
+    int slot;
+    char iccid_tail[12];
+    char operator_name[48];
+    int active;
+    uint64_t today_rx_bytes, today_tx_bytes, today_bytes;
+    uint64_t cycle_rx_bytes, cycle_tx_bytes, cycle_bytes;
+    uint64_t lifetime_bytes;
+    int package_enabled;
+    uint64_t allowance_bytes;
+    int remaining_valid;
+    uint64_t remaining_bytes;
+    int reset_day;
+    int64_t cycle_start, cycle_end, last_seen;
+} devui_sim_traffic_t;
 
 typedef struct {
     int  valid;
@@ -64,6 +83,15 @@ typedef struct {
     /* traffic (bytes, bytes/s) */
     long rx_speed, tx_speed, rx_bytes, tx_bytes;
 
+    /* Shared fixed-offset timezone and persistent per-SIM traffic. */
+    int timezone_available;
+    int timezone_offset_minutes, timezone_dst_minutes, timezone_effective_minutes;
+    char timezone_label[24];
+    int sim_traffic_available;
+    char sim_traffic_active_id[24];
+    devui_sim_traffic_t sim_traffic[DEVUI_SIM_TRAFFIC_MAX];
+    int sim_traffic_n;
+
     /* qos (parsed from modem key.log by the backend) */
     int    qci;
     double ambr_dl, ambr_ul;   /* Mbps */
@@ -101,5 +129,8 @@ int data_refresh_live(devui_data_t *d);
  * transport or its large parser buffers. Intended for low-power dark-screen
  * sampling; returns 1 only when a complete sample was received. */
 int data_chart_metrics(devui_data_t *d);
+
+/* Small synchronous loopback request used by fixed DevUI control actions. */
+int data_backend_request(const char *method, const char *path, char *body, size_t body_cap);
 
 #endif /* U60PRO_DATA_H */
