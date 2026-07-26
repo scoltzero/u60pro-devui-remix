@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "datad": {
+    "version": "0.6.7-remix.4",
+    "asset": "zwrt-datad-aarch64",
+    "notes": "增加按 ICCID 持久流量统计、套餐配置和固定偏移时区接口"
+  },
+  "devui": {
+    "version": "1.2.12-remix.10",
+    "asset": "u60pro-devui-aarch64",
+    "notes": "增加飞猫页面手动开关并兼容切换命令空响应"
+  },
+  "ui": {
+    "version": "0.4.10-remix.8",
+    "asset": "ui.tar.gz",
+    "notes": "增加飞猫页面手动开关、三等分按钮及切换状态校验"
+  }
+}
