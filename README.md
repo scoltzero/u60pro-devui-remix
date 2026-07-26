@@ -103,13 +103,15 @@ adb shell '/etc/init.d/zte_topsw_devui stop; sleep 1;
 每个 release 附一个 `version.json`，声明各组件版本，供配套的「U60 DevUI 管理插件」检测更新。组件分三块、可各自独立升级：**后端 datad**、**渲染器 devui**（二进制）、**ui**（界面）。
 
 - Remix release 的 `version.json` 合并 `datad`、`devui` 与 `ui` 三项，供原版管理器从同一个自定义源完成全新安装。
+- `ui.tar.gz` 内含 `.devui-managed-files`。新版管理器据此原子替换 Remix 管理的页面，同时保留用户自行添加的 `ui/functions/` 页面。
+- 插件入口显隐诊断写入 `/data/plugins/u60pro-devui/plugin-detect.log`；向 DevUI 进程发送 `SIGUSR1` 可立即重跑一次完整诊断，不会重启进程。
 
 ```jsonc
 // Remix 聚合 version.json
 { "schema": 1,
   "datad": { "version": "0.6.7-remix.4", "asset": "zwrt-datad-aarch64" },
-  "devui": { "version": "1.2.12-remix.7", "asset": "u60pro-devui-aarch64" },
-  "ui":    { "version": "0.4.10-remix.5", "asset": "ui.tar.gz" } }
+  "devui": { "version": "1.2.12-remix.9", "asset": "u60pro-devui-aarch64" },
+  "ui":    { "version": "0.4.10-remix.7", "asset": "ui.tar.gz" } }
 ```
 
 在原版管理器中选择“自定义源链接”，正式发布后推荐填写对应版本的不可变 CDN 资产模板：

@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 DEVUI_BIN="$ROOT/u60pro-devui.stripped"
 DATAD_BIN=
-OUT="$ROOT/dist/v1.2.12-remix.8"
+OUT="$ROOT/dist/v1.2.12-remix.9"
 
 usage() {
     echo "usage: $0 --datad PATH [--devui PATH] [--out DIR]" >&2
@@ -45,6 +45,7 @@ cp "$DATAD_BIN" "$OUT/zwrt-datad-aarch64"
 chmod 755 "$OUT/u60pro-devui-aarch64" "$OUT/zwrt-datad-aarch64"
 
 cp "$ROOT"/ui/*.html "$ROOT"/ui/*.css "$OUT/.ui-stage/"
+cp "$ROOT/ui/.devui-managed-files" "$OUT/.ui-stage/.devui-managed-files"
 cp -R "$ROOT/ui/subpages" "$OUT/.ui-stage/subpages"
 cp -R "$ROOT/ui/functions"/. "$OUT/.ui-stage/functions/"
 cp "$ROOT/scripts/cpuctl.sh" "$OUT/.ui-stage/functions/cpuctl.sh"
@@ -53,13 +54,14 @@ chmod 755 "$OUT/.ui-stage/functions/fmsimpin.sh"
 
 (
     cd "$OUT/.ui-stage"
-    COPYFILE_DISABLE=1 tar -czf "$OUT/ui.tar.gz" -- *.html *.css subpages functions
+    COPYFILE_DISABLE=1 tar -czf "$OUT/ui.tar.gz" -- .devui-managed-files *.html *.css subpages functions
 )
 
 tar -tzf "$OUT/ui.tar.gz" > "$OUT/.tar-list"
 grep -qx '01-signal.html' "$OUT/.tar-list"
 grep -qx '02-functions.html' "$OUT/.tar-list"
 grep -qx 'style.css' "$OUT/.tar-list"
+grep -qx '.devui-managed-files' "$OUT/.tar-list"
 grep -qx 'functions/cpuctl.sh' "$OUT/.tar-list"
 for page in tailscale clash cpu-performance wireguard operator-lock sim-switch sim-traffic fmswitch timezone; do
     grep -qx "functions/$page.html" "$OUT/.tar-list"
@@ -71,6 +73,13 @@ if grep -Eq '^(\./|ui/)|(^|/)\._' "$OUT/.tar-list"; then
 fi
 tar -tvzf "$OUT/ui.tar.gz" | grep -Eq '^-rwx[^ ]* .* functions/cpuctl\.sh$'
 tar -tvzf "$OUT/ui.tar.gz" | grep -Eq '^-rwx[^ ]* .* functions/fmsimpin\.sh$'
+while IFS= read -r managed; do
+    [ -n "$managed" ] || continue
+    grep -qx "$managed" "$OUT/.tar-list" || {
+        echo "managed UI file missing from archive: $managed" >&2
+        exit 1
+    }
+done < "$ROOT/ui/.devui-managed-files"
 
 cp "$ROOT/version.json" "$OUT/version.json"
 python3 - "$OUT/version.json" <<'PY'

@@ -6,13 +6,13 @@
     "notes": "增加按 ICCID 持久流量统计、套餐配置和固定偏移时区接口"
   },
   "devui": {
-    "version": "1.2.12-remix.8",
+    "version": "1.2.12-remix.9",
     "asset": "u60pro-devui-aarch64",
-    "notes": "新增飞猫三网分身卡严格识别、二次确认和安全切换页面"
+    "notes": "增加插件入口结构化诊断、隐藏原因日志和手动诊断信号"
   },
   "ui": {
-    "version": "0.4.10-remix.6",
+    "version": "0.4.10-remix.7",
     "asset": "ui.tar.gz",
-    "notes": "新增飞猫分身卡状态、三网切换和带时间戳操作日志"
+    "notes": "增加受管理文件清单，支持功能页完整性校验和原子更新"
   }
 }

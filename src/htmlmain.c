@@ -81,8 +81,10 @@ static void        maybe_dump_fb(drm_disp_t *d);
 #define DATAD_HTTP_TIMEOUT_MS 300
 
 static volatile sig_atomic_t g_run = 1;
+static volatile sig_atomic_t g_plugin_diag_requested;
 static volatile int g_ui_awake = 1;
 static void on_sig(int s) { (void)s; g_run = 0; }
+static void on_plugin_diag_sig(int s) { (void)s; g_plugin_diag_requested = 1; }
 
 static uint32_t millis(void)
 {
@@ -186,6 +188,7 @@ static void devui_posix_tz(char *out, size_t outlen)
 #define CPU_CTL_OLD     "/data/ufi-tools/u60pro-devui/cpuctl.sh"
 #define CPU_ACTION_LOG "/tmp/devui-cpu-action.log"
 #define SIM_ACTION_LOG "/tmp/devui-sim-action.log"
+#define PLUGIN_DETECT_LOG "/data/plugins/u60pro-devui/plugin-detect.log"
 
 struct plugin_candidate {
     const char *dir;
@@ -399,8 +402,8 @@ static int normalize_chart_sec(int sec);
 
 static void invalidate_render_html_cache(void);
 static int sim_slot_refresh(uint32_t now, int force);
-static int dual_sim_management_available(void);
-static int sim_traffic_page_available(void);
+static int dual_sim_management_status(void);
+static int sim_traffic_page_status(void);
 static int fm_card_available(void);
 
 /* ---- page-2 aux state, cached (-1 = unknown). Like the reference plugin,
@@ -2266,31 +2269,264 @@ static int subpage_name_ok(const char *name)
     return l > 5 && strcmp(name + l - 5, ".html") == 0;
 }
 
+struct function_detection {
+    int visible;
+    char reason[48];
+    char detail[320];
+};
+
+struct plugin_detect_cache {
+    const char *name;
+    int initialized;
+    int visible;
+    char reason[48];
+    char detail[320];
+};
+
+static struct plugin_detect_cache g_plugin_detect_cache[] = {
+    { "tailscale.html", 0, 0, "", "" },
+    { "clash.html", 0, 0, "", "" },
+    { "cpu-performance.html", 0, 0, "", "" },
+    { "wireguard.html", 0, 0, "", "" },
+    { "operator-lock.html", 0, 0, "", "" },
+    { "sim-switch.html", 0, 0, "", "" },
+    { "sim-traffic.html", 0, 0, "", "" },
+    { "fmswitch.html", 0, 0, "", "" },
+    { "timezone.html", 0, 0, "", "" },
+};
+
+static void function_detection_set(struct function_detection *out, int visible,
+                                   const char *reason, const char *detail)
+{
+    if (!out) return;
+    out->visible = visible;
+    snprintf(out->reason, sizeof out->reason, "%s", reason ? reason : "unknown");
+    snprintf(out->detail, sizeof out->detail, "%s", detail ? detail : "-");
+}
+
+static void plugin_candidate_detection(const struct plugin_candidate *items, size_t count,
+                                       struct function_detection *out)
+{
+    char first_reason[48] = "";
+    char first_detail[320] = "";
+    int saw_dir = 0;
+
+    for (size_t i = 0; i < count; i++) {
+        if (access(items[i].dir, F_OK) != 0) continue;
+        saw_dir = 1;
+        if (access(items[i].ctl, F_OK) != 0) {
+            if (!first_reason[0]) {
+                snprintf(first_reason, sizeof first_reason, "controller_missing");
+                snprintf(first_detail, sizeof first_detail, "%s", items[i].ctl);
+            }
+            continue;
+        }
+        if (access(items[i].ctl, R_OK) != 0) {
+            if (!first_reason[0]) {
+                snprintf(first_reason, sizeof first_reason, "controller_not_readable");
+                snprintf(first_detail, sizeof first_detail, "%s", items[i].ctl);
+            }
+            continue;
+        }
+        if (!items[i].bin || access(items[i].bin, F_OK) != 0) {
+            if (!first_reason[0]) {
+                snprintf(first_reason, sizeof first_reason, "core_missing");
+                snprintf(first_detail, sizeof first_detail, "%s", items[i].bin ? items[i].bin : items[i].dir);
+            }
+            continue;
+        }
+        if (access(items[i].bin, X_OK) != 0) {
+            if (!first_reason[0]) {
+                snprintf(first_reason, sizeof first_reason, "core_not_executable");
+                snprintf(first_detail, sizeof first_detail, "%s", items[i].bin);
+            }
+            continue;
+        }
+        function_detection_set(out, 1, "available", items[i].dir);
+        return;
+    }
+    if (!saw_dir)
+        function_detection_set(out, 0, "plugin_dir_missing", count ? items[0].dir : "-");
+    else
+        function_detection_set(out, 0, first_reason[0] ? first_reason : "plugin_incomplete",
+                               first_detail[0] ? first_detail : "-");
+}
+
+static void operator_candidate_detection(struct function_detection *out)
+{
+    char first_reason[48] = "";
+    char first_detail[320] = "";
+    int saw_dir = 0;
+
+    for (size_t i = 0; i < ARRAY_LEN(g_operator_candidates); i++) {
+        char config[320];
+        const struct plugin_candidate *item = &g_operator_candidates[i];
+        if (access(item->dir, F_OK) != 0) continue;
+        saw_dir = 1;
+        if (access(item->ctl, F_OK) != 0) {
+            if (!first_reason[0]) {
+                snprintf(first_reason, sizeof first_reason, "controller_missing");
+                snprintf(first_detail, sizeof first_detail, "%s", item->ctl);
+            }
+            continue;
+        }
+        if (access(item->ctl, R_OK) != 0) {
+            if (!first_reason[0]) {
+                snprintf(first_reason, sizeof first_reason, "controller_not_readable");
+                snprintf(first_detail, sizeof first_detail, "%s", item->ctl);
+            }
+            continue;
+        }
+        snprintf(config, sizeof config, "%s/config.json", item->dir);
+        if (access(config, F_OK) != 0) {
+            if (!first_reason[0]) {
+                snprintf(first_reason, sizeof first_reason, "config_missing");
+                snprintf(first_detail, sizeof first_detail, "%s", config);
+            }
+            continue;
+        }
+        if (access(config, R_OK) != 0) {
+            if (!first_reason[0]) {
+                snprintf(first_reason, sizeof first_reason, "config_not_readable");
+                snprintf(first_detail, sizeof first_detail, "%s", config);
+            }
+            continue;
+        }
+        function_detection_set(out, 1, "available", item->dir);
+        return;
+    }
+    if (!saw_dir)
+        function_detection_set(out, 0, "plugin_dir_missing", g_operator_candidates[0].dir);
+    else
+        function_detection_set(out, 0, first_reason[0] ? first_reason : "plugin_incomplete",
+                               first_detail[0] ? first_detail : "-");
+}
+
+static void plugin_detect_rotate_if_needed(void)
+{
+    FILE *fp = fopen(PLUGIN_DETECT_LOG, "r");
+    char line[512];
+    int lines = 0;
+    if (!fp) return;
+    while (lines < 200 && fgets(line, sizeof line, fp)) lines++;
+    fclose(fp);
+    if (lines < 200) return;
+    unlink(PLUGIN_DETECT_LOG ".old");
+    (void)rename(PLUGIN_DETECT_LOG, PLUGIN_DETECT_LOG ".old");
+}
+
+static void plugin_detect_record(const char *name, const struct function_detection *result,
+                                 int force)
+{
+    struct plugin_detect_cache *cache = NULL;
+    FILE *fp;
+    char stamp[32];
+
+    for (size_t i = 0; i < ARRAY_LEN(g_plugin_detect_cache); i++)
+        if (!strcmp(name, g_plugin_detect_cache[i].name)) {
+            cache = &g_plugin_detect_cache[i];
+            break;
+        }
+    if (!cache || !result) return;
+    if (!force && cache->initialized && cache->visible == result->visible &&
+        !strcmp(cache->reason, result->reason) && !strcmp(cache->detail, result->detail))
+        return;
+
+    mkdir("/data/plugins/u60pro-devui", 0755);
+    plugin_detect_rotate_if_needed();
+    fp = fopen(PLUGIN_DETECT_LOG, "a");
+    if (fp) {
+        devui_time_stamp(stamp, sizeof stamp, time(NULL));
+        fprintf(fp, "[%s] page=%s visible=%d reason=%s detail=%s\n",
+                stamp, name, result->visible, result->reason, result->detail);
+        fclose(fp);
+    }
+    cache->initialized = 1;
+    cache->visible = result->visible;
+    snprintf(cache->reason, sizeof cache->reason, "%s", result->reason);
+    snprintf(cache->detail, sizeof cache->detail, "%s", result->detail);
+}
+
+static void function_detection_eval(const char *name, struct function_detection *out, int force_log)
+{
+    char page[320];
+    const char *ctl;
+    int status;
+
+    function_detection_set(out, 0, "invalid_name", "-");
+    if (!name || !subpage_name_ok(name)) return;
+    snprintf(page, sizeof page, "%s/%s", FUNCTIONS_DIR, name);
+    if (access(page, F_OK) != 0) {
+        function_detection_set(out, 0, "page_missing", page);
+        plugin_detect_record(name, out, force_log);
+        return;
+    }
+    if (access(page, R_OK) != 0) {
+        function_detection_set(out, 0, "page_not_readable", page);
+        plugin_detect_record(name, out, force_log);
+        return;
+    }
+
+    if (!strcmp(name, "tailscale.html"))
+        plugin_candidate_detection(g_ts_candidates, ARRAY_LEN(g_ts_candidates), out);
+    else if (!strcmp(name, "clash.html") || !strcmp(name, "mihomo.html"))
+        plugin_candidate_detection(g_mh_candidates, ARRAY_LEN(g_mh_candidates), out);
+    else if (!strcmp(name, "wireguard.html"))
+        plugin_candidate_detection(g_wg_candidates, ARRAY_LEN(g_wg_candidates), out);
+    else if (!strcmp(name, "operator-lock.html"))
+        operator_candidate_detection(out);
+    else if (!strcmp(name, "cpu-performance.html")) {
+        ctl = cpu_ctl_path();
+        if (access(ctl, F_OK) != 0)
+            function_detection_set(out, 0, "controller_missing", ctl);
+        else if (access(ctl, R_OK) != 0)
+            function_detection_set(out, 0, "controller_not_readable", ctl);
+        else if (access("/sys/devices/system/cpu/cpufreq/policy0/scaling_governor", F_OK) != 0)
+            function_detection_set(out, 0, "capability_missing", "cpufreq policy0 governor");
+        else if (access("/sys/devices/system/cpu/cpufreq/policy0/scaling_governor", R_OK | W_OK) != 0)
+            function_detection_set(out, 0, "capability_not_writable", "cpufreq policy0 governor");
+        else
+            function_detection_set(out, 1, "available", ctl);
+    } else if (!strcmp(name, "sim-switch.html")) {
+        status = dual_sim_management_status();
+        if (status < 0) function_detection_set(out, 0, "device_query_failed", "support_dual_sim unknown");
+        else if (!status) function_detection_set(out, 0, "device_unsupported", "support_dual_sim=0");
+        else function_detection_set(out, 1, "available", "support_dual_sim=1");
+    } else if (!strcmp(name, "sim-traffic.html")) {
+        status = sim_traffic_page_status();
+        if (status < 0) function_detection_set(out, 0, "datad_unavailable", "GET /state failed");
+        else if (!status) function_detection_set(out, 0, "capability_missing", "sim_traffic_available=0");
+        else function_detection_set(out, 1, "available", "sim_traffic_available=1");
+    } else if (!strcmp(name, "fmswitch.html")) {
+        if (access(FM_CTL_BUNDLED, F_OK) != 0)
+            function_detection_set(out, 0, "controller_missing", FM_CTL_BUNDLED);
+        else if (access(FM_CTL_BUNDLED, R_OK) != 0)
+            function_detection_set(out, 0, "controller_not_readable", FM_CTL_BUNDLED);
+        else if (!fm_card_available())
+            function_detection_set(out, 0, "card_not_detected", "seecom_card_flag is not string 1");
+        else
+            function_detection_set(out, 1, "available", "seecom_card_flag=string:1");
+    } else {
+        function_detection_set(out, 1, "available", !strcmp(name, "timezone.html") ? "built-in" : "custom page");
+    }
+    plugin_detect_record(name, out, force_log);
+}
+
+static void plugin_detect_log_all(int force)
+{
+    struct function_detection result;
+    for (size_t i = 0; i < ARRAY_LEN(g_plugin_detect_cache); i++)
+        function_detection_eval(g_plugin_detect_cache[i].name, &result, force);
+}
+
 /* Known service pages are useful only when their auditable control adapter is
- * installed. Treat that executable adapter as the local plugin API: checking
- * it keeps the launcher aligned with what the page can actually control. */
+ * installed. Keep strict checks, but record the exact hidden reason. */
 static int function_control_api_available(const char *name)
 {
+    struct function_detection result;
     if (!name) return 0;
-    if (!strcmp(name, "tailscale.html"))
-        return plugin_complete_select(g_ts_candidates, ARRAY_LEN(g_ts_candidates)) != NULL;
-    if (!strcmp(name, "clash.html") || !strcmp(name, "mihomo.html"))
-        return plugin_complete_select(g_mh_candidates, ARRAY_LEN(g_mh_candidates)) != NULL;
-    if (!strcmp(name, "cpu-performance.html"))
-        return cpu_control_available();
-    if (!strcmp(name, "wireguard.html"))
-        return plugin_complete_select(g_wg_candidates, ARRAY_LEN(g_wg_candidates)) != NULL;
-    if (!strcmp(name, "operator-lock.html"))
-        return operator_complete_select() != NULL;
-    if (!strcmp(name, "fmswitch.html"))
-        return fm_card_available();
-    if (!strcmp(name, "sim-switch.html"))
-        return dual_sim_management_available();
-    if (!strcmp(name, "sim-traffic.html"))
-        return sim_traffic_page_available();
-    if (!strcmp(name, "timezone.html"))
-        return 1;
-    return 1;
+    function_detection_eval(name, &result, 0);
+    return result.visible;
 }
 
 static int subpage_open(const char *name)
@@ -3866,16 +4102,17 @@ static void sim_auto_action(int enabled, uint32_t now)
     g_toast_until = now + 1800;
 }
 
-static int dual_sim_management_available(void)
+static int dual_sim_management_status(void)
 {
     (void)sim_slot_refresh(millis(), 0);
-    return g_sim_dual == 1;
+    return g_sim_dual;
 }
 
-static int sim_traffic_page_available(void)
+static int sim_traffic_page_status(void)
 {
     devui_data_t data;
-    return data_refresh_live(&data) && data.sim_traffic_available;
+    if (!data_refresh_live(&data)) return -1;
+    return data.sim_traffic_available ? 1 : 0;
 }
 
 static int band_count(const char *s) { if (!s[0]) return 0; int n = 1; for (; *s; s++) if (*s == ',') n++; return n; }
@@ -7749,6 +7986,7 @@ int main(void)
 {
     signal(SIGINT, on_sig);
     signal(SIGTERM, on_sig);
+    signal(SIGUSR1, on_plugin_diag_sig);
 
     g_charge_boot = boot_is_charge_mode();
     if (!g_charge_boot) {
@@ -7807,6 +8045,7 @@ int main(void)
 
     load_conf();                          /* restore persisted UI settings */
     mkdir(FUNCTIONS_DIR, 0755);
+    plugin_detect_log_all(1);
     speedtest_apply_saved_prefs();
     speedtest_poll(millis());
     if (!g_charge_boot) rescan_pages_keep_current();
@@ -7835,6 +8074,10 @@ int main(void)
     while (g_run) {
         uint32_t now = millis();
         int need_render = 0, animating = 0;
+        if (g_plugin_diag_requested) {
+            g_plugin_diag_requested = 0;
+            plugin_detect_log_all(1);
+        }
         int live_changed = data_backend_poll(now);
         if (live_changed) state_pending = 1;
         chart_sample_tick(backlight_is_on());

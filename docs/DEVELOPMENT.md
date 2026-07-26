@@ -448,6 +448,7 @@ cp u60pro-devui.stripped u60pro-devui-aarch64
 (cd ui && COPYFILE_DISABLE=1 tar -czf ../ui.tar.gz -- *.html *.css)
 ```
 > **坑：插件 UI 更新会残留旧页面文件 → 页数翻倍。** 插件的 `installUiTemplates` 早期只 `cp -f` 覆盖、**不删旧文件**。v0.3.5 给页面改名后（`02-wifi`→`02-sms/03-wifi`…），旧名文件不会被同名覆盖，于是新旧并存——「5 页变 10 页」。修复：先把 `ui.tar.gz` 解压到临时目录并确认新页面数量，再清空 `/data/plugins/u60pro-devui/ui` 顶层旧 `*.html` / `*.css`（`.lockpin` 是点文件不受影响），最后复制新模板并核对安装后的页面数量；如果设备还遗留旧 `/data/ui`，则先迁移再删除。**给页面改名/删页是个跨版本兼容陷阱，更新逻辑必须先校验、再清场、再铺新文件。** 已中招的用户点「重装UI」即可自愈；如果远端版本变了，正常「更新 UI」也会走同一套清理逻辑。（插件运行在原厂 Web 后台，不在本仓库；改完重新部署插件即可，不走 release。）
+> **坑：只创建 `ui/functions/` 空目录不等于安装功能页。** 旧管理器只复制顶层页面和 `subpages/`，完整性检查也只统计这两层，因此旧设备会靠历史残留“看起来正常”，干净安装却没有任何可选插件入口。Remix UI 包从 `0.4.10-remix.7` 起携带 `.devui-managed-files`；管理器必须按清单复制并校验 `functions/*.html`、`cpuctl.sh` 和 `fmsimpin.sh`。安装时先在 `ui.new` 合成新目录并继承用户自定义功能页，校验通过后再与当前 `ui` 原子交换，失败恢复 `ui.old`。仅发布新版 `ui.tar.gz` 不能修复旧管理器，管理插件本身也必须同步更新。
 > **坑：`ui.tar.gz` 的打包结构必须和旧版保持一致。** 设备侧更新逻辑默认期望的是“**顶层平铺页面文件**”的 tar 包：顶层直接是 `01-signal.html`、`02-functions.html`、`style.css`、`subpages/...`，**没有** `ui/` 目录、**没有** `./` 前缀、**没有** macOS 产生的 `._*` AppleDouble 文件。用 macOS 自带打包工具直接打整个目录时，容易把这些额外条目也塞进去，导致 UI 更新失败。打包时应显式关闭资源叉（如 `COPYFILE_DISABLE=1`），并直接列出页面文件名生成 tar；`examples/custom-functions/` 不属于默认 UI 包。
 
 ## 仓库约定
