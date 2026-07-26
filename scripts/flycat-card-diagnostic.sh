@@ -178,6 +178,154 @@ collect_card_fingerprint() {
     echo "uci_reset_refresh_flag=$(uci -q get zwrt_zte_mdm.sim_info.reset_refresh_flag 2>/dev/null)"
 }
 
+emit_card_shape() {
+    shape_name="$1"
+    shape_digits=$(printf '%s' "$2" | tr -cd '0-9')
+    shape_length=${#shape_digits}
+    shape_prefix=$(printf '%.8s' "$shape_digits")
+    echo "${shape_name}_prefix=${shape_prefix:-unknown}"
+    echo "${shape_name}_length=${shape_length:-0}"
+}
+
+collect_detection_matrix() {
+    known_atr="3B9F11801FC78031E073FE211B57378660C90200215C"
+    known_prefix="89860487"
+    sim_json=$(ubus -t 4 call zwrt_zte_mdm.api get_sim_info '{}' 2>/dev/null)
+    flag_type=$(json_type "$sim_json" seecom_card_flag)
+    flag_value=$(json_get "$sim_json" seecom_card_flag)
+    api_card=$(json_get "$sim_json" sim_iccid)
+    api_card_digits=$(printf '%s' "$api_card" | tr -cd '0-9')
+    api_prefix=$(printf '%.8s' "$api_card_digits")
+    api_length=${#api_card_digits}
+    atr=$(uci -q get zwrt_zte_mdm.sim_info.sim_atr 2>/dev/null | tr '[:lower:]' '[:upper:]' | tr -cd '0-9A-F')
+    slot_fingerprint_match=0
+    for slot_key in simcard_0_iccid simcard_1_iccid; do
+        slot_card=$(uci -q get "zwrt_zte_mdm.sim_info.$slot_key" 2>/dev/null | tr -cd '0-9')
+        slot_prefix=$(printf '%.8s' "$slot_card")
+        slot_length=${#slot_card}
+        if [ "$slot_prefix" = "$known_prefix" ] && [ "$slot_length" = "20" ]; then
+            slot_fingerprint_match=1
+            break
+        fi
+    done
+
+    flag_value_match=0
+    flag_string_match=0
+    case "$flag_value" in 1|2) flag_value_match=1 ;; esac
+    if [ "$flag_type" = "string" ] && [ "$flag_value_match" = "1" ]; then
+        flag_string_match=1
+    fi
+    atr_match=0
+    prefix_match=0
+    length_match=0
+    fingerprint_match=0
+    [ "$atr" = "$known_atr" ] && atr_match=1
+    [ "$api_prefix" = "$known_prefix" ] && prefix_match=1
+    [ "$api_length" = "20" ] && length_match=1
+    if [ "$atr_match" = "1" ] && [ "$prefix_match" = "1" ] && [ "$length_match" = "1" ]; then
+        fingerprint_match=1
+    fi
+
+    legacy_detector_match=0
+    updated_detector_match=0
+    relaxed_flag_match=0
+    if [ "$flag_string_match" = "1" ] || [ "$fingerprint_match" = "1" ]; then
+        legacy_detector_match=1
+    fi
+    if [ "$flag_value_match" = "1" ] || [ "$fingerprint_match" = "1" ] ||
+       { [ "$atr_match" = "1" ] && [ "$length_match" = "1" ] && [ "$slot_fingerprint_match" = "1" ]; }; then
+        updated_detector_match=1
+    fi
+    if [ "$flag_value_match" = "1" ] || [ "$fingerprint_match" = "1" ]; then
+        relaxed_flag_match=1
+    fi
+
+    echo "flag_type=${flag_type:-missing}"
+    echo "flag_value=${flag_value:-missing}"
+    echo "flag_value_is_1_or_2=$flag_value_match"
+    echo "flag_is_supported_string=$flag_string_match"
+    echo "known_atr_match=$atr_match"
+    echo "known_card_prefix_match=$prefix_match"
+    echo "card_length_20_match=$length_match"
+    echo "known_fingerprint_match=$fingerprint_match"
+    echo "physical_slot_fingerprint_match=$slot_fingerprint_match"
+    echo "legacy_release_detector_match=$legacy_detector_match"
+    echo "updated_detector_match=$updated_detector_match"
+    echo "relaxed_numeric_flag_detector_match=$relaxed_flag_match"
+    echo "devui_manual_display=$(sed -n '1p' /data/plugins/u60pro-devui/flymodem-display.conf 2>/dev/null | tr -d '[:space:]')"
+    if [ "$atr_match" = "1" ] && [ "$length_match" = "1" ] &&
+       [ "$slot_fingerprint_match" = "1" ] && [ "$prefix_match" != "1" ]; then
+        echo "likely_issue=carrier_profile_changed_current_iccid"
+    elif [ "$flag_value_match" != "1" ] && [ "$fingerprint_match" != "1" ]; then
+        echo "likely_issue=unrecognized_card_batch_or_vendor_state"
+    elif [ "$updated_detector_match" = "1" ]; then
+        echo "likely_issue=installed_controller_or_ui_cache"
+    else
+        echo "likely_issue=unknown"
+    fi
+
+    emit_card_shape "api_primary_card" "$api_card"
+    emit_card_shape "api_secondary_card" "$(json_get "$sim_json" sim2_iccid)"
+    emit_card_shape "uci_current_card" "$(uci -q get zwrt_zte_mdm.sim_info.current_sim_iccid 2>/dev/null)"
+    emit_card_shape "uci_primary_card" "$(uci -q get zwrt_zte_mdm.sim_info.sim_iccid 2>/dev/null)"
+    emit_card_shape "uci_slot0_card" "$(uci -q get zwrt_zte_mdm.sim_info.simcard_0_iccid 2>/dev/null)"
+    emit_card_shape "uci_slot1_card" "$(uci -q get zwrt_zte_mdm.sim_info.simcard_1_iccid 2>/dev/null)"
+}
+
+collect_controller_samples() {
+    controller=
+    for path in \
+        /data/plugins/u60pro-devui/ui/functions/fmsimpin.sh \
+        /data/plugins/u60pro-devui/functions/fmsimpin.sh; do
+        if [ -r "$path" ]; then
+            controller="$path"
+            break
+        fi
+    done
+    if [ -z "$controller" ]; then
+        echo "controller_not_found=1"
+        return
+    fi
+    echo "controller_path=$controller"
+    ls -l "$controller" 2>/dev/null
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$controller" 2>/dev/null
+    fi
+    sample=1
+    while [ "$sample" -le 3 ]; do
+        echo "--- status_sample=$sample ---"
+        sh "$controller" status 2>&1
+        sample=$((sample + 1))
+        [ "$sample" -gt 3 ] || sleep 2
+    done
+}
+
+collect_detection_log() {
+    for path in \
+        /data/plugins/u60pro-devui/plugin-detect.log \
+        /tmp/devui-fmswitch-action.log; do
+        echo "--- path=$path ---"
+        if [ -r "$path" ]; then
+            tail -n 80 "$path"
+        else
+            echo "missing_or_unreadable=1"
+        fi
+    done
+}
+
+collect_vendor_references() {
+    found=0
+    for root in /www /etc /usr/lib/lua; do
+        [ -d "$root" ] || continue
+        data=$(grep -R -n -E 'seecom_card_flag|seecom_card_carrier_type|sim_change_pin_mode|mqtt_st_card_type_msg' "$root" 2>/dev/null | head -n 80)
+        if [ -n "$data" ]; then
+            printf '%s\n' "$data"
+            found=1
+        fi
+    done
+    [ "$found" = "1" ] || echo "<no matching vendor references>"
+}
+
 collect_devui_flycat_assets() {
     for path in \
         /data/plugins/u60pro-devui/ui/functions/fmswitch.html \
@@ -230,7 +378,7 @@ collect_related_paths() {
 
 {
     emit "Feimao/Seecom SIM diagnostic report"
-    emit "collector_version=2"
+    emit "collector_version=3"
     emit "read_only=1"
     emit "generated_at=$(date '+%F %T %z')"
     emit "warning=Sensitive identifiers are automatically redacted; review before public sharing."
@@ -245,6 +393,7 @@ collect_related_paths() {
     run_command "MQTT card list state" ubus -t 8 call zwrt_mqtt.api get_auth_simcardlist '{}'
     run_command "get_card_iccid" collect_card_iccid_api
     run_command "derived card fingerprint" collect_card_fingerprint
+    run_command "detector decision matrix" collect_detection_matrix
     run_command "installed Flymodem UI assets" collect_devui_flycat_assets
     run_command "get_sim_info" ubus -t 4 call zwrt_zte_mdm.api get_sim_info '{}'
     run_command "get_sim_info_before" ubus -t 4 call zwrt_zte_mdm.api get_sim_info_before '{}'
@@ -256,6 +405,9 @@ collect_related_paths() {
     run_command "relevant UCI entries" collect_relevant_uci
     run_command "recent related logs" collect_related_logs
     run_command "related runtime paths" collect_related_paths
+    run_command "installed controller samples" collect_controller_samples
+    run_command "DevUI Flymodem detection logs" collect_detection_log
+    run_command "vendor implementation references" collect_vendor_references
 
     if [ -r /data/plugins/u60pro-devui/ui/functions/fmsimpin.sh ]; then
         run_command "installed fmsimpin status" sh /data/plugins/u60pro-devui/ui/functions/fmsimpin.sh status

@@ -105,7 +105,8 @@ adb shell '/etc/init.d/zte_topsw_devui stop; sleep 1;
 - Remix release 的 `version.json` 合并 `datad`、`devui` 与 `ui` 三项，供原版管理器从同一个自定义源完成全新安装。
 - `ui.tar.gz` 内含 `.devui-managed-files`。新版管理器据此原子替换 Remix 管理的页面，同时保留用户自行添加的 `ui/functions/` 页面。
 - 插件入口显隐诊断写入 `/data/plugins/u60pro-devui/plugin-detect.log`；向 DevUI 进程发送 `SIGUSR1` 可立即重跑一次完整诊断，不会重启进程。
-- 飞猫卡误判时可运行 `scripts/flycat-card-diagnostic.sh`。脚本只读采集 SIM、MQTT、UCI 和网络状态，自动脱敏 IMSI、ICCID、IMEI、手机号及 PIN/PUK；将生成的完整报告反馈给维护者即可对比卡型指纹。
+- 飞猫卡无法自动识别时，可在第四页“高级设置”开启“飞猫分身卡”，开启后第二页显示三网切换子页面；普通 SIM 请保持关闭，实际切换仍需要二次确认。
+- 飞猫卡误判时可运行 `scripts/flycat-card-diagnostic.sh`。脚本只读采集 SIM、MQTT、UCI、手动显示状态和网络状态，自动脱敏 IMSI、ICCID、IMEI、手机号及 PIN/PUK；将生成的完整报告反馈给维护者即可继续排查。
 
 ```sh
 adb push scripts/flycat-card-diagnostic.sh /tmp/
@@ -117,14 +118,14 @@ adb pull /tmp/flycat-report.txt
 // Remix 聚合 version.json
 { "schema": 1,
   "datad": { "version": "0.6.7-remix.4", "asset": "zwrt-datad-aarch64" },
-  "devui": { "version": "1.2.12-remix.9", "asset": "u60pro-devui-aarch64" },
-  "ui":    { "version": "0.4.10-remix.7", "asset": "ui.tar.gz" } }
+  "devui": { "version": "1.2.12-remix.10", "asset": "u60pro-devui-aarch64" },
+  "ui":    { "version": "0.4.10-remix.8", "asset": "ui.tar.gz" } }
 ```
 
 在原版管理器中选择“自定义源链接”，正式发布后推荐填写对应版本的不可变 CDN 资产模板：
 
 ```text
-https://fastly.jsdelivr.net/gh/scoltzero/u60pro-devui-remix@assets-v1.2.12-remix.7/{file}
+https://fastly.jsdelivr.net/gh/scoltzero/u60pro-devui-remix@assets-v1.2.12-remix.10/{file}
 ```
 
 该地址固定到同一批发布资产，避免清单和二进制因 CDN 分支缓存而不一致。正式归档仍位于 `https://github.com/scoltzero/u60pro-devui-remix/releases/latest/download`。
@@ -137,7 +138,7 @@ https://fastly.jsdelivr.net/gh/scoltzero/u60pro-devui-remix@assets-v1.2.12-remix
 bash scripts/build.sh
 bash scripts/package-release.sh \
   --datad ../zwrt-datad/zwrt-datad.stripped \
-  --out dist/v1.2.12-remix.7
+  --out dist/v1.2.12-remix.10
 ```
 
 ## 致谢

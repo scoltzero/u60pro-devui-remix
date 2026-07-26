@@ -13,6 +13,7 @@ PIN_FILE="$TMP/pin-state"
 ATR_FILE="$TMP/sim-atr"
 CALLS_FILE="$TMP/switch-calls"
 LOG_FILE="$TMP/action.log"
+DISPLAY_FILE="$TMP/flymodem-display.conf"
 
 cat >"$TMP/bin/jsonfilter" <<'EOF'
 #!/bin/sh
@@ -63,6 +64,14 @@ case "${1:-}" in
                 [ -s "$FM_MOCK_ATR_FILE" ] || exit 1
                 cat "$FM_MOCK_ATR_FILE"
                 ;;
+            zwrt_zte_mdm.sim_info.simcard_0_iccid)
+                [ -n "${FM_MOCK_SLOT0_ICCID:-}" ] || exit 1
+                printf '%s\n' "$FM_MOCK_SLOT0_ICCID"
+                ;;
+            zwrt_zte_mdm.sim_info.simcard_1_iccid)
+                [ -n "${FM_MOCK_SLOT1_ICCID:-}" ] || exit 1
+                printf '%s\n' "$FM_MOCK_SLOT1_ICCID"
+                ;;
             *) exit 1 ;;
         esac
         ;;
@@ -87,11 +96,20 @@ case "$args" in
         ;;
     *" zwrt_mdm_uci_set "*)
         value=$(printf '%s' "$args" | sed -n 's/.*"value":"\([^"]*\)".*/\1/p')
-        printf '%s\n' "$value" >"$FM_MOCK_PIN_FILE"
         case "${FM_MOCK_SET_MODE:-success}" in
-            success) printf '%s\n' '{"result":"success"}' ;;
-            error) printf '%s\n' '{"result":1}' ;;
-            empty) ;;
+            success)
+                printf '%s\n' "$value" >"$FM_MOCK_PIN_FILE"
+                printf '%s\n' '{"result":"success"}'
+                ;;
+            error)
+                printf '%s\n' "$value" >"$FM_MOCK_PIN_FILE"
+                printf '%s\n' '{"result":1}'
+                ;;
+            empty)
+                printf '%s\n' "$value" >"$FM_MOCK_PIN_FILE"
+                ;;
+            empty-no-write)
+                ;;
         esac
         ;;
     *" sim_change_pin_mode "*)
@@ -104,11 +122,20 @@ case "$args" in
                     *0100*) carrier=LT ;;
                     *) carrier=UNKNOWN ;;
                 esac
-                if [ "${FM_MOCK_CARD_CLASS:-vendor}" = "fingerprint" ]; then
-                    printf '{"seecom_card_flag":"0","seecom_card_carrier_type":"%s","sim_iccid":"89860487000000000000"}\n' "$carrier" >"$FM_MOCK_SIM_FILE"
-                else
-                    printf '{"seecom_card_flag":"1","seecom_card_carrier_type":"%s"}\n' "$carrier" >"$FM_MOCK_SIM_FILE"
-                fi
+                case "${FM_MOCK_CARD_CLASS:-vendor}" in
+                    fingerprint)
+                        printf '{"seecom_card_flag":"0","seecom_card_carrier_type":"%s","sim_iccid":"89860487000000000000"}\n' "$carrier" >"$FM_MOCK_SIM_FILE"
+                        ;;
+                    slot-fingerprint)
+                        printf '{"seecom_card_flag":"0","seecom_card_carrier_type":"%s","sim_iccid":"89861123000000000000"}\n' "$carrier" >"$FM_MOCK_SIM_FILE"
+                        ;;
+                    manual)
+                        printf '{"seecom_card_flag":"0","seecom_card_carrier_type":"%s","sim_iccid":"89860489000000000000"}\n' "$carrier" >"$FM_MOCK_SIM_FILE"
+                        ;;
+                    *)
+                        printf '{"seecom_card_flag":"1","seecom_card_carrier_type":"%s"}\n' "$carrier" >"$FM_MOCK_SIM_FILE"
+                        ;;
+                esac
                 printf '%s\n' '{"result":[0]}'
                 ;;
             no-update)
@@ -116,6 +143,25 @@ case "$args" in
                 ;;
             error)
                 printf '%s\n' '{"result":1}'
+                ;;
+            empty-success)
+                case "$args" in
+                    *0200*) carrier=YD ;;
+                    *0300*) carrier=DX ;;
+                    *0100*) carrier=LT ;;
+                    *) carrier=UNKNOWN ;;
+                esac
+                printf '{"seecom_card_flag":"1","seecom_card_carrier_type":"%s"}\n' "$carrier" >"$FM_MOCK_SIM_FILE"
+                ;;
+            unknown-success)
+                case "$args" in
+                    *0200*) carrier=YD ;;
+                    *0300*) carrier=DX ;;
+                    *0100*) carrier=LT ;;
+                    *) carrier=UNKNOWN ;;
+                esac
+                printf '{"seecom_card_flag":"1","seecom_card_carrier_type":"%s"}\n' "$carrier" >"$FM_MOCK_SIM_FILE"
+                printf '%s\n' '{"message":"queued"}'
                 ;;
             empty)
                 ;;
@@ -134,9 +180,13 @@ export FM_MOCK_PIN_FILE="$PIN_FILE"
 export FM_MOCK_ATR_FILE="$ATR_FILE"
 export FM_MOCK_CALLS_FILE="$CALLS_FILE"
 export FM_ACTION_LOG="$LOG_FILE"
+export FM_ENABLE_FILE="$DISPLAY_FILE"
 export FM_SWITCH_TIMEOUT=1
 export FM_POLL_INTERVAL=0
+export FM_MOCK_SLOT0_ICCID=
+export FM_MOCK_SLOT1_ICCID=
 : >"$ATR_FILE"
+rm -f "$DISPLAY_FILE"
 
 write_net() {
     printf '%s\n' '{"network_type":"SA","wan_active_band":"n78","signalbar":"4","rmcc":460,"rmnc":1}' >"$NET_FILE"
@@ -163,8 +213,9 @@ run_switch() {
     mode=$2
     pin=$3
     card_class=${4:-vendor}
+    set_mode=${5:-success}
     export FM_MOCK_SWITCH_MODE="$mode"
-    export FM_MOCK_SET_MODE=success
+    export FM_MOCK_SET_MODE="$set_mode"
     export FM_MOCK_CARD_CLASS="$card_class"
     : >"$CALLS_FILE"
     : >"$LOG_FILE"
@@ -209,6 +260,17 @@ out=$("$CTL" status)
 assert_contains "$out" 'FM_AVAILABLE=0'
 
 printf '%s\n' '3B9F11801FC78031E073FE211B57378660C90200215C' >"$ATR_FILE"
+export FM_MOCK_SLOT0_ICCID=89860487000000000000
+printf '%s\n' '{"seecom_card_flag":"0","seecom_card_carrier_type":"DX","sim_iccid":"89861123000000000000"}' >"$SIM_FILE"
+out=$("$CTL" status)
+assert_contains "$out" 'FM_AVAILABLE=1'
+assert_contains "$out" 'FM_DETECT_SOURCE=known_slot_fingerprint'
+assert_contains "$out" 'FM_CARD_PREFIX=89861123'
+assert_contains "$out" 'FM_BASE_PREFIX=89860487'
+assert_not_contains "$out" '89861123000000000000'
+export FM_MOCK_SLOT0_ICCID=
+
+printf '%s\n' '3B9F11801FC78031E073FE211B57378660C90200215C' >"$ATR_FILE"
 printf '%s\n' '{"seecom_card_flag":"0","seecom_card_carrier_type":"YD","sim_iccid":"89860210000000000000"}' >"$SIM_FILE"
 out=$("$CTL" status)
 assert_contains "$out" 'FM_AVAILABLE=0'
@@ -217,11 +279,25 @@ assert_contains "$out" 'FM_AVAILABLE=0'
 
 printf '%s\n' '{"seecom_card_flag":1,"seecom_card_carrier_type":"LT"}' >"$SIM_FILE"
 out=$("$CTL" status)
-assert_contains "$out" 'FM_AVAILABLE=0'
+assert_contains "$out" 'FM_AVAILABLE=1'
+assert_contains "$out" 'FM_DETECT_SOURCE=vendor_seecom'
 
 printf '%s\n' '{}' >"$SIM_FILE"
 out=$("$CTL" status)
 assert_contains "$out" 'FM_AVAILABLE=0'
+
+printf '%s\n' '3B9A94801FC38031E073FE211B2404198D' >"$ATR_FILE"
+printf '%s\n' '{"seecom_card_flag":"0","seecom_card_carrier_type":"YD","sim_iccid":"89860489000000000000"}' >"$SIM_FILE"
+out=$("$CTL" status)
+assert_contains "$out" 'FM_AVAILABLE=0'
+assert_contains "$out" 'FM_MANUAL_ENABLED=0'
+printf '1\n' >"$DISPLAY_FILE"
+out=$("$CTL" status)
+assert_contains "$out" 'FM_AVAILABLE=1'
+assert_contains "$out" 'FM_MANUAL_ENABLED=1'
+assert_contains "$out" 'FM_DETECT_SOURCE=manual_override'
+assert_not_contains "$out" '89860489000000000000'
+rm -f "$DISPLAY_FILE"
 
 rm -f "$PIN_FILE"
 printf '%s\n' '3B9F11801FC78031E073FE211B57378660C90200215C' >"$ATR_FILE"
@@ -250,11 +326,42 @@ run_switch 0 success 0300
 
 rm -f "$PIN_FILE"
 printf '%s\n' '{"seecom_card_flag":"1","seecom_card_carrier_type":"LT"}' >"$SIM_FILE"
-run_switch 5 empty 0200
+run_switch 0 empty-success 0200
+[ "$(wc -l <"$CALLS_FILE" | tr -d ' ')" = "1" ]
+[ ! -e "$PIN_FILE" ]
+assert_contains "$(cat "$LOG_FILE")" '设备未返回切换结果'
+
+rm -f "$PIN_FILE"
+printf '%s\n' '{"seecom_card_flag":"1","seecom_card_carrier_type":"LT"}' >"$SIM_FILE"
+run_switch 0 unknown-success 0200
+[ ! -e "$PIN_FILE" ]
+assert_contains "$(cat "$LOG_FILE")" '设备返回未识别结果'
+
+rm -f "$PIN_FILE"
+printf '%s\n' '{"seecom_card_flag":"1","seecom_card_carrier_type":"LT"}' >"$SIM_FILE"
+run_switch 6 empty 0200
 [ ! -e "$PIN_FILE" ]
 
 printf '%s\n' '{"seecom_card_flag":"1","seecom_card_carrier_type":"LT"}' >"$SIM_FILE"
 run_switch 5 error 0200
+[ ! -e "$PIN_FILE" ]
+
+rm -f "$PIN_FILE"
+printf '%s\n' '{"seecom_card_flag":"1","seecom_card_carrier_type":"LT"}' >"$SIM_FILE"
+run_switch 0 success 0200 vendor empty
+[ ! -e "$PIN_FILE" ]
+assert_contains "$(cat "$LOG_FILE")" '已通过配置回读确认生效'
+
+rm -f "$PIN_FILE"
+printf '%s\n' '{"seecom_card_flag":"1","seecom_card_carrier_type":"LT"}' >"$SIM_FILE"
+run_switch 4 success 0200 vendor empty-no-write
+[ "$(wc -l <"$CALLS_FILE" | tr -d ' ')" = "0" ]
+[ ! -e "$PIN_FILE" ]
+
+rm -f "$PIN_FILE"
+printf '%s\n' '{"seecom_card_flag":"1","seecom_card_carrier_type":"LT"}' >"$SIM_FILE"
+run_switch 4 success 0200 vendor error
+[ "$(wc -l <"$CALLS_FILE" | tr -d ' ')" = "0" ]
 [ ! -e "$PIN_FILE" ]
 
 printf '%s\n' '{"seecom_card_flag":"1","seecom_card_carrier_type":"LT"}' >"$SIM_FILE"
@@ -266,7 +373,25 @@ run_switch 3 success 0200
 [ "$(wc -l <"$CALLS_FILE" | tr -d ' ')" = "0" ]
 
 printf '%s\n' '{"seecom_card_flag":1,"seecom_card_carrier_type":"LT"}' >"$SIM_FILE"
-run_switch 3 success 0200
-[ "$(wc -l <"$CALLS_FILE" | tr -d ' ')" = "0" ]
+run_switch 0 success 0200
+[ "$(wc -l <"$CALLS_FILE" | tr -d ' ')" = "1" ]
+
+rm -f "$PIN_FILE"
+printf '%s\n' '3B9F11801FC78031E073FE211B57378660C90200215C' >"$ATR_FILE"
+export FM_MOCK_SLOT0_ICCID=89860487000000000000
+printf '%s\n' '{"seecom_card_flag":"0","seecom_card_carrier_type":"DX","sim_iccid":"89861123000000000000"}' >"$SIM_FILE"
+run_switch 0 success 0200 slot-fingerprint
+[ "$(wc -l <"$CALLS_FILE" | tr -d ' ')" = "1" ]
+[ ! -e "$PIN_FILE" ]
+export FM_MOCK_SLOT0_ICCID=
+
+rm -f "$PIN_FILE"
+printf '1\n' >"$DISPLAY_FILE"
+printf '%s\n' '3B9A94801FC38031E073FE211B2404198D' >"$ATR_FILE"
+printf '%s\n' '{"seecom_card_flag":"0","seecom_card_carrier_type":"DX","sim_iccid":"89860489000000000000"}' >"$SIM_FILE"
+run_switch 0 success 0200 manual
+[ "$(wc -l <"$CALLS_FILE" | tr -d ' ')" = "1" ]
+[ ! -e "$PIN_FILE" ]
+rm -f "$DISPLAY_FILE"
 
 echo "fmsimpin tests: OK"

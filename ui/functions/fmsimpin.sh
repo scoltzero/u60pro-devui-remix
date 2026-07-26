@@ -4,6 +4,7 @@ LOG="${FM_ACTION_LOG:-/tmp/devui-fmswitch-action.log}"
 PIN_KEY="zwrt_zte_mdm.sim_info.pin_no_need_decode"
 SWITCH_TIMEOUT="${FM_SWITCH_TIMEOUT:-60}"
 POLL_INTERVAL="${FM_POLL_INTERVAL:-1}"
+DISPLAY_FILE="${FM_ENABLE_FILE:-/data/plugins/u60pro-devui/flymodem-display.conf}"
 KNOWN_FLYCAT_ATR="3B9F11801FC78031E073FE211B57378660C90200215C"
 KNOWN_FLYCAT_ICCID_PREFIX="89860487"
 KNOWN_FLYCAT_ICCID_LENGTH="20"
@@ -37,6 +38,10 @@ uci_value() {
     uci -q get "$1" 2>/dev/null | head -n 1
 }
 
+manual_display_enabled() {
+    [ "$(sed -n '1p' "$DISPLAY_FILE" 2>/dev/null | tr -d '[:space:]')" = "1" ]
+}
+
 detect_flycat_card() {
     fm_detect_json="$1"
     FM_DETECT_AVAILABLE=0
@@ -44,25 +49,25 @@ detect_flycat_card() {
     FM_DETECT_REASON="card fingerprint not matched"
     FM_CARD_PREFIX="-"
     FM_CARD_LENGTH=0
+    FM_BASE_PREFIX="-"
+    FM_BASE_LENGTH=0
 
     fm_detect_flag=$(json_value "$fm_detect_json" seecom_card_flag)
     fm_detect_flag_type=$(json_type "$fm_detect_json" seecom_card_flag)
-    if [ "$fm_detect_flag_type" = "string" ]; then
-        case "$fm_detect_flag" in
-            2)
-                FM_DETECT_AVAILABLE=1
-                FM_DETECT_SOURCE="vendor_flymodem"
-                FM_DETECT_REASON="seecom_card_flag string 2"
-                return 0
-                ;;
-            1)
-                FM_DETECT_AVAILABLE=1
-                FM_DETECT_SOURCE="vendor_seecom"
-                FM_DETECT_REASON="seecom_card_flag string 1"
-                return 0
-                ;;
-        esac
-    fi
+    case "$fm_detect_flag" in
+        2)
+            FM_DETECT_AVAILABLE=1
+            FM_DETECT_SOURCE="vendor_flymodem"
+            FM_DETECT_REASON="seecom_card_flag ${fm_detect_flag_type:-unknown} 2"
+            return 0
+            ;;
+        1)
+            FM_DETECT_AVAILABLE=1
+            FM_DETECT_SOURCE="vendor_seecom"
+            FM_DETECT_REASON="seecom_card_flag ${fm_detect_flag_type:-unknown} 1"
+            return 0
+            ;;
+    esac
 
     fm_detect_iccid=$(json_value "$fm_detect_json" sim_iccid | tr -cd '0-9')
     [ -n "$fm_detect_iccid" ] || \
@@ -73,6 +78,20 @@ detect_flycat_card() {
     FM_CARD_LENGTH=${#fm_detect_iccid}
     [ -z "$fm_detect_iccid" ] || FM_CARD_PREFIX=$(printf '%.8s' "$fm_detect_iccid")
 
+    fm_detect_base_match=0
+    for fm_detect_key in simcard_0_iccid simcard_1_iccid; do
+        fm_detect_base_iccid=$(uci_value "zwrt_zte_mdm.sim_info.$fm_detect_key" | tr -cd '0-9')
+        fm_detect_base_length=${#fm_detect_base_iccid}
+        fm_detect_base_prefix=$(printf '%.8s' "$fm_detect_base_iccid")
+        if [ "$fm_detect_base_prefix" = "$KNOWN_FLYCAT_ICCID_PREFIX" ] &&
+           [ "$fm_detect_base_length" = "$KNOWN_FLYCAT_ICCID_LENGTH" ]; then
+            fm_detect_base_match=1
+            FM_BASE_PREFIX="$fm_detect_base_prefix"
+            FM_BASE_LENGTH="$fm_detect_base_length"
+            break
+        fi
+    done
+
     if [ "$fm_detect_atr" = "$KNOWN_FLYCAT_ATR" ] &&
        [ "$FM_CARD_PREFIX" = "$KNOWN_FLYCAT_ICCID_PREFIX" ] &&
        [ "$FM_CARD_LENGTH" = "$KNOWN_FLYCAT_ICCID_LENGTH" ]; then
@@ -82,7 +101,23 @@ detect_flycat_card() {
         return 0
     fi
 
-    FM_DETECT_REASON="flag ${fm_detect_flag_type:-missing} ${fm_detect_flag:-missing}; fingerprint mismatch"
+    if [ "$fm_detect_atr" = "$KNOWN_FLYCAT_ATR" ] &&
+       [ "$FM_CARD_LENGTH" = "$KNOWN_FLYCAT_ICCID_LENGTH" ] &&
+       [ "$fm_detect_base_match" = "1" ]; then
+        FM_DETECT_AVAILABLE=1
+        FM_DETECT_SOURCE="known_slot_fingerprint"
+        FM_DETECT_REASON="ATR and physical slot ICCID fingerprint matched"
+        return 0
+    fi
+
+    if manual_display_enabled; then
+        FM_DETECT_AVAILABLE=1
+        FM_DETECT_SOURCE="manual_override"
+        FM_DETECT_REASON="enabled in DevUI advanced settings"
+        return 0
+    fi
+
+    FM_DETECT_REASON="flag ${fm_detect_flag_type:-missing} ${fm_detect_flag:-missing}; current/base fingerprint mismatch"
     return 1
 }
 
@@ -132,6 +167,12 @@ response_success() {
         '"result"[[:space:]]*:[[:space:]]*(0|\[[[:space:]]*0[[:space:]]*\]|true|"(success|ok)")([[:space:]],|[[:space:]}])'
 }
 
+response_failure() {
+    [ -n "$1" ] || return 1
+    printf '%s' "$1" | grep -Eiq \
+        '"result"[[:space:]]*:[[:space:]]*(-?[1-9][0-9]*|\[[[:space:]]*-?[1-9][0-9]*[[:space:]]*\]|false|"(error|fail|failed|failure)")([[:space:]],|[[:space:]}])|"(error|errmsg|error_message)"[[:space:]]*:[[:space:]]*"[^"}]+"'
+}
+
 print_status() {
     sim_json=$(get_sim_info)
     net_json=$(get_net_info)
@@ -154,11 +195,15 @@ print_status() {
         plmn="-"
     fi
 
+    if manual_display_enabled; then fm_manual=1; else fm_manual=0; fi
     printf 'FM_AVAILABLE=%s\n' "$FM_DETECT_AVAILABLE"
+    printf 'FM_MANUAL_ENABLED=%s\n' "$fm_manual"
     printf 'FM_DETECT_SOURCE=%s\n' "$(one_line "$FM_DETECT_SOURCE")"
     printf 'FM_DETECT_REASON=%s\n' "$(one_line "$FM_DETECT_REASON")"
     printf 'FM_CARD_PREFIX=%s\n' "$(one_line "$FM_CARD_PREFIX")"
     printf 'FM_CARD_LENGTH=%s\n' "$FM_CARD_LENGTH"
+    printf 'FM_BASE_PREFIX=%s\n' "$(one_line "$FM_BASE_PREFIX")"
+    printf 'FM_BASE_LENGTH=%s\n' "$FM_BASE_LENGTH"
     printf 'FM_CARRIER=%s\n' "$(one_line "$carrier")"
     printf 'FM_PROVIDER=%s\n' "$(one_line "$provider")"
     printf 'FM_NETTYPE=%s\n' "$(one_line "$net_type")"
@@ -220,17 +265,35 @@ switch_carrier() {
     set_reply=$(ubus -t 5 call zwrt_zte_mdm.api zwrt_mdm_uci_set \
         '{"option":"pin_no_need_decode","value":"1"}' 2>&1)
     set_rc=$?
-    if [ "$set_rc" -ne 0 ] || ! response_success "$set_reply"; then
+    if [ "$set_rc" -ne 0 ] || response_failure "$set_reply"; then
         log "切换失败：无法启用临时 PIN 解码模式"
         return 4
+    fi
+    if ! response_success "$set_reply"; then
+        if [ "$(uci_value "$PIN_KEY")" != "1" ]; then
+            log "切换失败：临时 PIN 解码模式未实际生效"
+            return 4
+        fi
+        log "设备未返回 PIN 设置结果，已通过配置回读确认生效"
     fi
 
     switch_reply=$(ubus -t 20 call zwrt_zte_mdm.api sim_change_pin_mode \
         "{\"pin_num_m\":\"$target_pin\",\"pin_mode\":1}" 2>&1)
     switch_rc=$?
-    if [ "$switch_rc" -ne 0 ] || ! response_success "$switch_reply"; then
-        log "切换失败：设备未返回明确成功结果"
+    if [ "$switch_rc" -ne 0 ]; then
+        log "切换失败：切换命令执行异常"
         return 5
+    fi
+    if response_failure "$switch_reply"; then
+        log "切换失败：设备明确拒绝切换命令"
+        return 5
+    fi
+    if ! response_success "$switch_reply"; then
+        if [ -n "$switch_reply" ]; then
+            log "设备返回未识别结果，继续等待运营商状态确认"
+        else
+            log "设备未返回切换结果，继续等待运营商状态确认"
+        fi
     fi
 
     case "$SWITCH_TIMEOUT" in ''|*[!0-9]*) SWITCH_TIMEOUT=60 ;; esac

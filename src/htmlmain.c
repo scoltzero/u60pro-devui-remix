@@ -183,6 +183,8 @@ static void devui_posix_tz(char *out, size_t outlen)
 #define FM_ACTION_LOG "/tmp/devui-fmswitch-action.log"
 #define FM_CTL_BUNDLED UI_DIR "/functions/fmsimpin.sh"
 #define FM_SWITCH_RC "/tmp/devui-fmswitch.rc"
+#define FM_DISPLAY_FILE "/data/plugins/u60pro-devui/flymodem-display.conf"
+#define FM_DISPLAY_TMP  "/data/plugins/u60pro-devui/flymodem-display.conf.tmp"
 #define CPU_CTL_BUNDLED UI_DIR "/functions/cpuctl.sh"
 #define CPU_CTL_LEGACY  UI_DIR "/../cpuctl.sh"
 #define CPU_CTL_OLD     "/data/ufi-tools/u60pro-devui/cpuctl.sh"
@@ -280,7 +282,7 @@ static int g_wg_installed, g_wg_running, g_wg_deps, g_wg_boot;
 static int g_wg_peer_n, g_wg_peer_total, g_wg_peer_active;
 static int g_op_installed, g_op_registered, g_op_job_running, g_op_at_busy;
 static int g_op_candidate_n, g_op_candidate_total;
-static int g_fm_available, g_fm_switching;
+static int g_fm_available, g_fm_switching, g_fm_enabled;
 static char g_ts_pid[16] = "-", g_ts_ip[48] = "-", g_ts_version[32] = "-";
 static char g_ts_host[64] = "-", g_ts_routes[160] = "-";
 static char g_mh_pid[16] = "-", g_mh_version[64] = "-", g_mh_mode[24] = "-";
@@ -1315,6 +1317,50 @@ static int fm_network_registered(void)
            !strcmp(g_fm_nettype, "LTE") || !strcmp(g_fm_nettype, "ENDC");
 }
 
+static int fm_display_read(int *configured)
+{
+    FILE *fp;
+    char line[16];
+    long value;
+    char *end = NULL;
+
+    if (configured) *configured = 0;
+    fp = fopen(FM_DISPLAY_FILE, "r");
+    if (!fp) return 0;
+    if (!fgets(line, sizeof line, fp)) {
+        fclose(fp);
+        return 0;
+    }
+    fclose(fp);
+    value = strtol(line, &end, 10);
+    if (end == line || (value != 0 && value != 1)) return 0;
+    if (configured) *configured = 1;
+    return value == 1;
+}
+
+static int fm_display_write(int enabled)
+{
+    FILE *fp;
+    int write_ok;
+
+    mkdir("/data/plugins/u60pro-devui", 0755);
+    fp = fopen(FM_DISPLAY_TMP, "w");
+    if (!fp) return -1;
+    write_ok = fprintf(fp, "%d\n", enabled ? 1 : 0) >= 0;
+    if (fclose(fp) != 0) write_ok = 0;
+    if (!write_ok) {
+        unlink(FM_DISPLAY_TMP);
+        return -1;
+    }
+    (void)chmod(FM_DISPLAY_TMP, 0644);
+    if (rename(FM_DISPLAY_TMP, FM_DISPLAY_FILE) != 0) {
+        unlink(FM_DISPLAY_TMP);
+        return -1;
+    }
+    g_fm_enabled = enabled ? 1 : 0;
+    return 0;
+}
+
 static int fm_switch_rc_read(int *rc)
 {
     char line[24], *end = NULL;
@@ -1410,6 +1456,23 @@ static int fm_card_available(void)
     if (access(FM_CTL_BUNDLED, R_OK) != 0) return 0;
     (void)refresh_fm_status(millis(), 0);
     return g_fm_available;
+}
+
+static void fm_display_load(void)
+{
+    int configured = 0;
+    int enabled = fm_display_read(&configured);
+
+    if (configured) {
+        g_fm_enabled = enabled;
+        return;
+    }
+
+    /* Preserve visibility for cards recognized by earlier releases. Unknown
+     * batches remain hidden until the user explicitly enables the page. */
+    (void)refresh_fm_status(millis(), 1);
+    g_fm_enabled = g_fm_available ? 1 : 0;
+    (void)fm_display_write(g_fm_enabled);
 }
 
 static int fm_switch_start(const char *pin, uint32_t now)
@@ -2510,15 +2573,17 @@ static void function_detection_eval(const char *name, struct function_detection 
         else if (!status) function_detection_set(out, 0, "capability_missing", "sim_traffic_available=0");
         else function_detection_set(out, 1, "available", "sim_traffic_available=1");
     } else if (!strcmp(name, "fmswitch.html")) {
-        if (access(FM_CTL_BUNDLED, F_OK) != 0)
+        if (!g_fm_enabled)
+            function_detection_set(out, 0, "user_disabled", "advanced setting off");
+        else if (access(FM_CTL_BUNDLED, F_OK) != 0)
             function_detection_set(out, 0, "controller_missing", FM_CTL_BUNDLED);
         else if (access(FM_CTL_BUNDLED, R_OK) != 0)
             function_detection_set(out, 0, "controller_not_readable", FM_CTL_BUNDLED);
         else {
             int available = fm_card_available();
-            snprintf(detail, sizeof detail, "source=%s; %s",
+            snprintf(detail, sizeof detail, "display=enabled; source=%s; %s",
                      g_fm_detect_source, g_fm_detect_reason);
-            function_detection_set(out, available, available ? "available" : "card_not_detected", detail);
+            function_detection_set(out, 1, available ? "available" : "manual_enabled", detail);
         }
     } else {
         function_detection_set(out, 1, "available", !strcmp(name, "timezone.html") ? "built-in" : "custom page");
@@ -5341,9 +5406,10 @@ static int fetch_signal_raw_vendor(const char *kind, char *dst, size_t cap)
 static void signal_settings_summary(char *dst, size_t cap)
 {
     if (!dst || cap == 0) return;
-    snprintf(dst, cap, "读取 %s · 解析 %s",
+    snprintf(dst, cap, "读取 %s · 解析 %s · 飞猫 %s",
              g_sig_read ? "已开启" : "已关闭",
-             g_sig_parse ? "已开启" : "已关闭");
+             g_sig_parse ? "已开启" : "已关闭",
+             g_fm_enabled ? "已显示" : "已隐藏");
 }
 /* escape &,<,> for safe litehtml parsing of arbitrary SMS text */
 static void html_esc(char *dst, size_t cap, const char *src)
@@ -5474,7 +5540,7 @@ static const char *sms_modal_html(void)
 /* Build the second-level band-lock dialog (overlaid on the dimmed page). */
 static const char *modal_html(void)
 {
-    static char out[3200];
+    static char out[4200];
     const char *uni, *sel, *pfx, *title, *act;
     if (g_modal == 4) {
         snprintf(out, sizeof out,
@@ -5485,12 +5551,15 @@ static const char *modal_html(void)
             "<span class='ctrl'><span class='sw %s'><span class='kn'></span></span></span></a>"
             "<a href='act:sigparse' class='row'><span class='lab'>解析信令<span class='st'>控制 LTE / NR RRC / NAS 解析，并决定第二页是否显示</span></span>"
             "<span class='ctrl'><span class='sw %s'><span class='kn'></span></span></span></a>"
-            "<div class='sec'>开启解析后才显示第二页。读取关闭时，TA / Ports / SSB Index 会显示为空。</div>"
+            "<a href='act:flymodem' class='row'><span class='lab'>飞猫分身卡<span class='st'>开启后第二页显示插件子页面，仅确认使用飞猫卡时开启</span></span>"
+            "<span class='ctrl'><span class='sw %s'><span class='kn'></span></span></span></a>"
+            "<div class='sec'>读取关闭时 TA / Ports / SSB Index 会显示为空。飞猫卡切换会短暂断网，并保留二次确认。</div>"
             "<div class='mbtns'><a href='act:closemodal' class='mbtn2 prim mfull'>关闭</a></div>"
             "</div></body></html>",
             g_theme ? "light" : "dark",
             g_sig_read ? "on" : "off",
-            g_sig_parse ? "on" : "off");
+            g_sig_parse ? "on" : "off",
+            g_fm_enabled ? "on" : "off");
         return out;
     }
     if (g_modal == 1)      { uni = g_uni_sa;  sel = g_sel_sa;  pfx = "n"; act = "bsa";  title = "5G SA 锁频"; }
@@ -6002,7 +6071,7 @@ static int build_kv(struct kv *t, const char *path)
     static char s_rxb[16], s_txb[16], s_cpu[8], s_mem[8], w_rsrp[6], w_rsrq[6], w_sinr[6], w_bw[6];
     static char s_oper[48], s_ssid[64], s_key[64], s_page[8], s_np[8], s_model[64], s_fw[80];
     static char s_qci[8], s_ambr[24], s_sbar[640], s_dots[320], s_ta[16], s_tadist[24];
-    static char s_nrports[64], s_nrbeam[128], s_nrvendor[64], s_sigadvstate[64], s_sigrefresh[16], s_signalcards[10000], s_neighborcards[7000];
+    static char s_nrports[64], s_nrbeam[128], s_nrvendor[64], s_sigadvstate[96], s_sigrefresh[16], s_signalcards[10000], s_neighborcards[7000];
     static char s_last_lte_nas[128] = "-";
         static char s_last_nr_nas[128] = "-";
         static char s_last_nrports[64] = "-";
@@ -7876,6 +7945,28 @@ static void handle_modal_tap(drm_disp_t *disp, int x, int y, uint32_t now,
             snprintf(g_toast, sizeof g_toast, "信令解析已%s", g_sig_parse ? "开启" : "关闭");
             g_toast_until = now + 1600;
             *need_render = 1;
+        } else if (!strcmp(a, "flymodem")) {
+            int enabled = !g_fm_enabled;
+            struct function_detection result;
+            if (!enabled && g_fm_switching) {
+                snprintf(g_toast, sizeof g_toast, "切换进行中，暂不能隐藏");
+            } else if (fm_display_write(enabled) != 0) {
+                snprintf(g_toast, sizeof g_toast, "飞猫页面设置保存失败");
+            } else {
+                g_fm_confirm_pin[0] = 0;
+                g_fm_confirm_until = 0;
+                g_fm_refresh_at = 0;
+                (void)refresh_fm_status(now, 1);
+                function_detection_eval("fmswitch.html", &result, 1);
+                if (enabled && !result.visible)
+                    snprintf(g_toast, sizeof g_toast, "已开启，但飞猫控制器不可用");
+                else
+                    snprintf(g_toast, sizeof g_toast, "%s",
+                             enabled ? "飞猫子页面已显示" : "飞猫子页面已隐藏");
+            }
+            g_toast_until = now + 1800;
+            invalidate_render_html_cache();
+            *need_render = 1;
         } else if (!strcmp(a, "closemodal")) {
             g_modal = 0;
             *need_render = 1;
@@ -8058,6 +8149,7 @@ int main(void)
     #define CUR_PATH (g_lock_state == 1 ? g_pages[0] : g_lock_state ? lock_path : menu ? menu_path : active_page_path())
 
     load_conf();                          /* restore persisted UI settings */
+    fm_display_load();                    /* migrate prior auto-detection, then obey the user switch */
     mkdir(FUNCTIONS_DIR, 0755);
     plugin_detect_log_all(1);
     speedtest_apply_saved_prefs();

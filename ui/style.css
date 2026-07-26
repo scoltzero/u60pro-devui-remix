@@ -199,6 +199,7 @@ body.light .seg { background: #e3ebf4; }
 .segc { display: table-cell; text-align: center; font-size: 15px; padding: 12px 0;
         text-decoration: none; white-space: nowrap; }
 .seg2 .segc { width: 50%; }
+.seg3 .segc { width: 33.333%; }
 .seg4 .segc { width: 25%; }            /* explicit widths = equal cells */
 .seg5 .segc { width: 20%; font-size: 13px; padding: 11px 0; }
 .seg6 { margin-top: 5px; }
