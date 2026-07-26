@@ -2,6 +2,20 @@
 
 > 当前正式命名与安装路径已经统一为：`zwrt-datad`、`/data/plugins/zwrt-datad/zwrt-datad`、`/data/plugins/u60pro-devui/`、`/data/plugins/u60pro-devui/ui`。历史条目里如果出现 `u60-datad`、`/data/u60pro` 或 `/data/ui`，表示当时版本记录。
 
+## v1.2.12-remix.9 - 2026-07-26
+
+### 修复
+
+- 飞猫卡显隐、切换前校验和切换完成校验统一使用同一控制器判断，避免页面显示后仍被切换逻辑拒绝。
+- 厂商 `seecom_card_flag` 失效时，支持使用已确认的 SIM ATR、ICCID 发行前缀和长度进行离线卡型识别；普通卡必须同时匹配全部指纹才会显示入口。
+- 兼容厂商字符串标志 `1`（Seecom）和 `2`（Flymodem），不接受缺少本地指纹的数值型标志或字符串 `0`。
+
+### 诊断
+
+- 插件入口显隐写入带时间戳的 `plugin-detect.log`，记录页面缺失、控制器缺失、卡型未匹配和实际识别来源。
+- 新增只读、自动脱敏的飞猫卡诊断脚本，采集 SIM、MQTT、UCI、ATR 和可选 `get_card_iccid` 状态，不执行切卡或配置写入。
+- 飞猫控制器状态增加 `FM_DETECT_SOURCE` 和 `FM_DETECT_REASON`，便于区分厂商标志识别与本地指纹识别。
+
 ## v1.2.12-remix.8 - 2026-07-26
 
 ### 新增

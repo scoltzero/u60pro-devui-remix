@@ -4,6 +4,9 @@ LOG="${FM_ACTION_LOG:-/tmp/devui-fmswitch-action.log}"
 PIN_KEY="zwrt_zte_mdm.sim_info.pin_no_need_decode"
 SWITCH_TIMEOUT="${FM_SWITCH_TIMEOUT:-60}"
 POLL_INTERVAL="${FM_POLL_INTERVAL:-1}"
+KNOWN_FLYCAT_ATR="3B9F11801FC78031E073FE211B57378660C90200215C"
+KNOWN_FLYCAT_ICCID_PREFIX="89860487"
+KNOWN_FLYCAT_ICCID_LENGTH="20"
 
 timestamp() {
     date '+%F %T'
@@ -28,6 +31,59 @@ json_type() {
 
 one_line() {
     printf '%s' "$1" | tr '\r\n=' '   ' | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//'
+}
+
+uci_value() {
+    uci -q get "$1" 2>/dev/null | head -n 1
+}
+
+detect_flycat_card() {
+    fm_detect_json="$1"
+    FM_DETECT_AVAILABLE=0
+    FM_DETECT_SOURCE="none"
+    FM_DETECT_REASON="card fingerprint not matched"
+    FM_CARD_PREFIX="-"
+    FM_CARD_LENGTH=0
+
+    fm_detect_flag=$(json_value "$fm_detect_json" seecom_card_flag)
+    fm_detect_flag_type=$(json_type "$fm_detect_json" seecom_card_flag)
+    if [ "$fm_detect_flag_type" = "string" ]; then
+        case "$fm_detect_flag" in
+            2)
+                FM_DETECT_AVAILABLE=1
+                FM_DETECT_SOURCE="vendor_flymodem"
+                FM_DETECT_REASON="seecom_card_flag string 2"
+                return 0
+                ;;
+            1)
+                FM_DETECT_AVAILABLE=1
+                FM_DETECT_SOURCE="vendor_seecom"
+                FM_DETECT_REASON="seecom_card_flag string 1"
+                return 0
+                ;;
+        esac
+    fi
+
+    fm_detect_iccid=$(json_value "$fm_detect_json" sim_iccid | tr -cd '0-9')
+    [ -n "$fm_detect_iccid" ] || \
+        fm_detect_iccid=$(uci_value zwrt_zte_mdm.sim_info.current_sim_iccid | tr -cd '0-9')
+    [ -n "$fm_detect_iccid" ] || \
+        fm_detect_iccid=$(uci_value zwrt_zte_mdm.sim_info.sim_iccid | tr -cd '0-9')
+    fm_detect_atr=$(uci_value zwrt_zte_mdm.sim_info.sim_atr | tr '[:lower:]' '[:upper:]' | tr -cd '0-9A-F')
+    FM_CARD_LENGTH=${#fm_detect_iccid}
+    [ -z "$fm_detect_iccid" ] || FM_CARD_PREFIX=$(printf '%.8s' "$fm_detect_iccid")
+
+    if [ "$fm_detect_atr" = "$KNOWN_FLYCAT_ATR" ] &&
+       [ "$FM_CARD_PREFIX" = "$KNOWN_FLYCAT_ICCID_PREFIX" ] &&
+       [ "$FM_CARD_LENGTH" = "$KNOWN_FLYCAT_ICCID_LENGTH" ]; then
+        FM_DETECT_AVAILABLE=1
+        FM_DETECT_SOURCE="known_fingerprint"
+        FM_DETECT_REASON="ATR and ICCID issuer fingerprint matched"
+        return 0
+    fi
+
+    FM_DETECT_REASON="flag ${fm_detect_flag_type:-missing} ${fm_detect_flag:-missing}; fingerprint mismatch"
+    return 1
 }
 
 get_sim_info() {
@@ -79,8 +135,7 @@ response_success() {
 print_status() {
     sim_json=$(get_sim_info)
     net_json=$(get_net_info)
-    flag=$(json_value "$sim_json" seecom_card_flag)
-    flag_type=$(json_type "$sim_json" seecom_card_flag)
+    detect_flycat_card "$sim_json" || true
     carrier=$(json_value "$sim_json" seecom_card_carrier_type | tr '[:lower:]' '[:upper:]')
     net_type=$(json_value "$net_json" network_type)
     band=$(json_value "$net_json" wan_active_band)
@@ -89,11 +144,6 @@ print_status() {
     mnc=$(normalize_mnc "$(json_value "$net_json" rmnc)")
     provider=$(carrier_name "$carrier")
 
-    if [ "$flag_type" = "string" ] && [ "$flag" = "1" ]; then
-        available=1
-    else
-        available=0
-    fi
     [ -n "$carrier" ] || carrier="-"
     [ -n "$net_type" ] || net_type="-"
     [ -n "$band" ] || band="-"
@@ -104,7 +154,11 @@ print_status() {
         plmn="-"
     fi
 
-    printf 'FM_AVAILABLE=%s\n' "$available"
+    printf 'FM_AVAILABLE=%s\n' "$FM_DETECT_AVAILABLE"
+    printf 'FM_DETECT_SOURCE=%s\n' "$(one_line "$FM_DETECT_SOURCE")"
+    printf 'FM_DETECT_REASON=%s\n' "$(one_line "$FM_DETECT_REASON")"
+    printf 'FM_CARD_PREFIX=%s\n' "$(one_line "$FM_CARD_PREFIX")"
+    printf 'FM_CARD_LENGTH=%s\n' "$FM_CARD_LENGTH"
     printf 'FM_CARRIER=%s\n' "$(one_line "$carrier")"
     printf 'FM_PROVIDER=%s\n' "$(one_line "$provider")"
     printf 'FM_NETTYPE=%s\n' "$(one_line "$net_type")"
@@ -142,10 +196,9 @@ switch_carrier() {
     target_name=$(carrier_name "$target_carrier")
 
     sim_json=$(get_sim_info)
-    flag=$(json_value "$sim_json" seecom_card_flag)
-    flag_type=$(json_type "$sim_json" seecom_card_flag)
+    detect_flycat_card "$sim_json" || true
     current=$(json_value "$sim_json" seecom_card_carrier_type | tr '[:lower:]' '[:upper:]')
-    if [ "$flag_type" != "string" ] || [ "$flag" != "1" ]; then
+    if [ "$FM_DETECT_AVAILABLE" != "1" ]; then
         log "拒绝切换：未检测到飞猫分身卡"
         trim_log
         return 3
@@ -185,11 +238,10 @@ switch_carrier() {
     while [ "$elapsed" -lt "$SWITCH_TIMEOUT" ]; do
         sim_json=$(get_sim_info)
         net_json=$(get_net_info)
-        flag=$(json_value "$sim_json" seecom_card_flag)
-        flag_type=$(json_type "$sim_json" seecom_card_flag)
+        detect_flycat_card "$sim_json" || true
         current=$(json_value "$sim_json" seecom_card_carrier_type | tr '[:lower:]' '[:upper:]')
         net_type=$(json_value "$net_json" network_type)
-        if [ "$flag_type" = "string" ] && [ "$flag" = "1" ] &&
+        if [ "$FM_DETECT_AVAILABLE" = "1" ] &&
            [ "$current" = "$target_carrier" ] && network_registered "$net_type"; then
             log "切换成功：$target_name，网络已恢复为$net_type"
             return 0

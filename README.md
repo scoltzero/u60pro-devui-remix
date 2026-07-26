@@ -105,6 +105,13 @@ adb shell '/etc/init.d/zte_topsw_devui stop; sleep 1;
 - Remix release 的 `version.json` 合并 `datad`、`devui` 与 `ui` 三项，供原版管理器从同一个自定义源完成全新安装。
 - `ui.tar.gz` 内含 `.devui-managed-files`。新版管理器据此原子替换 Remix 管理的页面，同时保留用户自行添加的 `ui/functions/` 页面。
 - 插件入口显隐诊断写入 `/data/plugins/u60pro-devui/plugin-detect.log`；向 DevUI 进程发送 `SIGUSR1` 可立即重跑一次完整诊断，不会重启进程。
+- 飞猫卡误判时可运行 `scripts/flycat-card-diagnostic.sh`。脚本只读采集 SIM、MQTT、UCI 和网络状态，自动脱敏 IMSI、ICCID、IMEI、手机号及 PIN/PUK；将生成的完整报告反馈给维护者即可对比卡型指纹。
+
+```sh
+adb push scripts/flycat-card-diagnostic.sh /tmp/
+adb shell 'chmod 700 /tmp/flycat-card-diagnostic.sh && /tmp/flycat-card-diagnostic.sh /tmp/flycat-report.txt'
+adb pull /tmp/flycat-report.txt
+```
 
 ```jsonc
 // Remix 聚合 version.json

@@ -295,6 +295,7 @@ static char g_op_mode[24] = "-", g_op_job_status[24] = "idle", g_op_job_message[
 static char g_op_rat_pref[16] = "auto", g_op_failure_policy[24] = "stay_offline";
 static char g_fm_carrier[8] = "-", g_fm_provider[32] = "-", g_fm_nettype[24] = "-";
 static char g_fm_band[32] = "-", g_fm_signal[16] = "-", g_fm_plmn[16] = "-";
+static char g_fm_detect_source[32] = "none", g_fm_detect_reason[128] = "not checked";
 static char g_fm_confirm_pin[8], g_fm_switch_pin[8];
 static uint32_t g_fm_refresh_at, g_fm_confirm_until, g_fm_switch_until;
 static char g_toast[48];
@@ -1342,12 +1343,17 @@ static int refresh_fm_status(uint32_t now, int force)
     uint32_t interval = g_fm_switching ? 1000U : 5000U;
     FILE *fp;
     char cmd[512], line[192];
+    char old_source[sizeof g_fm_detect_source], old_reason[sizeof g_fm_detect_reason];
     int old_available = g_fm_available, old_switching = g_fm_switching;
     int rc;
 
     if (!force && g_fm_refresh_at && now - g_fm_refresh_at < interval) return 0;
     g_fm_refresh_at = now;
+    snprintf(old_source, sizeof old_source, "%s", g_fm_detect_source);
+    snprintf(old_reason, sizeof old_reason, "%s", g_fm_detect_reason);
     g_fm_available = 0;
+    snprintf(g_fm_detect_source, sizeof g_fm_detect_source, "none");
+    snprintf(g_fm_detect_reason, sizeof g_fm_detect_reason, "controller returned no match");
     snprintf(g_fm_carrier, sizeof g_fm_carrier, "-");
     snprintf(g_fm_provider, sizeof g_fm_provider, "-");
     snprintf(g_fm_nettype, sizeof g_fm_nettype, "-");
@@ -1362,6 +1368,10 @@ static int refresh_fm_status(uint32_t now, int force)
             while (fgets(line, sizeof line, fp)) {
                 if (!strncmp(line, "FM_AVAILABLE=", 13))
                     g_fm_available = line[13] == '1';
+                else if (!strncmp(line, "FM_DETECT_SOURCE=", 17))
+                    line_value(g_fm_detect_source, sizeof g_fm_detect_source, line, 17);
+                else if (!strncmp(line, "FM_DETECT_REASON=", 17))
+                    line_value(g_fm_detect_reason, sizeof g_fm_detect_reason, line, 17);
                 else if (!strncmp(line, "FM_CARRIER=", 11))
                     line_value(g_fm_carrier, sizeof g_fm_carrier, line, 11);
                 else if (!strncmp(line, "FM_PROVIDER=", 12))
@@ -1391,7 +1401,8 @@ static int refresh_fm_status(uint32_t now, int force)
             fm_switch_finish(now, 0, "飞猫三网切换超时");
         }
     }
-    return old_available != g_fm_available || old_switching != g_fm_switching;
+    return old_available != g_fm_available || old_switching != g_fm_switching ||
+           strcmp(old_source, g_fm_detect_source) || strcmp(old_reason, g_fm_detect_reason);
 }
 
 static int fm_card_available(void)
@@ -2450,6 +2461,7 @@ static void plugin_detect_record(const char *name, const struct function_detecti
 static void function_detection_eval(const char *name, struct function_detection *out, int force_log)
 {
     char page[320];
+    char detail[320];
     const char *ctl;
     int status;
 
@@ -2502,10 +2514,12 @@ static void function_detection_eval(const char *name, struct function_detection 
             function_detection_set(out, 0, "controller_missing", FM_CTL_BUNDLED);
         else if (access(FM_CTL_BUNDLED, R_OK) != 0)
             function_detection_set(out, 0, "controller_not_readable", FM_CTL_BUNDLED);
-        else if (!fm_card_available())
-            function_detection_set(out, 0, "card_not_detected", "seecom_card_flag is not string 1");
-        else
-            function_detection_set(out, 1, "available", "seecom_card_flag=string:1");
+        else {
+            int available = fm_card_available();
+            snprintf(detail, sizeof detail, "source=%s; %s",
+                     g_fm_detect_source, g_fm_detect_reason);
+            function_detection_set(out, available, available ? "available" : "card_not_detected", detail);
+        }
     } else {
         function_detection_set(out, 1, "available", !strcmp(name, "timezone.html") ? "built-in" : "custom page");
     }
