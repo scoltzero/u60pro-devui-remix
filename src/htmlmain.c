@@ -5551,7 +5551,7 @@ static const char *modal_html(void)
             "<span class='ctrl'><span class='sw %s'><span class='kn'></span></span></span></a>"
             "<a href='act:sigparse' class='row'><span class='lab'>解析信令<span class='st'>控制 LTE / NR RRC / NAS 解析，并决定第二页是否显示</span></span>"
             "<span class='ctrl'><span class='sw %s'><span class='kn'></span></span></span></a>"
-            "<a href='act:flymodem' class='row'><span class='lab'>飞猫分身卡<span class='st'>开启后第二页显示插件子页面，仅确认使用飞猫卡时开启</span></span>"
+            "<a href='act:flymodem' class='row'><span class='lab'>飞猫分身卡<span class='st'>开启后第二页显示插件子页面，仅确认使用飞猫卡时开启，非飞猫卡切卡会导致封卡，谨慎操作</span></span>"
             "<span class='ctrl'><span class='sw %s'><span class='kn'></span></span></span></a>"
             "<div class='sec'>读取关闭时 TA / Ports / SSB Index 会显示为空。飞猫卡切换会短暂断网，并保留二次确认。</div>"
             "<div class='mbtns'><a href='act:closemodal' class='mbtn2 prim mfull'>关闭</a></div>"

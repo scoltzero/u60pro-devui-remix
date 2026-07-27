@@ -2,6 +2,12 @@
 
 > 当前正式命名与安装路径已经统一为：`zwrt-datad`、`/data/plugins/zwrt-datad/zwrt-datad`、`/data/plugins/u60pro-devui/`、`/data/plugins/u60pro-devui/ui`。历史条目里如果出现 `u60-datad`、`/data/u60pro` 或 `/data/ui`，表示当时版本记录。
 
+## v1.2.12-remix.11 - 2026-07-27
+
+### 安全提示
+
+- 高级设置“飞猫分身卡”开关补充非飞猫卡切卡可能导致封卡的明确警告，提醒用户仅在确认使用飞猫卡时启用。
+
 ## v1.2.12-remix.10 - 2026-07-26
 
 ### 新增
