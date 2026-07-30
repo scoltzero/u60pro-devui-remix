@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "datad": {
+    "version": "0.6.7-remix.5",
+    "asset": "zwrt-datad-aarch64",
+    "notes": "修复 SNTP 校时后时区和流量周期回退 UTC 的问题"
+  },
+  "devui": {
+    "version": "1.2.12-remix.12",
+    "asset": "u60pro-devui-aarch64",
+    "notes": "固定按 UTC epoch 应用用户时区，不再受厂商 SNTP 配置影响"
+  },
+  "ui": {
+    "version": "0.4.10-remix.8",
+    "asset": "ui.tar.gz",
+    "notes": "增加飞猫页面手动开关、三等分按钮及切换状态校验"
+  }
+}
