@@ -117,15 +117,15 @@ adb pull /tmp/flycat-report.txt
 ```jsonc
 // Remix 聚合 version.json
 { "schema": 1,
-  "datad": { "version": "0.6.7-remix.4", "asset": "zwrt-datad-aarch64" },
-  "devui": { "version": "1.2.12-remix.11", "asset": "u60pro-devui-aarch64" },
+  "datad": { "version": "0.6.7-remix.5", "asset": "zwrt-datad-aarch64" },
+  "devui": { "version": "1.2.12-remix.12", "asset": "u60pro-devui-aarch64" },
   "ui":    { "version": "0.4.10-remix.8", "asset": "ui.tar.gz" } }
 ```
 
 在原版管理器中选择“自定义源链接”，正式发布后推荐填写对应版本的不可变 CDN 资产模板：
 
 ```text
-https://fastly.jsdelivr.net/gh/scoltzero/u60pro-devui-remix@assets-v1.2.12-remix.11/{file}
+https://fastly.jsdelivr.net/gh/scoltzero/u60pro-devui-remix@assets-v1.2.12-remix.12/{file}
 ```
 
 该地址固定到同一批发布资产，避免清单和二进制因 CDN 分支缓存而不一致。正式归档仍位于 `https://github.com/scoltzero/u60pro-devui-remix/releases/latest/download`。
@@ -138,7 +138,7 @@ https://fastly.jsdelivr.net/gh/scoltzero/u60pro-devui-remix@assets-v1.2.12-remix
 bash scripts/build.sh
 bash scripts/package-release.sh \
   --datad ../zwrt-datad/zwrt-datad.stripped \
-  --out dist/v1.2.12-remix.11
+  --out dist/v1.2.12-remix.12
 ```
 
 ## 致谢

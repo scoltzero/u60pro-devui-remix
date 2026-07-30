@@ -2,6 +2,15 @@
 
 > 当前正式命名与安装路径已经统一为：`zwrt-datad`、`/data/plugins/zwrt-datad/zwrt-datad`、`/data/plugins/u60pro-devui/`、`/data/plugins/u60pro-devui/ui`。历史条目里如果出现 `u60-datad`、`/data/u60pro` 或 `/data/ui`，表示当时版本记录。
 
+## v1.2.12-remix.12 - 2026-07-30
+
+### 修复
+
+- DevUI 固定以 Unix UTC epoch 叠加用户选择的时区，不再把厂商 `time_from_utc` 设置误认为底层时钟已偏移。
+- 修复开机后启用 Mihomo、SNTP 完成校时或系统时间被纠正时，屏幕时钟从 UTC+8 跳回 UTC+0 的问题。
+- datad 的今日流量和套餐周期同步使用相同的 UTC epoch 时区计算，避免日界线错误落在 UTC 00:00。
+- 新旧组件交叉升级兼容：新 DevUI 会忽略旧 datad 的错误时钟补偿；新 datad 也会向旧 DevUI 返回正确的 UTC 基准。
+
 ## v1.2.12-remix.11 - 2026-07-27
 
 ### 安全提示
