@@ -50,25 +50,51 @@ static inline void put_px(int x, int y, int r, int g, int b, int a)
     *p = (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
 }
 
+static inline void put_px_clean_blend(int x, int y, int r, int g, int b, int a)
+{
+    if (y < g_clip_top) return;
+    if (x < 0 || y < 0 || x >= g_w || y >= g_h || a <= 0) return;
+    int dx = g_rotate ? (g_w - 1 - x) : x;
+    int dy = g_rotate ? (g_h - 1 - y) : y;
+    uint16_t *p = &g_fb[dy * g_pitch_px + dx];
+    if (a < 255) {
+        uint16_t o = *p;
+        int orr = ((o >> 11) & 0x1F) << 3;
+        int og = ((o >> 5) & 0x3F) << 2;
+        int ob = (o & 0x1F) << 3;
+        r = (r * a + orr * (255 - a)) / 255;
+        g = (g * a + og * (255 - a)) / 255;
+        b = (b * a + ob * (255 - a)) / 255;
+    }
+    *p = (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
+
 static int round_coverage(int x, int y, int fx, int fy, int fw, int fh,
                           int rtl, int rtr, int rbr, int rbl)
 {
-    int r = 0;
-    float cx = 0, cy = 0;
+    int r = 0, cx = 0, cy = 0;
     if (x < fx || y < fy || x >= fx + fw || y >= fy + fh) return 0;
     if      (x < fx + rtl       && y < fy + rtl)       { r = rtl; cx = fx + rtl;      cy = fy + rtl; }
     else if (x >= fx + fw - rtr && y < fy + rtr)       { r = rtr; cx = fx + fw - rtr; cy = fy + rtr; }
     else if (x >= fx + fw - rbr && y >= fy + fh - rbr) { r = rbr; cx = fx + fw - rbr; cy = fy + fh - rbr; }
     else if (x < fx + rbl       && y >= fy + fh - rbl) { r = rbl; cx = fx + rbl;      cy = fy + fh - rbl; }
     if (r <= 0) return 255;
-    static const float sample[4][2] = {{.25f,.25f},{.75f,.25f},{.25f,.75f},{.75f,.75f}};
+
+    /* 8x8 fixed-point edge coverage. The old 2x2 sampling exposed visible
+     * staircase pixels on 8-13px button radii, especially after RGB565
+     * quantisation. Sixty-four samples stay cheap because only corner squares
+     * reach this loop. */
+    static const int sample16[8] = {1, 3, 5, 7, 9, 11, 13, 15};
     int inside = 0;
-    float rr = (float)r * r;
-    for (int i = 0; i < 4; i++) {
-        float dx = x + sample[i][0] - cx, dy = y + sample[i][1] - cy;
-        if (dx * dx + dy * dy <= rr) inside++;
-    }
-    return inside * 255 / 4;
+    int rr = r * 16;
+    rr *= rr;
+    for (int sy = 0; sy < 8; sy++)
+        for (int sx = 0; sx < 8; sx++) {
+            int dx = (x - cx) * 16 + sample16[sx];
+            int dy = (y - cy) * 16 + sample16[sy];
+            if (dx * dx + dy * dy <= rr) inside++;
+        }
+    return inside * 255 / 64;
 }
 
 static inline uint16_t get_px565(int x, int y)
@@ -215,6 +241,18 @@ class fb_container : public document_container {
             for (int x = x1; x < x2; x++)
                 put_px(x, y, c.red, c.green, c.blue, c.alpha);
     }
+    void fill_soft_shadow(int fx, int fy, int fw, int fh,
+                          int rtl, int rtr, int rbr, int rbl, int alpha) {
+        if (alpha <= 0 || fw <= 0 || fh <= 0) return;
+        position cl = eff_clip();
+        int x1 = std::max(fx, (int)cl.left()),  y1 = std::max(fy, (int)cl.top());
+        int x2 = std::min(fx + fw, (int)cl.right()), y2 = std::min(fy + fh, (int)cl.bottom());
+        for (int y = y1; y < y2; y++)
+            for (int x = x1; x < x2; x++) {
+                int cov = round_coverage(x, y, fx, fy, fw, fh, rtl, rtr, rbr, rbl);
+                if (cov) put_px_clean_blend(x, y, 4, 9, 16, alpha * cov / 255);
+            }
+    }
     /* Filled rectangle with rounded corners. litehtml only hands us the radii;
      * it's up to the container to honor them, so a pixel inside one of the four
      * corner squares but outside its quarter-circle arc is skipped. */
@@ -225,11 +263,26 @@ class fb_container : public document_container {
         if (rtr > hw) rtr = hw; if (rtr > hh) rtr = hh;
         if (rbr > hw) rbr = hw; if (rbr > hh) rbr = hh;
         if (rbl > hw) rbl = hw; if (rbl > hh) rbl = hh;
+        int max_r = std::max(std::max(rtl, rtr), std::max(rbr, rbl));
+        bool soft_surface = c.alpha >= 240 && max_r >= 5 && fw >= 22 && fh >= 16;
+        int cmax = std::max(c.red, std::max(c.green, c.blue));
+        int cmin = std::min(c.red, std::min(c.green, c.blue));
+        bool accent = cmax - cmin >= 28 && c.blue > c.red + 12;
+        /* The deliberately darker slot/log palette is inset. Slightly brighter
+         * cards and command buttons stay raised even when they are wide. */
+        bool deep_inset = c.red <= 23 && c.green <= 32 && c.blue <= 45;
+        bool inset_surface = soft_surface && deep_inset && !accent;
+        bool compact_control = soft_surface && fh <= 64;
+        bool raised_surface = soft_surface && !inset_surface && max_r >= 6 && fw >= 36 && fh >= 20;
+        if (raised_surface) {
+            /* A single one-pixel contact shadow cannot expose stacked alpha
+             * bands at the corners. Surface bevel and border carry the depth. */
+            fill_soft_shadow(fx, fy + 1, fw, fh,
+                             rtl, rtr, rbr, rbl, compact_control ? 10 : 7);
+        }
         position cl = eff_clip();
         int x1 = std::max(fx, (int)cl.left()),  y1 = std::max(fy, (int)cl.top());
         int x2 = std::min(fx + fw, (int)cl.right()), y2 = std::min(fy + fh, (int)cl.bottom());
-        int max_r = std::max(std::max(rtl, rtr), std::max(rbr, rbl));
-        bool soft_surface = c.alpha >= 240 && max_r >= 5 && fw >= 22 && fh >= 16;
         for (int y = y1; y < y2; y++) {
             for (int x = x1; x < x2; x++) {
                 int r = 0, cx = 0, cy = 0;
@@ -244,16 +297,25 @@ class fb_container : public document_container {
                         int top = y - fy, left = x - fx;
                         int bottom = fy + fh - 1 - y, right = fx + fw - 1 - x;
                         int lift = 0, shade = 0;
-                        if (top == 0 || left == 0) lift = 10;
-                        else if (top == 1 || left == 1) lift = 4;
-                        if (bottom == 0 || right == 0) shade = 11;
-                        else if (bottom == 1 || right == 1) shade = 5;
+                        if (inset_surface) {
+                            if (top == 0 || left == 0) shade = 12;
+                            else if (top == 1 || left == 1) shade = 5;
+                            if (bottom == 0 || right == 0) lift = 7;
+                            else if (bottom == 1 || right == 1) lift = 3;
+                        } else {
+                            if (top == 0 || left == 0) lift = accent ? 20 : compact_control ? 13 : 9;
+                            else if (top == 1 || left == 1) lift = accent ? 8 : compact_control ? 5 : 3;
+                            if (bottom == 0 || right == 0) shade = accent ? 18 : compact_control ? 13 : 9;
+                            else if (bottom == 1 || right == 1) shade = accent ? 8 : compact_control ? 5 : 3;
+                        }
                         int delta = lift - shade;
                         rr = std::max(0, std::min(255, rr + delta));
                         gg = std::max(0, std::min(255, gg + delta));
                         bb = std::max(0, std::min(255, bb + delta));
                     }
-                    put_px(x, y, rr, gg, bb, c.alpha * cov / 255);
+                    int alpha = c.alpha * cov / 255;
+                    if (alpha < 255) put_px_clean_blend(x, y, rr, gg, bb, alpha);
+                    else             put_px(x, y, rr, gg, bb, alpha);
                 }
             }
         }
@@ -272,6 +334,7 @@ class fb_container : public document_container {
         position cl = eff_clip();
         int x1 = std::max(fx, (int)cl.left()),  y1 = std::max(fy, (int)cl.top());
         int x2 = std::min(fx + fw, (int)cl.right()), y2 = std::min(fy + fh, (int)cl.bottom());
+        bool soft_outline = std::max(std::max(rtl, rtr), std::max(rbr, rbl)) >= 5 && fw >= 22 && fh >= 16;
         for (int y = y1; y < y2; y++)
             for (int x = x1; x < x2; x++)
                 {
@@ -279,7 +342,17 @@ class fb_container : public document_container {
                     int inner = round_coverage(x, y, fx + t, fy + t, fw - 2 * t, fh - 2 * t,
                                                itl, itr, ibr, ibl);
                     int cov = outer > inner ? outer - inner : 0;
-                    if (cov) put_px(x, y, c.red, c.green, c.blue, c.alpha * cov / 255);
+                    if (cov) {
+                        int delta = 0;
+                        if (soft_outline) {
+                            delta += y < fy + fh / 2 ? 5 : -5;
+                            delta += x < fx + fw / 2 ? 3 : -3;
+                        }
+                        int rr = std::max(0, std::min(255, c.red + delta));
+                        int gg = std::max(0, std::min(255, c.green + delta));
+                        int bb = std::max(0, std::min(255, c.blue + delta));
+                        put_px_clean_blend(x, y, rr, gg, bb, c.alpha * cov / 255);
+                    }
                 }
     }
 
@@ -623,7 +696,7 @@ extern "C" void html_view_fill_round_rect(int x, int y, int w, int h, int rad, i
         for (int xx = x; xx < x + w; xx++)
             {
                 int cov = round_coverage(xx, yy, x, y, w, h, rad, rad, rad, rad);
-                if (cov) put_px(xx, yy, r, g, b, a * cov / 255);
+                if (cov) put_px_clean_blend(xx, yy, r, g, b, a * cov / 255);
             }
 }
 

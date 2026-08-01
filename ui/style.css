@@ -551,24 +551,25 @@ body.light .sthint.bad { background: #fff0ee; color: #b6362d; border: 1px solid 
 .mono { font-family: monospace; font-size: 11px; }
 
 /* ---- newUI: restrained dark Soft UI for the RGB565 panel ----
- * litehtml handles layout; the framebuffer renderer adds a one-pixel bevel to
- * larger rounded fills. Keep the palette discrete so RGB565 does not band. */
+ * litehtml handles layout; the framebuffer renderer supplies anti-aliased
+ * radii, short contact shadows and directional edge light. Palette steps stay
+ * discrete so RGB565 does not produce visible gradient bands. */
 body { letter-spacing: 0; }
-body.dark  { background: #0a1018; color: #f1f5fa; }
-body.light { background: #e8eef5; color: #182433; }
+body.dark  { background: #0b1018; color: #f0f3f8; }
+body.light { background: #e8edf3; color: #182433; }
 
-body.dark  .sbar { background: #101722; color: #f4f7fb; }
+body.dark  .sbar { background: #10151e; color: #f4f6f9; }
 body.light .sbar { background: #dbe4ee; color: #182433; }
 body.dark  .spd { color: #a2adbc; }
 body.light .spd { color: #536173; }
 
 .card { margin-top: 6px; border-radius: 8px; padding: 9px 10px 10px; }
-body.dark  .card { background: #18212d; border-color: #2b3747; }
-body.light .card { background: #f7f9fc; border-color: #c8d3df; }
+body.dark  .card { background: #18212e; border-color: #283344; }
+body.light .card { background: #f5f8fb; border-color: #ccd5df; }
 .title { color: inherit; font-weight: 800; }
 .title .sub, .sec, .muted, .func-desc, .func-note, .simhint,
 .peer-detail, .peer-meta, .operator-pref, .operator-main small,
-.custom-page > p { color: #8794a6; letter-spacing: 0; }
+.custom-page > p { color: #9aa5b5; letter-spacing: 0; }
 body.light .title .sub, body.light .sec, body.light .muted,
 body.light .func-desc, body.light .func-note, body.light .simhint,
 body.light .peer-detail, body.light .peer-meta, body.light .operator-pref,
@@ -576,7 +577,7 @@ body.light .operator-main small, body.light .custom-page > p { color: #657386; }
 td.kv-l, .cbw, .carfcn, .cpci, .cm .ml, .cx, .qa, .ctitle .unit,
 .chart-range-label, .srow .sval, .lc-b, .smsd, .smsp, .row .lab .st,
 .svc-log-empty, .traffic-plan-title, .traffic-plan-state,
-.compact-empty, .compact-more, .job-line { color: #8794a6; }
+.compact-empty, .compact-more, .job-line { color: #9aa5b5; }
 body.light td.kv-l, body.light .cbw, body.light .carfcn,
 body.light .cpci, body.light .cm .ml, body.light .cx, body.light .qa,
 body.light .ctitle .unit, body.light .chart-range-label,
@@ -593,57 +594,58 @@ body.light .ccd, body.light .memrow, body.light .row + .row,
 body.light .cli + .cli, body.light .sms + .sms, body.light .nrow,
 body.light .strow { border-color: #d0d9e3; }
 
-body.dark  .chart { background: #111925; border: 1px solid #253245; }
+body.dark  .chart { background: #111923; border: 1px solid #222d3c; }
 body.light .chart { background: #edf2f7; border: 1px solid #d1dae4; }
 .chart, .seg, .chart-range-seg, .sw, .svc-btn, .step-btn, .step-value,
 .tz-hour, a.rev, .aoff, .pin-del, a.kp, .stsegc, .stbtn { box-sizing: border-box; }
 body.dark  .membar, body.dark .slider { background: #263344; }
 body.light .membar, body.light .slider { background: #cbd6e2; }
 .slider .sfill, .chart-range-cell.chart-range-on,
-.segc.seg-on, .aoff-on, .tz-hour.on { background: #3d86df; color: #ffffff; }
+.segc.seg-on, .aoff-on, .tz-hour.on { background: #183c68; color: #58a8f8; }
 
-body.dark  .seg, body.dark .chart-range-seg { background: #202a38; border: 1px solid #303d4f; }
+body.dark  .seg, body.dark .chart-range-seg { background: #171f2c; border: 1px solid #2a3547; }
 body.light .seg, body.light .chart-range-seg { background: #dbe3ec; border: 1px solid #c8d2de; }
 body.dark  .segc { color: #cbd4df; }
 body.light .segc { color: #344255; }
 .segc.seg-on { border-radius: 7px; }
 
 .sw { border: 1px solid transparent; }
-.sw.off { background: #343e4d; border-color: #455264; }
-.sw.on  { background: #347fd8; border-color: #5a9bea; }
+.sw.off { background: #3a414d; border-color: #4a5362; }
+.sw.on  { background: #173b68; border-color: #2b6298; }
 .sw .kn { background: #f4f7fb; }
+.sw.on .kn { background: #4090e8; }
 body.light .sw.off { background: #b9c3cf; border-color: #aab5c2; }
 body.light .sw.on { background: #347fd8; border-color: #2e70be; }
 
 .func-grid { padding: 4px 3px 0; }
 .func-tile { min-height: 76px; margin-top: 6px; padding: 12px 10px 10px; border-radius: 8px; }
-body.dark  .func-tile { background: #18212d; border-color: #2b3747; color: #f1f5fa; }
-body.light .func-tile { background: #f7f9fc; border-color: #c8d3df; color: #182433; }
+body.dark  .func-tile { background: #18212e; border-color: #283344; color: #f0f3f8; }
+body.light .func-tile { background: #f5f8fb; border-color: #ccd5df; color: #182433; }
 .func-custom { border-left-color: #3d86df; }
 .func-name { font-weight: 800; }
 
 .subtop { margin-top: 3px; }
 .subback { border-radius: 7px; }
-body.dark  .subback { background: #202a38; color: #e8edf4; border-color: #303d4f; }
+body.dark  .subback { background: #202a39; color: #e8edf4; border-color: #303d50; }
 body.light .subback { background: #f7f9fc; color: #243247; border-color: #c8d3df; }
 
 .svc-btn, .step-btn, .step-value, .tz-hour, a.rev, .aoff, .pin-del,
 a.kp, .stsegc, .stbtn { border: 1px solid transparent; }
 body.dark  .svc-btn, body.dark .step-btn, body.dark .tz-hour,
 body.dark  a.rev, body.dark .aoff, body.dark .pin-del, body.dark a.kp,
-body.dark  .stsegc { background: #202a38; color: #d7dfe9; border-color: #303d4f; }
+body.dark  .stsegc { background: #202a39; color: #d7dfe9; border-color: #303d50; }
 body.light .svc-btn, body.light .step-btn, body.light .tz-hour,
 body.light a.rev, body.light .aoff, body.light .pin-del, body.light a.kp,
 body.light .stsegc { background: #e0e7ef; color: #2b394c; border-color: #c8d2de; }
 .svc-btn.seg-on, .svc-btn.svc-primary, .tz-hour.on,
 body.dark .stsegc.on, body.light .stsegc.on,
-body.dark .stbtn, body.light .stbtn { background: #3d86df; color: #ffffff; border-color: #62a0e9; }
-body.dark .step-value { background: #121a25; color: #f1f5fa; border-color: #273446; }
+body.dark .stbtn, body.light .stbtn { background: #183c68; color: #58a8f8; border-color: #306898; }
+body.dark .step-value { background: #131923; color: #f1f5fa; border-color: #242e3c; }
 body.light .step-value { background: #f7f9fc; color: #182433; border-color: #c8d3df; }
 
 body.dark  .svc-log, body.dark .traffic-plan-title, body.dark .traffic-plan-state,
 body.dark  .compact-empty, body.dark .compact-more, body.dark .job-line,
-body.dark  .peer-row, body.dark .operator-row { background: #121a25; border-color: #273446; }
+body.dark  .peer-row, body.dark .operator-row { background: #111923; border-color: #242f40; }
 body.light .svc-log, body.light .traffic-plan-title, body.light .traffic-plan-state,
 body.light .compact-empty, body.light .compact-more, body.light .job-line,
 body.light .peer-row, body.light .operator-row { background: #edf2f7; border-color: #ced8e3; }
@@ -657,7 +659,7 @@ body.light .cx span { background: #e4eaf1; color: #526075; }
 
 .dots { bottom: 9px; }
 .dots .dot { background: #344254; }
-.dots .dot.on { width: 18px; background: #438ce6; }
+.dots .dot.on { width: 18px; background: #3b82d5; }
 body.light .dots .dot { background: #aeb9c6; }
 body.light .dots .dot.on { background: #347fd8; }
 
@@ -665,10 +667,10 @@ body.dark  .ring .ri { background: #0a1018; }
 body.light .ring .ri { background: #e8eef5; }
 .pin-slots .dot { background: #3d86df; }
 
-body.dark  .st-card { background: #18212d; border-color: #2b3747; }
+body.dark  .st-card { background: #18212e; border-color: #283344; }
 body.light .st-card { background: #f7f9fc; border-color: #c8d3df; }
 body.dark  .st-gauge-dial, body.dark .st-line-chart,
-body.dark  .ststat, body.dark .stempty { background: #111925; border-color: #253245; }
+body.dark  .ststat, body.dark .stempty { background: #111923; border-color: #222d3c; }
 body.light .st-gauge-dial, body.light .st-line-chart,
 body.light .ststat, body.light .stempty { background: #edf2f7; border-color: #d1dae4; }
 
@@ -676,3 +678,9 @@ body.dark .card.hsrmode { background: #1b2737; border-color: #3b6fae; border-lef
 body.light .card.hsrmode { background: #eef5fc; border-color: #4a7fb8; border-left-color: #347fd8; }
 body.dark .ccd.hsrhint { background: #1b2737; border-top-color: #31445d; }
 body.light .ccd.hsrhint { background: #eef5fc; border-top-color: #c4d4e5; }
+
+.seg, .chart-range-seg { border-radius: 13px; }
+.segc.seg-on, .chart-range-cell.chart-range-on { border-radius: 12px; }
+.svc-btn, .subback, .step-btn, .step-value, .tz-hour,
+.pin-del, .stsegc, .stbtn { border-radius: 14px; }
+.aoff, a.rev { border-radius: 11px; }

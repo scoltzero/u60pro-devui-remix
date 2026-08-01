@@ -3838,7 +3838,6 @@ static void render_charge_boot(drm_disp_t *disp)
 }
 
 static int  g_modal;           /* 0 none, 1 SA, 2 NSA, 3 LTE, 4 signal settings */
-static int  g_segdrag;         /* dragging the segmented control (suppress cell highlight) */
 static int  g_pwr_confirm;     /* power menu: 0 none, 1 poweroff armed, 2 reboot armed */
 static uint32_t g_pwr_until;   /* millis the armed state auto-resets at */
 static char g_net_pending[16]; /* optimistic net mode until net_select catches up */
@@ -6647,7 +6646,7 @@ static int build_kv(struct kv *t, const char *path)
         const char *cur = g_net_pending[0] ? g_net_pending : d.net_select;
         int active = 0;
         for (int k = 0; k < 4; k++) if (!strcmp(g_netmodes[k].v, cur)) active = k;
-        int hl = g_segdrag == 1 ? -1 : active;   /* during drag the native box is the highlight */
+        int hl = active;
         int o = snprintf(s_netseg, sizeof s_netseg, "<div id='netseg' class='seg seg4'>");
         for (int k = 0; k < 4; k++)
             o += snprintf(s_netseg + o, sizeof s_netseg - o, "<a href='act:net:%s' class='segc%s'>%s</a>",
@@ -6712,7 +6711,7 @@ static int build_kv(struct kv *t, const char *path)
     {   /* auto-off segmented control (#autoseg), same UI as net mode */
         int active = 0;
         for (int k = 0; k < 6; k++) if (g_autooffs[k].ms == g_autooff_ms) active = k;
-        int hl = g_segdrag == 2 ? -1 : active;
+        int hl = active;
         int o = snprintf(s_autooff, sizeof s_autooff, "<div id='autoseg' class='seg seg6'>");
         for (int k = 0; k < 6; k++)
             o += snprintf(s_autooff + o, sizeof s_autooff - o,
@@ -6723,7 +6722,7 @@ static int build_kv(struct kv *t, const char *path)
     {   /* refresh segmented control (#refreshseg), same UI as auto-off */
         int active = 0;
         for (int k = 0; k < 5; k++) if (g_refresh_rates[k].ms == g_refresh_ms) active = k;
-        int hl = g_segdrag == 3 ? -1 : active;
+        int hl = active;
         int o = snprintf(s_refreshseg, sizeof s_refreshseg, "<div id='refreshseg' class='seg seg5'>");
         for (int k = 0; k < 5; k++)
             o += snprintf(s_refreshseg + o, sizeof s_refreshseg - o,
@@ -7969,17 +7968,6 @@ static void handle_modal_tap(drm_disp_t *disp, int x, int y, uint32_t now,
     }
 }
 
-/* Draw the sliding segmented-control highlight box at the finger, over cached fb.
- * n = number of cells. */
-static void seg_box(drm_disp_t *d, int sx, int sy, int sw, int sh, int n, int fx)
-{
-    restore_fb(d);
-    int cw = sw / n, bx = fx - cw / 2;
-    if (bx < sx) bx = sx; if (bx > sx + sw - cw) bx = sx + sw - cw;
-    html_view_fill_rect(bx, sy, cw, sh, 0x4f, 0x8f, 0xe8, 150);
-    drm_disp_dirty(d, 0, 0, d->width - 1, d->height - 1);
-}
-
 /* Set backlight from a tap/drag x within the brightness bar [bx, bx+bw). */
 static void set_bright_x(int x, int bx, int bw)
 {
@@ -8064,7 +8052,6 @@ int main(void)
     }
 
     int menu = 0, prev_press = 0, prev_lock = 0, was_on = 1, down_x = 0, down_y = 0;
-    int press_feedback = 0;
     int dragging = 0, drag_dir = 0, drag_target = 0, back_drag = 0;
     int scroll_dir = 0, scroll_start = 0;
     int sms_dragging = 0, sms_scroll_start = 0;
@@ -8076,7 +8063,7 @@ int main(void)
     uint32_t last_motion_frame = 0;
     float scroll_v = 0.0f, scroll_pos = 0.0f;
     int sliding = 0, bar_x = 0, bar_w = 0;   /* brightness slider drag */
-    int segging = 0, seg_x = 0, seg_y = 0, seg_w = 0, seg_h = 0;   /* segmented control drag */
+    int segging = 0, seg_x = 0, seg_w = 0;   /* segmented control selection */
     int seg_which = 0, seg_n = 4;   /* 1 = net mode, 2 = auto-off, 3 = refresh */
     const int W = disp.width, H = disp.height;
     devui_ext_t ext;
@@ -8229,17 +8216,9 @@ int main(void)
             interaction_pulse(now);
             g_gesture_used_at = now;
         }
-        if (pressed && !prev_press && on_now && !g_lock_state && !g_modal && g_sms_open < 0 &&
-            !(ext_ok && devui_ext_active(&ext))) {
-            capture_fb(&disp);
-            html_view_fill_round_rect(x - 12, y - 8, 24, 16, 6, 255, 255, 255, 44);
-            drm_disp_dirty(&disp, 0, 0, W - 1, H - 1);
-            press_feedback = 1;
-        } else if (!pressed && prev_press && press_feedback) {
-            restore_fb(&disp);
-            drm_disp_dirty(&disp, 0, 0, W - 1, H - 1);
-            press_feedback = 0;
-        }
+        /* Do not paint a generic touch rectangle over controls. It exposed the
+         * square hit box for one frame before the rounded selected state was
+         * rendered. State changes now redraw directly on release. */
 
         if (!on_now) {
             /* screen off: ignore touch entirely and discard any taps the panel
@@ -8556,13 +8535,9 @@ queued_done:
                              x >= bx && x < bx + bw && y >= by - 4 && y < by + bh + 4) { which = 3; n = 5; }
                     if (which) {
                         segging = 1; seg_which = which; seg_n = n;
-                        seg_x = bx; seg_y = by; seg_w = bw; seg_h = bh;
-                        g_segdrag = which;
-                        render(&disp, CUR_PATH);          /* plain seg (no cell highlight) */
-                        capture_fb(&disp);
-                        seg_box(&disp, seg_x, seg_y, seg_w, seg_h, seg_n, x);
-                        last_motion_frame = now;
-                        animating = 1;
+                        seg_x = bx; seg_w = bw;
+                        /* Keep the current rounded state visible while the
+                         * finger is down. The new state appears on release. */
                     }
                 }
             }
@@ -8575,17 +8550,14 @@ queued_done:
                     }
                 }
                 else if (segging) {
-                    if (motion_frame_due(now, &last_motion_frame)) {
-                        seg_box(&disp, seg_x, seg_y, seg_w, seg_h, seg_n, x);
-                        animating = 1;
-                    }
+                    /* No intermediate drag animation: it used a rectangular
+                     * overlay that did not match the final rounded button. */
                 }
                 else {
                 int dx = x - down_x, dy = y - down_y;
                 int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
                 if (drag_dir == 0 && scroll_dir == 0) {
                     if (g_subpage[0] && dx > 0 && adx > DRAG_START_PX && adx > ady) {
-                        if (press_feedback) { restore_fb(&disp); press_feedback = 0; }
                         back_drag = 1;
                         drag_dir = -1;
                         if (!prep_subpage_back(&disp)) {
@@ -8594,7 +8566,6 @@ queued_done:
                             dragging = 0;
                         }
                     } else if (!g_subpage[0] && g_npages > 1 && adx > DRAG_START_PX && adx > ady) {
-                        if (press_feedback) { restore_fb(&disp); press_feedback = 0; }
                         drag_dir = dx < 0 ? 1 : -1;
                         drag_target = (g_cur + (drag_dir > 0 ? 1 : g_npages - 1)) % g_npages;
                         if (!prep_pair(&disp, drag_target, drag_dir)) {
@@ -8602,7 +8573,6 @@ queued_done:
                             dragging = 0;
                         }
                     } else if (ady > DRAG_START_PX && ady >= adx && maxs > 0) {
-                        if (press_feedback) { restore_fb(&disp); press_feedback = 0; }
                         scroll_dir = 1; scroll_start = g_scroll;
                         int bufh = g_page_h > SCROLLMAX ? SCROLLMAX : g_page_h;  /* prerender once */
                         int rh = prepare_scroll_buffer(bufh);
@@ -8675,7 +8645,7 @@ queued_done:
                         last_data = 0;
                         save_conf();
                     }
-                    g_segdrag = 0; need_render = 1;
+                    need_render = 1;
                 }
                 else if (dragging && drag_dir != 0) {            /* finish or snap back */
                     int adx = dx < 0 ? -dx : dx;
@@ -9353,7 +9323,7 @@ action_done:
                 if (!replay_release)
                     touch_input_drop_replayed_release(&touch, release_was_tap);
                 last_motion_frame = 0;
-                dragging = 0; drag_dir = 0; back_drag = 0; scroll_dir = 0; sliding = 0; segging = 0; g_segdrag = 0;
+                dragging = 0; drag_dir = 0; back_drag = 0; scroll_dir = 0; sliding = 0; segging = 0;
                 scroll_track_valid = 0;
             }
         }
