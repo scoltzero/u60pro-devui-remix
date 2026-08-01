@@ -228,6 +228,8 @@ class fb_container : public document_container {
         position cl = eff_clip();
         int x1 = std::max(fx, (int)cl.left()),  y1 = std::max(fy, (int)cl.top());
         int x2 = std::min(fx + fw, (int)cl.right()), y2 = std::min(fy + fh, (int)cl.bottom());
+        int max_r = std::max(std::max(rtl, rtr), std::max(rbr, rbl));
+        bool soft_surface = c.alpha >= 240 && max_r >= 5 && fw >= 22 && fh >= 16;
         for (int y = y1; y < y2; y++) {
             for (int x = x1; x < x2; x++) {
                 int r = 0, cx = 0, cy = 0;
@@ -236,7 +238,23 @@ class fb_container : public document_container {
                 else if (x >= fx + fw - rbr && y >= fy + fh - rbr) { r = rbr; cx = fx + fw - 1 - rbr; cy = fy + fh - 1 - rbr; }
                 else if (x < fx + rbl       && y >= fy + fh - rbl) { r = rbl; cx = fx + rbl;          cy = fy + fh - 1 - rbl; }
                 int cov = r > 0 ? round_coverage(x, y, fx, fy, fw, fh, rtl, rtr, rbr, rbl) : 255;
-                if (cov) put_px(x, y, c.red, c.green, c.blue, c.alpha * cov / 255);
+                if (cov) {
+                    int rr = c.red, gg = c.green, bb = c.blue;
+                    if (soft_surface) {
+                        int top = y - fy, left = x - fx;
+                        int bottom = fy + fh - 1 - y, right = fx + fw - 1 - x;
+                        int lift = 0, shade = 0;
+                        if (top == 0 || left == 0) lift = 10;
+                        else if (top == 1 || left == 1) lift = 4;
+                        if (bottom == 0 || right == 0) shade = 11;
+                        else if (bottom == 1 || right == 1) shade = 5;
+                        int delta = lift - shade;
+                        rr = std::max(0, std::min(255, rr + delta));
+                        gg = std::max(0, std::min(255, gg + delta));
+                        bb = std::max(0, std::min(255, bb + delta));
+                    }
+                    put_px(x, y, rr, gg, bb, c.alpha * cov / 255);
+                }
             }
         }
     }

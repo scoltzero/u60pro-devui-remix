@@ -549,3 +549,130 @@ body.light .stempty.bad { color: #b6362d; }
 body.dark  .sthint.bad { background: #2a1818; color: #ffb6ae; border: 1px solid #5c2925; }
 body.light .sthint.bad { background: #fff0ee; color: #b6362d; border: 1px solid #f0c0ba; }
 .mono { font-family: monospace; font-size: 11px; }
+
+/* ---- newUI: restrained dark Soft UI for the RGB565 panel ----
+ * litehtml handles layout; the framebuffer renderer adds a one-pixel bevel to
+ * larger rounded fills. Keep the palette discrete so RGB565 does not band. */
+body { letter-spacing: 0; }
+body.dark  { background: #0a1018; color: #f1f5fa; }
+body.light { background: #e8eef5; color: #182433; }
+
+body.dark  .sbar { background: #101722; color: #f4f7fb; }
+body.light .sbar { background: #dbe4ee; color: #182433; }
+body.dark  .spd { color: #a2adbc; }
+body.light .spd { color: #536173; }
+
+.card { margin-top: 6px; border-radius: 8px; padding: 9px 10px 10px; }
+body.dark  .card { background: #18212d; border-color: #2b3747; }
+body.light .card { background: #f7f9fc; border-color: #c8d3df; }
+.title { color: inherit; font-weight: 800; }
+.title .sub, .sec, .muted, .func-desc, .func-note, .simhint,
+.peer-detail, .peer-meta, .operator-pref, .operator-main small,
+.custom-page > p { color: #8794a6; letter-spacing: 0; }
+body.light .title .sub, body.light .sec, body.light .muted,
+body.light .func-desc, body.light .func-note, body.light .simhint,
+body.light .peer-detail, body.light .peer-meta, body.light .operator-pref,
+body.light .operator-main small, body.light .custom-page > p { color: #657386; }
+td.kv-l, .cbw, .carfcn, .cpci, .cm .ml, .cx, .qa, .ctitle .unit,
+.chart-range-label, .srow .sval, .lc-b, .smsd, .smsp, .row .lab .st,
+.svc-log-empty, .traffic-plan-title, .traffic-plan-state,
+.compact-empty, .compact-more, .job-line { color: #8794a6; }
+body.light td.kv-l, body.light .cbw, body.light .carfcn,
+body.light .cpci, body.light .cm .ml, body.light .cx, body.light .qa,
+body.light .ctitle .unit, body.light .chart-range-label,
+body.light .srow .sval, body.light .lc-b, body.light .smsd,
+body.light .smsp, body.light .row .lab .st, body.light .svc-log-empty,
+body.light .traffic-plan-title, body.light .traffic-plan-state,
+body.light .compact-empty, body.light .compact-more,
+body.light .job-line { color: #657386; }
+
+body.dark  .ccd, body.dark .memrow, body.dark .row + .row,
+body.dark  .cli + .cli, body.dark .sms + .sms, body.dark .nrow,
+body.dark  .strow { border-color: #2a3544; }
+body.light .ccd, body.light .memrow, body.light .row + .row,
+body.light .cli + .cli, body.light .sms + .sms, body.light .nrow,
+body.light .strow { border-color: #d0d9e3; }
+
+body.dark  .chart { background: #111925; border: 1px solid #253245; }
+body.light .chart { background: #edf2f7; border: 1px solid #d1dae4; }
+.chart, .seg, .chart-range-seg, .sw, .svc-btn, .step-btn, .step-value,
+.tz-hour, a.rev, .aoff, .pin-del, a.kp, .stsegc, .stbtn { box-sizing: border-box; }
+body.dark  .membar, body.dark .slider { background: #263344; }
+body.light .membar, body.light .slider { background: #cbd6e2; }
+.slider .sfill, .chart-range-cell.chart-range-on,
+.segc.seg-on, .aoff-on, .tz-hour.on { background: #3d86df; color: #ffffff; }
+
+body.dark  .seg, body.dark .chart-range-seg { background: #202a38; border: 1px solid #303d4f; }
+body.light .seg, body.light .chart-range-seg { background: #dbe3ec; border: 1px solid #c8d2de; }
+body.dark  .segc { color: #cbd4df; }
+body.light .segc { color: #344255; }
+.segc.seg-on { border-radius: 7px; }
+
+.sw { border: 1px solid transparent; }
+.sw.off { background: #343e4d; border-color: #455264; }
+.sw.on  { background: #347fd8; border-color: #5a9bea; }
+.sw .kn { background: #f4f7fb; }
+body.light .sw.off { background: #b9c3cf; border-color: #aab5c2; }
+body.light .sw.on { background: #347fd8; border-color: #2e70be; }
+
+.func-grid { padding: 4px 3px 0; }
+.func-tile { min-height: 76px; margin-top: 6px; padding: 12px 10px 10px; border-radius: 8px; }
+body.dark  .func-tile { background: #18212d; border-color: #2b3747; color: #f1f5fa; }
+body.light .func-tile { background: #f7f9fc; border-color: #c8d3df; color: #182433; }
+.func-custom { border-left-color: #3d86df; }
+.func-name { font-weight: 800; }
+
+.subtop { margin-top: 3px; }
+.subback { border-radius: 7px; }
+body.dark  .subback { background: #202a38; color: #e8edf4; border-color: #303d4f; }
+body.light .subback { background: #f7f9fc; color: #243247; border-color: #c8d3df; }
+
+.svc-btn, .step-btn, .step-value, .tz-hour, a.rev, .aoff, .pin-del,
+a.kp, .stsegc, .stbtn { border: 1px solid transparent; }
+body.dark  .svc-btn, body.dark .step-btn, body.dark .tz-hour,
+body.dark  a.rev, body.dark .aoff, body.dark .pin-del, body.dark a.kp,
+body.dark  .stsegc { background: #202a38; color: #d7dfe9; border-color: #303d4f; }
+body.light .svc-btn, body.light .step-btn, body.light .tz-hour,
+body.light a.rev, body.light .aoff, body.light .pin-del, body.light a.kp,
+body.light .stsegc { background: #e0e7ef; color: #2b394c; border-color: #c8d2de; }
+.svc-btn.seg-on, .svc-btn.svc-primary, .tz-hour.on,
+body.dark .stsegc.on, body.light .stsegc.on,
+body.dark .stbtn, body.light .stbtn { background: #3d86df; color: #ffffff; border-color: #62a0e9; }
+body.dark .step-value { background: #121a25; color: #f1f5fa; border-color: #273446; }
+body.light .step-value { background: #f7f9fc; color: #182433; border-color: #c8d3df; }
+
+body.dark  .svc-log, body.dark .traffic-plan-title, body.dark .traffic-plan-state,
+body.dark  .compact-empty, body.dark .compact-more, body.dark .job-line,
+body.dark  .peer-row, body.dark .operator-row { background: #121a25; border-color: #273446; }
+body.light .svc-log, body.light .traffic-plan-title, body.light .traffic-plan-state,
+body.light .compact-empty, body.light .compact-more, body.light .job-line,
+body.light .peer-row, body.light .operator-row { background: #edf2f7; border-color: #ced8e3; }
+body.dark  .peer-row, body.dark .operator-row { color: #eef3f8; }
+body.light .peer-row, body.light .operator-row { color: #182433; }
+
+body.dark  .nhead { background: #202a38; color: #9aa7b8; }
+body.light .nhead { background: #dfe6ee; color: #5f6d80; }
+body.dark  .cx span { background: #212b38; color: #bcc6d3; }
+body.light .cx span { background: #e4eaf1; color: #526075; }
+
+.dots { bottom: 9px; }
+.dots .dot { background: #344254; }
+.dots .dot.on { width: 18px; background: #438ce6; }
+body.light .dots .dot { background: #aeb9c6; }
+body.light .dots .dot.on { background: #347fd8; }
+
+body.dark  .ring .ri { background: #0a1018; }
+body.light .ring .ri { background: #e8eef5; }
+.pin-slots .dot { background: #3d86df; }
+
+body.dark  .st-card { background: #18212d; border-color: #2b3747; }
+body.light .st-card { background: #f7f9fc; border-color: #c8d3df; }
+body.dark  .st-gauge-dial, body.dark .st-line-chart,
+body.dark  .ststat, body.dark .stempty { background: #111925; border-color: #253245; }
+body.light .st-gauge-dial, body.light .st-line-chart,
+body.light .ststat, body.light .stempty { background: #edf2f7; border-color: #d1dae4; }
+
+body.dark .card.hsrmode { background: #1b2737; border-color: #3b6fae; border-left-color: #4d91e3; }
+body.light .card.hsrmode { background: #eef5fc; border-color: #4a7fb8; border-left-color: #347fd8; }
+body.dark .ccd.hsrhint { background: #1b2737; border-top-color: #31445d; }
+body.light .ccd.hsrhint { background: #eef5fc; border-top-color: #c4d4e5; }
