@@ -59,6 +59,10 @@ extern void        html_view_set_clip_top(int y);
 extern void        html_view_fill_rect(int x, int y, int w, int h, int r, int g, int b, int a);
 extern void        html_view_fill_poly(const int *xs, const int *ys, int n, int r, int g, int b, int a);
 extern void        html_view_fill_round_rect(int x, int y, int w, int h, int rad, int r, int g, int b, int a);
+extern void        html_view_fill_bevel_circle(int cx, int cy, int rad, int r, int g, int b,
+                                               int light_theme, int pressed);
+extern void        html_view_draw_power_glyph(int cx, int cy, int rad, int kind,
+                                              int r, int g, int b, int a);
 extern int         html_view_text_width_px(const char *text, int size);
 extern void        html_view_text_bounds_px(const char *text, int size, int *x0, int *y0, int *x1, int *y1);
 extern void        html_view_draw_text_px(int x, int y, const char *text, int size, int bold,
@@ -3698,12 +3702,12 @@ static void draw_native_statusbar(void)
         html_view_fill_round_rect(bat_x + 2, bat_y + 2, fill_w, bat_h - 4, 2, fr, fgc, fb, 255);
 
     if (g_show_batpct) {
-        char bp[8]; snprintf(bp, sizeof bp, "%d%%", bat_pct);
+        char bp[8]; snprintf(bp, sizeof bp, "%d", bat_pct);
         int x0, y0, x1, y1;
-        int pct_size = 11;
+        int pct_size = 12;
         html_view_text_bounds_px(bp, pct_size, &x0, &y0, &x1, &y1);
         if (x1 - x0 > bat_w - 4) {
-            pct_size = 10;
+            pct_size = 11;
             html_view_text_bounds_px(bp, pct_size, &x0, &y0, &x1, &y1);
         }
         int tx = bat_x + (bat_w - (x1 - x0)) / 2 - x0;
@@ -5502,11 +5506,11 @@ static const char *modal_html(void)
             "<body class='mo'><div class='modal %s'>"
             "<div class='mtitle'>高级设置</div>"
             "<a href='act:sigread' class='row'><span class='lab'>读取信令<span class='st'>控制 ML1 / 原始信令读取，影响 TA / Ports / Beam</span></span>"
-            "<span class='ctrl'><span class='sw %s'><span class='kn'></span></span></span></a>"
+            "<span class='ctrl'><span class='sw %s'><span class='sw-track'></span><span class='kn'></span></span></span></a>"
             "<a href='act:sigparse' class='row'><span class='lab'>解析信令<span class='st'>控制 LTE / NR RRC / NAS 解析，并决定第二页是否显示</span></span>"
-            "<span class='ctrl'><span class='sw %s'><span class='kn'></span></span></span></a>"
+            "<span class='ctrl'><span class='sw %s'><span class='sw-track'></span><span class='kn'></span></span></span></a>"
             "<a href='act:flymodem' class='row'><span class='lab'>飞猫分身卡<span class='st'>开启后第二页显示插件子页面，仅确认使用飞猫卡时开启，非飞猫卡切卡会导致封卡，谨慎操作</span></span>"
-            "<span class='ctrl'><span class='sw %s'><span class='kn'></span></span></span></a>"
+            "<span class='ctrl'><span class='sw %s'><span class='sw-track'></span><span class='kn'></span></span></span></a>"
             "<div class='sec'>读取关闭时 TA / Ports / SSB Index 会显示为空。飞猫卡切换会短暂断网，并保留二次确认。</div>"
             "<div class='mbtns'><a href='act:closemodal' class='mbtn2 prim mfull'>关闭</a></div>"
             "</div></body></html>",
@@ -7266,12 +7270,15 @@ static void invalidate_render_html_cache(void)
 /* ---- power menu: three large round buttons with native-drawn glyphs
  * (litehtml can't render a power symbol / circular arrow / X reliably). The
  * HTML provides the circle placeholders (#pmc-*) + labels + tap targets; we
- * fill the disc and draw the glyph centered over each. ---- */
+ * fill the raised disc and draw the glyph centered over each. ---- */
 #define PM_PI 3.14159265358979
 
+/* Plain native disc remains shared by non-menu widgets such as the speed-test
+ * gauge. Power-menu controls use html_view_fill_bevel_circle instead. */
 static void pm_disc(int cx, int cy, int rad, int r, int g, int b, int a)
 {
-    html_view_fill_round_rect(cx - rad, cy - rad, rad * 2, rad * 2, rad, r, g, b, a);
+    html_view_fill_round_rect(cx - rad, cy - rad, rad * 2, rad * 2,
+                              rad, r, g, b, a);
 }
 
 /* thick line segment (a-b) as a filled quad */
@@ -7308,28 +7315,15 @@ static void pm_glyph(const char *sel, int kind, int cr, int cg, int cb)
     int rad = (w < h ? w : h) / 2;
     int cx = x + w / 2, cy = y + h / 2;
     int armed = (kind == 0 && g_pwr_confirm == 1) || (kind == 1 && g_pwr_confirm == 2);
-    if (armed) pm_disc(cx, cy, rad + 4, 0xff, 0xff, 0xff, 255);   /* white halo when armed */
-    pm_disc(cx, cy, rad, cr, cg, cb, 255);
-    const int W = 0xff;
-    double ro = rad * 0.54, ri = ro - rad * 0.15, th = rad * 0.15;
-    if (kind == 0) {                         /* power: ring with a gap at top + vertical bar */
-        pm_arc(cx, cy, ro, ri, 110, 430, W, W, W);
-        pm_line(cx, cy - rad * 0.06, cx, cy - rad * 0.60, th, W, W, W);
-    } else if (kind == 1) {                  /* reboot: about 290 degree ring + arrowhead */
-        int a0 = 120, a1 = 410;
-        pm_arc(cx, cy, ro, ri, a0, a1, W, W, W);
-        double te = a1 * PM_PI / 180.0, rm = (ro + ri) / 2.0;
-        double pex = cx + rm * cos(te), pey = cy - rm * sin(te);
-        double tx = -sin(te), ty = -cos(te), rxx = cos(te), ryy = -sin(te);
-        double L = (ro - ri) * 1.9, hw = (ro - ri) * 1.25;
-        int ax[3] = { (int)(pex + tx * L + 0.5), (int)(pex + rxx * hw + 0.5), (int)(pex - rxx * hw + 0.5) };
-        int ay[3] = { (int)(pey + ty * L + 0.5), (int)(pey + ryy * hw + 0.5), (int)(pey - ryy * hw + 0.5) };
-        html_view_fill_poly(ax, ay, 3, W, W, W, 255);
-    } else {                                 /* cancel: X */
-        double d = rad * 0.40;
-        pm_line(cx - d, cy - d, cx + d, cy + d, th, W, W, W);
-        pm_line(cx - d, cy + d, cx + d, cy - d, th, W, W, W);
-    }
+    html_view_fill_bevel_circle(cx, cy, rad, cr, cg, cb, g_theme, armed);
+
+    /* Both passes use subpixel coverage. Keep the colored shadow restrained so
+     * it adds depth without turning the white edge into a dark staircase. */
+    int icon_y = cy + (armed ? 1 : 0);
+    html_view_draw_power_glyph(cx, icon_y + 1, rad, kind,
+                               cr / 2, cg / 2, cb / 2, 96);
+    html_view_draw_power_glyph(cx, icon_y, rad, kind,
+                               0xf4, 0xf8, 0xfa, 255);
 }
 
 static void draw_power_menu(void)

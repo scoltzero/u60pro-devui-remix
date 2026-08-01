@@ -97,6 +97,45 @@ static int round_coverage(int x, int y, int fx, int fy, int fw, int fh,
     return inside * 255 / 64;
 }
 
+static bool rounded_box_is_circle(int fw, int fh,
+                                  int rtl, int rtr, int rbr, int rbl)
+{
+    if (fw != fh || fw < 18 || fw > 30) return false;
+    int r = fw / 2;
+    return rtl >= r - 1 && rtr >= r - 1 && rbr >= r - 1 && rbl >= r - 1;
+}
+
+/* Switch knobs are small enough that generic rounded-rectangle corner
+ * sampling still exposes their pixel grid. Supersample only the circle edge;
+ * pixels wholly inside or outside return immediately. */
+static int circle_coverage_16x(int x, int y, int fx, int fy, int fw, int fh)
+{
+    if (x < fx || y < fy || x >= fx + fw || y >= fy + fh) return 0;
+
+    const int scale = 32;
+    const int cx = fx * scale + fw * scale / 2;
+    const int cy = fy * scale + fh * scale / 2;
+    const int radius = std::min(fw, fh) * scale / 2;
+    const int rr = radius * radius;
+    const int xlo = x * scale, xhi = (x + 1) * scale;
+    const int ylo = y * scale, yhi = (y + 1) * scale;
+    int near_x = cx < xlo ? xlo - cx : cx > xhi ? cx - xhi : 0;
+    int near_y = cy < ylo ? ylo - cy : cy > yhi ? cy - yhi : 0;
+    int far_x = std::max(std::abs(xlo - cx), std::abs(xhi - cx));
+    int far_y = std::max(std::abs(ylo - cy), std::abs(yhi - cy));
+    if (far_x * far_x + far_y * far_y <= rr) return 255;
+    if (near_x * near_x + near_y * near_y >= rr) return 0;
+
+    int inside = 0;
+    for (int sy = 1; sy < scale; sy += 2)
+        for (int sx = 1; sx < scale; sx += 2) {
+            int dx = x * scale + sx - cx;
+            int dy = y * scale + sy - cy;
+            if (dx * dx + dy * dy <= rr) inside++;
+        }
+    return inside * 255 / 256;
+}
+
 static inline uint16_t get_px565(int x, int y)
 {
     if (x < 0 || y < 0 || x >= g_w || y >= g_h || !g_fb) return 0;
@@ -222,6 +261,12 @@ static unsigned utf8_next(const char *&s)
 /* ---- container ---- */
 class fb_container : public document_container {
     std::vector<position> m_clip;
+    struct surface_hint {
+        int16_t x, y, w, h;
+        uint8_t inset;
+    };
+    surface_hint m_surfaces[256];
+    int m_surface_count = 0;
 
     position eff_clip() const {
         position r(0, 0, (pixel_t)g_w, (pixel_t)g_h);
@@ -247,9 +292,12 @@ class fb_container : public document_container {
         position cl = eff_clip();
         int x1 = std::max(fx, (int)cl.left()),  y1 = std::max(fy, (int)cl.top());
         int x2 = std::min(fx + fw, (int)cl.right()), y2 = std::min(fy + fh, (int)cl.bottom());
+        bool true_circle = rounded_box_is_circle(fw, fh, rtl, rtr, rbr, rbl);
         for (int y = y1; y < y2; y++)
             for (int x = x1; x < x2; x++) {
-                int cov = round_coverage(x, y, fx, fy, fw, fh, rtl, rtr, rbr, rbl);
+                int cov = true_circle
+                        ? circle_coverage_16x(x, y, fx, fy, fw, fh)
+                        : round_coverage(x, y, fx, fy, fw, fh, rtl, rtr, rbr, rbl);
                 if (cov) put_px_clean_blend(x, y, 4, 9, 16, alpha * cov / 255);
             }
     }
@@ -264,51 +312,89 @@ class fb_container : public document_container {
         if (rbr > hw) rbr = hw; if (rbr > hh) rbr = hh;
         if (rbl > hw) rbl = hw; if (rbl > hh) rbl = hh;
         int max_r = std::max(std::max(rtl, rtr), std::max(rbr, rbl));
-        bool soft_surface = c.alpha >= 240 && max_r >= 5 && fw >= 22 && fh >= 16;
+        bool true_circle = rounded_box_is_circle(fw, fh, rtl, rtr, rbr, rbl);
+        bool soft_surface = c.alpha >= 240 && max_r >= 4 && fw >= 22 && fh >= 16;
         int cmax = std::max(c.red, std::max(c.green, c.blue));
         int cmin = std::min(c.red, std::min(c.green, c.blue));
         bool accent = cmax - cmin >= 28 && c.blue > c.red + 12;
         /* The deliberately darker slot/log palette is inset. Slightly brighter
          * cards and command buttons stay raised even when they are wide. */
         bool deep_inset = c.red <= 23 && c.green <= 32 && c.blue <= 45;
-        bool inset_surface = soft_surface && deep_inset && !accent;
+        bool switch_track = fw >= 40 && fw <= 48 && fh >= 14 && fh <= 20 && max_r >= 7;
+        bool inset_surface = soft_surface && ((deep_inset && !accent) || switch_track);
         bool compact_control = soft_surface && fh <= 64;
-        bool raised_surface = soft_surface && !inset_surface && max_r >= 6 && fw >= 36 && fh >= 20;
+        bool round_knob = true_circle;
+        bool range_pill = accent && fw >= 40 && fw <= 48 && fh >= 17 && fh <= 20 && max_r >= 8;
+        bool compact_segment = accent && fw >= 40 && fw <= 56 && fh >= 26 && fh <= 30 && max_r >= 12;
+        bool soft_accent_pill = range_pill || compact_segment;
+        bool raised_surface = soft_surface && !inset_surface && max_r >= 6 && fh >= 18 &&
+                              (fw >= 36 || round_knob);
+        if (soft_surface && m_surface_count < (int)(sizeof m_surfaces / sizeof m_surfaces[0])) {
+            m_surfaces[m_surface_count++] = {
+                (int16_t)fx, (int16_t)fy, (int16_t)fw, (int16_t)fh,
+                (uint8_t)(inset_surface ? 1 : 0)
+            };
+        }
         if (raised_surface) {
             /* A single one-pixel contact shadow cannot expose stacked alpha
              * bands at the corners. Surface bevel and border carry the depth. */
             fill_soft_shadow(fx, fy + 1, fw, fh,
-                             rtl, rtr, rbr, rbl, compact_control ? 10 : 7);
+                             rtl, rtr, rbr, rbl,
+                             soft_accent_pill ? 8 : accent ? 18 : compact_control ? 14 : 11);
         }
         position cl = eff_clip();
         int x1 = std::max(fx, (int)cl.left()),  y1 = std::max(fy, (int)cl.top());
         int x2 = std::min(fx + fw, (int)cl.right()), y2 = std::min(fy + fh, (int)cl.bottom());
         for (int y = y1; y < y2; y++) {
+            int surface_tone = 0;
+            if (raised_surface && fh >= 32) {
+                int rel = y - fy;
+                surface_tone = 2 - (4 * rel) / std::max(1, fh - 1);
+            }
             for (int x = x1; x < x2; x++) {
-                int r = 0, cx = 0, cy = 0;
-                if      (x < fx + rtl       && y < fy + rtl)       { r = rtl; cx = fx + rtl;          cy = fy + rtl; }
-                else if (x >= fx + fw - rtr && y < fy + rtr)       { r = rtr; cx = fx + fw - 1 - rtr; cy = fy + rtr; }
-                else if (x >= fx + fw - rbr && y >= fy + fh - rbr) { r = rbr; cx = fx + fw - 1 - rbr; cy = fy + fh - 1 - rbr; }
-                else if (x < fx + rbl       && y >= fy + fh - rbl) { r = rbl; cx = fx + rbl;          cy = fy + fh - 1 - rbl; }
-                int cov = r > 0 ? round_coverage(x, y, fx, fy, fw, fh, rtl, rtr, rbr, rbl) : 255;
+                int cov;
+                if (true_circle) {
+                    cov = circle_coverage_16x(x, y, fx, fy, fw, fh);
+                } else {
+                    int r = 0;
+                    if      (x < fx + rtl       && y < fy + rtl)       r = rtl;
+                    else if (x >= fx + fw - rtr && y < fy + rtr)       r = rtr;
+                    else if (x >= fx + fw - rbr && y >= fy + fh - rbr) r = rbr;
+                    else if (x < fx + rbl       && y >= fy + fh - rbl) r = rbl;
+                    cov = r > 0 ? round_coverage(x, y, fx, fy, fw, fh,
+                                                 rtl, rtr, rbr, rbl) : 255;
+                }
                 if (cov) {
                     int rr = c.red, gg = c.green, bb = c.blue;
                     if (soft_surface) {
-                        int top = y - fy, left = x - fx;
-                        int bottom = fy + fh - 1 - y, right = fx + fw - 1 - x;
-                        int lift = 0, shade = 0;
-                        if (inset_surface) {
-                            if (top == 0 || left == 0) shade = 12;
-                            else if (top == 1 || left == 1) shade = 5;
-                            if (bottom == 0 || right == 0) lift = 7;
-                            else if (bottom == 1 || right == 1) lift = 3;
+                        int delta;
+                        if (true_circle) {
+                            int dx2 = (x - fx) * 2 + 1 - fw;
+                            int dy2 = (y - fy) * 2 + 1 - fh;
+                            delta = std::max(-12, std::min(12,
+                                    -(dx2 + dy2) * 8 / std::max(1, fw)));
                         } else {
-                            if (top == 0 || left == 0) lift = accent ? 20 : compact_control ? 13 : 9;
-                            else if (top == 1 || left == 1) lift = accent ? 8 : compact_control ? 5 : 3;
-                            if (bottom == 0 || right == 0) shade = accent ? 18 : compact_control ? 13 : 9;
-                            else if (bottom == 1 || right == 1) shade = accent ? 8 : compact_control ? 5 : 3;
+                            int top = y - fy, left = x - fx;
+                            int bottom = fy + fh - 1 - y, right = fx + fw - 1 - x;
+                            int lift = surface_tone > 0 ? surface_tone : 0;
+                            int shade = surface_tone < 0 ? -surface_tone : 0;
+                            if (inset_surface) {
+                                if (top == 0 || left == 0) shade += 16;
+                                else if (top == 1 || left == 1) shade += 9;
+                                else if (top == 2 || left == 2) shade += 4;
+                                if (bottom == 0 || right == 0) lift += 12;
+                                else if (bottom == 1 || right == 1) lift += 6;
+                                else if (bottom == 2 || right == 2) lift += 3;
+                            } else {
+                                if (top == 0 || left == 0) lift += soft_accent_pill ? 10 : accent ? 18 : compact_control ? 17 : 15;
+                                else if (top == 1 || left == 1) lift += soft_accent_pill ? 5 : accent ? 10 : compact_control ? 9 : 8;
+                                else if (top == 2 || left == 2) lift += soft_accent_pill ? 2 : accent ? 5 : compact_control ? 4 : 3;
+                                if (bottom == 0 || right == 0) shade += soft_accent_pill ? 8 : accent ? 20 : compact_control ? 17 : 15;
+                                else if (bottom == 1 || right == 1) shade += soft_accent_pill ? 4 : accent ? 10 : compact_control ? 9 : 8;
+                                else if (bottom == 2 || right == 2) shade += soft_accent_pill ? 1 : accent ? 5 : compact_control ? 4 : 3;
+                            }
+                            delta = lift - shade;
                         }
-                        int delta = lift - shade;
                         rr = std::max(0, std::min(255, rr + delta));
                         gg = std::max(0, std::min(255, gg + delta));
                         bb = std::max(0, std::min(255, bb + delta));
@@ -334,19 +420,53 @@ class fb_container : public document_container {
         position cl = eff_clip();
         int x1 = std::max(fx, (int)cl.left()),  y1 = std::max(fy, (int)cl.top());
         int x2 = std::min(fx + fw, (int)cl.right()), y2 = std::min(fy + fh, (int)cl.bottom());
-        bool soft_outline = std::max(std::max(rtl, rtr), std::max(rbr, rbl)) >= 5 && fw >= 22 && fh >= 16;
+        int max_r = std::max(std::max(rtl, rtr), std::max(rbr, rbl));
+        bool true_circle = rounded_box_is_circle(fw, fh, rtl, rtr, rbr, rbl);
+        bool soft_outline = max_r >= 4 && fw >= 22 && fh >= 16;
+        int cmax = std::max(c.red, std::max(c.green, c.blue));
+        int cmin = std::min(c.red, std::min(c.green, c.blue));
+        bool strong_accent = cmax - cmin >= 45 && c.blue > c.red + 25;
+        bool switch_outline = fw >= 38 && fw <= 50 && fh >= 14 && fh <= 17 && max_r >= 7;
+        bool wide_well = fw >= 80 && fh <= 54 && max_r >= 7;
+        bool chart_well = fw >= 80 && fh >= 35 && max_r <= 6;
+        bool inset_outline = switch_outline || (!strong_accent && (wide_well || chart_well));
+        for (int i = m_surface_count - 1; i >= 0; i--) {
+            const surface_hint &hint = m_surfaces[i];
+            if (hint.x == fx && hint.y == fy && hint.w == fw && hint.h == fh) {
+                inset_outline = hint.inset != 0;
+                break;
+            }
+        }
         for (int y = y1; y < y2; y++)
             for (int x = x1; x < x2; x++)
                 {
-                    int outer = round_coverage(x, y, fx, fy, fw, fh, rtl, rtr, rbr, rbl);
-                    int inner = round_coverage(x, y, fx + t, fy + t, fw - 2 * t, fh - 2 * t,
+                    int outer = true_circle
+                              ? circle_coverage_16x(x, y, fx, fy, fw, fh)
+                              : round_coverage(x, y, fx, fy, fw, fh, rtl, rtr, rbr, rbl);
+                    int inner = 0;
+                    if (fw > 2 * t && fh > 2 * t) {
+                        inner = true_circle
+                              ? circle_coverage_16x(x, y, fx + t, fy + t,
+                                                    fw - 2 * t, fh - 2 * t)
+                              : round_coverage(x, y, fx + t, fy + t,
+                                               fw - 2 * t, fh - 2 * t,
                                                itl, itr, ibr, ibl);
+                    }
                     int cov = outer > inner ? outer - inner : 0;
                     if (cov) {
                         int delta = 0;
                         if (soft_outline) {
-                            delta += y < fy + fh / 2 ? 5 : -5;
-                            delta += x < fx + fw / 2 ? 3 : -3;
+                            int directional;
+                            if (true_circle) {
+                                int dx2 = (x - fx) * 2 + 1 - fw;
+                                int dy2 = (y - fy) * 2 + 1 - fh;
+                                directional = std::max(-10, std::min(10,
+                                        -(dx2 + dy2) * 7 / std::max(1, fw)));
+                            } else {
+                                directional = (y < fy + fh / 2 ? 7 : -7)
+                                            + (x < fx + fw / 2 ? 4 : -4);
+                            }
+                            delta += inset_outline ? -directional : directional;
                         }
                         int rr = std::max(0, std::min(255, c.red + delta));
                         int gg = std::max(0, std::min(255, c.green + delta));
@@ -473,7 +593,7 @@ public:
 
     void set_clip(const position &pos, const border_radiuses &) override { m_clip.push_back(pos); }
     void del_clip() override { if (!m_clip.empty()) m_clip.pop_back(); }
-    void reset_state() { m_clip.clear(); }
+    void reset_state() { m_clip.clear(); m_surface_count = 0; }
 
     void get_viewport(position &v) const override { v = position(0, 0, (pixel_t)g_w, (pixel_t)g_h); }
     void get_media_features(media_features &m) const override {
@@ -698,6 +818,230 @@ extern "C" void html_view_fill_round_rect(int x, int y, int w, int h, int rad, i
                 int cov = round_coverage(xx, yy, x, y, w, h, rad, rad, rad, rad);
                 if (cov) put_px_clean_blend(xx, yy, r, g, b, a * cov / 255);
             }
+}
+
+static inline int bevel_channel(int v)
+{
+    return std::max(0, std::min(255, v));
+}
+
+/* Large native controls cannot use litehtml's surface treatment because their
+ * glyphs are painted after HTML layout. Draw each circular layer with the same
+ * top-left light source as the CSS controls, while keeping the edge coverage
+ * independent from RGB565 quantisation. */
+static void draw_bevel_circle_layer(int cx, int cy, int rad,
+                                    int r, int g, int b, int alpha,
+                                    int base_delta, int directional,
+                                    int radial_lift)
+{
+    if (rad <= 0 || alpha <= 0) return;
+    const int fx = cx - rad, fy = cy - rad, size = rad * 2;
+    const int diameter_sq = size * size;
+
+    for (int y = fy; y < fy + size; y++)
+        for (int x = fx; x < fx + size; x++) {
+            int cov = circle_coverage_16x(x, y, fx, fy, size, size);
+            if (!cov) continue;
+
+            int dx2 = (x - cx) * 2 + 1;
+            int dy2 = (y - cy) * 2 + 1;
+            int delta = base_delta;
+            if (directional)
+                delta -= (dx2 + dy2) * directional / std::max(1, rad * 4);
+            if (radial_lift) {
+                int dist_sq = dx2 * dx2 + dy2 * dy2;
+                if (dist_sq < diameter_sq)
+                    delta += radial_lift * (diameter_sq - dist_sq) /
+                             std::max(1, diameter_sq);
+            }
+
+            put_px_clean_blend(x, y,
+                               bevel_channel(r + delta),
+                               bevel_channel(g + delta),
+                               bevel_channel(b + delta),
+                               alpha * cov / 255);
+        }
+}
+
+extern "C" void html_view_fill_bevel_circle(int cx, int cy, int rad,
+                                              int r, int g, int b,
+                                              int light_theme, int pressed)
+{
+    if (rad <= 5) return;
+
+    /* Contact shadow. The pressed state sits closer to the surface and keeps a
+     * shorter shadow, which makes the confirmation state read as depressed. */
+    int shadow_alpha = light_theme ? 56 : 92;
+    if (pressed) {
+        draw_bevel_circle_layer(cx, cy + 2, rad + 1,
+                                3, 8, 14, shadow_alpha, 0, 0, 0);
+    } else {
+        draw_bevel_circle_layer(cx + 1, cy + 4, rad + 3,
+                                3, 8, 14, shadow_alpha / 2, 0, 0, 0);
+        draw_bevel_circle_layer(cx + 1, cy + 3, rad + 1,
+                                3, 8, 14, shadow_alpha, 0, 0, 0);
+    }
+
+    if (pressed) {
+        /* Semantic confirmation ring plus a dark separator. It stays colored
+         * instead of flashing the old flat white halo. */
+        draw_bevel_circle_layer(cx, cy, rad + 4,
+                                bevel_channel(r + 50),
+                                bevel_channel(g + 50),
+                                bevel_channel(b + 50),
+                                255, 0, 7, 0);
+        draw_bevel_circle_layer(cx, cy, rad + 1,
+                                bevel_channel(r - 42),
+                                bevel_channel(g - 42),
+                                bevel_channel(b - 42),
+                                255, -3, -10, 0);
+    }
+
+    /* Outer rim carries the crisp boundary; the smaller face leaves a visible
+     * 3px bevel instead of relying on a blurry translucent outline. */
+    draw_bevel_circle_layer(cx, cy, rad,
+                            r, g, b, 255,
+                            pressed ? -34 : -28,
+                            pressed ? -12 : 15, 0);
+
+    int face_rad = rad - (pressed ? 4 : 3);
+    int face_y = cy + (pressed ? 1 : 0);
+    draw_bevel_circle_layer(cx, face_y, face_rad,
+                            r, g, b, 255,
+                            pressed ? -10 : 0,
+                            pressed ? 7 : 15,
+                            pressed ? 2 : 6);
+}
+
+static double glyph_segment_dist_sq(double px, double py,
+                                    double x1, double y1,
+                                    double x2, double y2)
+{
+    double dx = x2 - x1, dy = y2 - y1;
+    double len_sq = dx * dx + dy * dy;
+    if (len_sq <= 0.0001) {
+        dx = px - x1; dy = py - y1;
+        return dx * dx + dy * dy;
+    }
+    double t = ((px - x1) * dx + (py - y1) * dy) / len_sq;
+    t = std::max(0.0, std::min(1.0, t));
+    double qx = x1 + t * dx, qy = y1 + t * dy;
+    dx = px - qx; dy = py - qy;
+    return dx * dx + dy * dy;
+}
+
+static inline double glyph_cross(double ax, double ay, double bx, double by)
+{
+    return ax * by - ay * bx;
+}
+
+/* Test a vector against a counter-clockwise wedge narrower than 180 degrees.
+ * Vector coordinates use mathematical Y-up even though framebuffer Y grows
+ * down, so the arc definitions remain easy to compare with the old code. */
+static bool glyph_in_wedge(double vx, double vy,
+                           double sx, double sy, double ex, double ey)
+{
+    return glyph_cross(sx, sy, vx, vy) >= 0.0 &&
+           glyph_cross(vx, vy, ex, ey) >= 0.0;
+}
+
+static bool glyph_in_triangle(double px, double py,
+                              double ax, double ay,
+                              double bx, double by,
+                              double cx, double cy)
+{
+    double c1 = glyph_cross(bx - ax, by - ay, px - ax, py - ay);
+    double c2 = glyph_cross(cx - bx, cy - by, px - bx, py - by);
+    double c3 = glyph_cross(ax - cx, ay - cy, px - cx, py - cy);
+    bool neg = c1 < 0.0 || c2 < 0.0 || c3 < 0.0;
+    bool pos = c1 > 0.0 || c2 > 0.0 || c3 > 0.0;
+    return !(neg && pos);
+}
+
+static bool power_glyph_sample(double px, double py,
+                               int cx, int cy, int rad, int kind)
+{
+    const double ro = rad * 0.54;
+    const double thick = rad * 0.15;
+    const double ri = ro - thick;
+    const double mid = (ro + ri) * 0.5;
+    const double half = thick * 0.5;
+    const double vx = px - cx;
+    const double vy_screen = py - cy;
+    const double vy_math = -vy_screen;
+    const double dist_sq = vx * vx + vy_screen * vy_screen;
+
+    if (kind == 0) {                         /* power */
+        /* Ring is everything except the narrow 70..110 degree top gap. */
+        const double s70x = 0.3420201433, s70y = 0.9396926208;
+        const double e110x = -0.3420201433, e110y = 0.9396926208;
+        bool in_gap = glyph_in_wedge(vx, vy_math, s70x, s70y, e110x, e110y);
+        bool ring = dist_sq >= ri * ri && dist_sq <= ro * ro && !in_gap;
+
+        /* Rounded arc caps and a rounded vertical bar avoid high-contrast
+         * square corners after RGB565 conversion. */
+        double cap1x = cx + mid * e110x, cap1y = cy - mid * e110y;
+        double cap2x = cx + mid * s70x,  cap2y = cy - mid * s70y;
+        double dx1 = px - cap1x, dy1 = py - cap1y;
+        double dx2 = px - cap2x, dy2 = py - cap2y;
+        bool caps = dx1 * dx1 + dy1 * dy1 <= half * half ||
+                    dx2 * dx2 + dy2 * dy2 <= half * half;
+        bool bar = glyph_segment_dist_sq(px, py,
+                                         cx, cy - rad * 0.60,
+                                         cx, cy - rad * 0.06) <= half * half;
+        return ring || caps || bar;
+    }
+
+    if (kind == 1) {                         /* reboot */
+        /* Existing arc is 120..410 degrees; its missing wedge is 50..120. */
+        const double s50x = 0.6427876097, s50y = 0.7660444431;
+        const double e120x = -0.5, e120y = 0.8660254038;
+        bool in_gap = glyph_in_wedge(vx, vy_math, s50x, s50y, e120x, e120y);
+        bool ring = dist_sq >= ri * ri && dist_sq <= ro * ro && !in_gap;
+
+        double startx = cx + mid * e120x, starty = cy - mid * e120y;
+        double sdx = px - startx, sdy = py - starty;
+        bool start_cap = sdx * sdx + sdy * sdy <= half * half;
+
+        /* Arrow geometry matches the prior polygon, now sampled rather than
+         * rounded to whole framebuffer pixels. */
+        double pex = cx + mid * s50x, pey = cy - mid * s50y;
+        double tx = -s50y, ty = -s50x;
+        double rx = s50x, ry = -s50y;
+        double len = thick * 1.9, hw = thick * 1.25;
+        bool arrow = glyph_in_triangle(px, py,
+                                       pex + tx * len, pey + ty * len,
+                                       pex + rx * hw,  pey + ry * hw,
+                                       pex - rx * hw,  pey - ry * hw);
+        return ring || start_cap || arrow;
+    }
+
+    /* Cancel uses two rounded capsules instead of integer-coordinate quads. */
+    double d = rad * 0.40;
+    return glyph_segment_dist_sq(px, py, cx - d, cy - d, cx + d, cy + d) <= half * half ||
+           glyph_segment_dist_sq(px, py, cx - d, cy + d, cx + d, cy - d) <= half * half;
+}
+
+extern "C" void html_view_draw_power_glyph(int cx, int cy, int rad, int kind,
+                                             int r, int g, int b, int a)
+{
+    if (rad <= 5 || kind < 0 || kind > 2 || a <= 0) return;
+    const int samples = 8;
+    const int extent = (int)std::ceil(rad * 0.78);
+
+    for (int y = cy - extent; y <= cy + extent; y++)
+        for (int x = cx - extent; x <= cx + extent; x++) {
+            int inside = 0;
+            for (int sy = 0; sy < samples; sy++)
+                for (int sx = 0; sx < samples; sx++) {
+                    double px = x + (sx + 0.5) / samples;
+                    double py = y + (sy + 0.5) / samples;
+                    if (power_glyph_sample(px, py, cx, cy, rad, kind)) inside++;
+                }
+            if (!inside) continue;
+            int cov = inside * 255 / (samples * samples);
+            put_px_clean_blend(x, y, r, g, b, a * cov / 255);
+        }
 }
 
 extern "C" int html_view_text_width_px(const char *text, int size)
